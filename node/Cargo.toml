@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/acrux-crypto"]
+members = ["crates/acrux-crypto", "crates/acrux-transport"]
 
 [workspace.dependencies]
 anyhow = "1"
