@@ -1,0 +1,15 @@
+[package]
+name = "acrux-crypto"
+version = "0.2.0"
+edition = "2021"
+description = "Hashing, signatures, ChaCha20-Poly1305 slices and Reed-Solomon shreds with Merkle proofs."
+
+[dependencies]
+anyhow = { workspace = true }
+bincode = { workspace = true }
+chacha20poly1305 = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+reed-solomon-erasure = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
