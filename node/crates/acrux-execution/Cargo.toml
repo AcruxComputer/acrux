@@ -1,0 +1,22 @@
+[package]
+name = "acrux-execution"
+version = "0.2.0"
+edition = "2021"
+description = "Algorithm 4 selection, SVM execution with fees and state hashes, and threshold transactions."
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+bincode = { workspace = true }
+bs58 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+litesvm = { workspace = true }
+rand = { workspace = true }
+reed-solomon-erasure = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+solana-sdk = { workspace = true }
+acrux-crypto = { path = "../acrux-crypto" }
