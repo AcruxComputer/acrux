@@ -1,0 +1,15 @@
+{
+  "description": "Section 3.1 example, integer stake units preserving the 6%, 2%, 1.2%, 0.8% proportions.",
+  "hub": {
+    "code": "FRA",
+    "region": "Europe",
+    "members": [
+      { "identity": "a", "stake": 6000000 },
+      { "identity": "b", "stake": 2000000 },
+      { "identity": "c", "stake": 1200000 },
+      { "identity": "d", "stake": 800000 }
+    ]
+  },
+  "expectedCap": 2000000,
+  "expectedHubStake": 6000000
+}
