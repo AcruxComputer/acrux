@@ -1,0 +1,8 @@
+[package]
+name = "acrux-consensus"
+version = "0.2.0"
+edition = "2021"
+description = "Votor on cblocks: votes, certificates, ParentReady and finality."
+
+[dependencies]
+serde = { workspace = true }
