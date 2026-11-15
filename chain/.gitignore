@@ -1,0 +1,8 @@
+node_modules/
+.anchor/
+.ledger/
+test-ledger/
+target/
+# Keys never enter the repo: keys/dev/ is rewritten by scripts/dev-keys.mjs, and the hub_registry
+# program keypair is the program id on every cluster.
+keys/

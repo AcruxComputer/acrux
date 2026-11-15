@@ -1,0 +1,14 @@
+[toolchain]
+anchor_version = "0.31.1"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+hub_registry = "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm"
+demo_pool = "CUBR9LNdTwxwp5ARBQj1EopfuH8dr8u4i7DsXcb8HbHN"
+
+[provider]
+cluster = "http://127.0.0.1:4990"
+wallet = "keys/dev/local-authority.json"
