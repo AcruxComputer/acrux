@@ -2,6 +2,7 @@ pub mod facts;
 pub mod cli;
 pub mod gateway;
 pub mod genesis;
+pub mod lab;
 pub mod limits;
 
 /// Validator `i`'s identity: from `ACRUX_IDENTITY_SEED` on a public net (a secret, since these
