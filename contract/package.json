@@ -1,0 +1,35 @@
+{
+  "name": "@acrux/contract",
+  "version": "0.1.8",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": "22.x"
+  },
+  "files": [
+    "dist",
+    "openapi.json"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./fixtures": {
+      "types": "./dist/fixtures.d.ts",
+      "import": "./dist/fixtures.js"
+    },
+    "./openapi.json": "./openapi.json"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node dist/write-openapi.js"
+  },
+  "dependencies": {
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,130 @@
+import { z } from 'zod'
+import { Address, Base64, BaseUnits, Signature, Timestamp, U64, page, PageQuery } from './primitives.js'
+import { defineErrors } from './errors.js'
+export { Address, Base64, BaseUnits, Signature, Timestamp, U64, PageQuery }
+export { CONTRACT_VERSION } from './version.js'
+export const errors = defineErrors({ FAUCET_LIMIT: 429, NET_STALLED: 503, NET_UNAVAILABLE: 503, INVALID_INPUT: 400 })
+export const ApiError = errors.ApiError
+export const ErrorCode = errors.ErrorCode
+export type ErrorCode = z.infer<typeof ErrorCode>
+export const Count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+export const SlotNumber = Count
+export const Hash = z.string().regex(/^[a-f0-9]{64}$/)
+export const TxId = Hash
+// Registry format is configured at runtime; do not freeze undecided code rules here.
+export const HubCode = z.string().min(1)
+export const ProposerIndex = z.number().int().min(1).max(3)
+export const Track = z.number().int().min(1).max(4)
+export const Parameters = z.strictObject({
+  k: z.literal(3), kappa: z.literal(4), w: z.literal(16), deltaLocalUs: z.literal(10000),
+  deltaBlockUs: z.literal(50000), deltaGlobalUs: z.literal(250000), timeoutUs: z.literal(750000),
+  tracks: z.literal(4), reserveLamports: z.literal('1000000'), trackCapacityCu: Count.nullable(),
+  fragmentExpirySlots: Count.nullable(), alpha: z.number().min(0).max(1).nullable(),
+  minimumHubMembers: Count.nullable(), minimumHubStake: U64.nullable(),
+})
+export type Parameters = z.infer<typeof Parameters>
+export const PROTOCOL_PARAMETERS: Parameters = {
+  k: 3, kappa: 4, w: 16, deltaLocalUs: 10000, deltaBlockUs: 50000, deltaGlobalUs: 250000,
+  timeoutUs: 750000, tracks: 4, reserveLamports: '1000000', trackCapacityCu: null,
+  fragmentExpirySlots: null, alpha: null, minimumHubMembers: null, minimumHubStake: null,
+}
+export const Proposer = z.strictObject({ index: ProposerIndex, identity: Address, stake: U64, status: z.enum(['online', 'late', 'crashed']) })
+export type Proposer = z.infer<typeof Proposer>
+export const Window = z.strictObject({ number: Count, hubCode: HubCode, firstSlot: SlotNumber, lastSlot: SlotNumber, consensusSlots: z.array(Count), proposers: z.array(Proposer).length(3) })
+export type Window = z.infer<typeof Window>
+export const Slice = z.strictObject({ index: Count, shredCount: z.literal(64), rebuildShreds: z.literal(32), bytes: Count, sentUs: Count, arrivedUs: Count, merkleRoot: Hash })
+export const CommitmentArrival = z.strictObject({ receiver: ProposerIndex, startUs: Count, arrivedUs: Count, relativeToStartUs: z.number().int(), deadlineUs: z.literal(20000), onTime: z.boolean() })
+export const Commitment = z.strictObject({ slot: SlotNumber, proposer: ProposerIndex, hash: Hash, keyHash: Hash, signature: Signature, sentUs: Count, arrivals: z.array(CommitmentArrival) })
+export type Commitment = z.infer<typeof Commitment>
+export const Attestation = z.strictObject({ slot: SlotNumber, proposer: ProposerIndex, pi: z.array(Hash.nullable()).length(3), key: Base64, signature: Signature, sentUs: Count, validatorArrivals: z.array(z.strictObject({ identity: Address, arrivedUs: Count })) })
+export type Attestation = z.infer<typeof Attestation>
+export const ProposerBlock = z.strictObject({ proposer: ProposerIndex, identity: Address, status: z.enum(['streaming', 'sealed', 'accepted', 'dropped', 'missing']), bytes: Count, slices: z.array(Slice), commitment: Commitment.nullable(), attestation: Attestation.nullable(), parent: z.strictObject({ consensusSlot: Count, hash: Hash }).nullable() })
+export type ProposerBlock = z.infer<typeof ProposerBlock>
+/** priorityFeePerCu is an unsigned decimal string of micro-lamports per compute unit. */
+export const TxHeader = z.strictObject({ id: TxId, feePayer: Address, priorityFeePerCu: U64.describe('Micro-lamports per compute unit, encoded as an unsigned decimal string.'), computeLimit: Count.min(1), writableAccounts: z.array(Address), targetSlot: SlotNumber })
+export type TxHeader = z.infer<typeof TxHeader>
+export const FragmentInclusion = z.strictObject({ index: Count, receiver: ProposerIndex, slot: SlotNumber, proposer: ProposerIndex, includedUs: Count })
+export const MergedTransaction = TxHeader.extend({ kind: z.enum(['plain', 'fragments']), sourceProposers: z.array(ProposerIndex), n: z.number().int().min(1).max(3), t: z.number().int().min(1).max(3), fragmentIndices: z.array(Count), position: Count, selected: z.boolean(), exclusion: z.enum(['capacity', 'priority_fee', 'incomplete']).nullable() })
+export type MergedTransaction = z.infer<typeof MergedTransaction>
+export const Placement = z.strictObject({ track: Track, startCu: Count, lengthCu: Count, txId: TxId })
+export type Placement = z.infer<typeof Placement>
+export const ExecutionSchedule = z.strictObject({ algorithm: z.literal(4), tracks: z.literal(4), capacityCu: Count.min(1), placements: z.array(Placement), gaps: z.array(z.strictObject({ track: Track, startCu: Count, lengthCu: Count })) })
+export type ExecutionSchedule = z.infer<typeof ExecutionSchedule>
+export const SkipReason = z.enum(['disagreeing_vectors', 'missing_attestation', 'equivocation', 'majority_lost', 'window_skipped'])
+export const Skip = z.strictObject({ reason: SkipReason, detail: z.string(), disagreeingVectors: z.array(Attestation), affectedSlots: z.array(SlotNumber), atUs: Count })
+export const Vote = z.strictObject({ consensusSlot: Count, validator: Address, kind: z.enum(['notar', 'notar_fallback', 'skip', 'skip_fallback', 'finalize']), stakeShare: z.number().min(0).max(1), hash: Hash.nullable(), atUs: Count })
+export type Vote = z.infer<typeof Vote>
+export const Certificate = z.strictObject({ consensusSlot: Count, kind: z.enum(['notarization', 'notar_fallback', 'fast_finalization', 'slow_finalization', 'skip']), stakeShare: z.number().min(0).max(1), threshold: z.number().min(0).max(1), hash: Hash.nullable(), signers: z.array(Address), atUs: Count, linkedConsensusSlot: Count.nullable() })
+export type Certificate = z.infer<typeof Certificate>
+export const Cblock = z.strictObject({ consensusSlot: Count, slots: z.array(SlotNumber), parent: z.strictObject({ consensusSlot: Count, hash: Hash }).nullable(), hash: Hash.nullable(), stateHash: Hash.nullable(), votes: z.array(Vote), certificates: z.array(Certificate), status: z.enum(['pending', 'notarized', 'finalized', 'skipped']), finalizedUs: Count.nullable() })
+export type Cblock = z.infer<typeof Cblock>
+// Block and execution times are slot-relative; these two deadlines are window ParentReady-relative.
+export const Slot = z.strictObject({ slot: SlotNumber, wallTime: Timestamp, window: Window, consensusSlot: Count, status: z.enum(['pending', 'executed', 'finalized', 'skipped']), blocks: z.array(ProposerBlock), attestations: z.array(Attestation), agreedSet: z.array(ProposerIndex).nullable(), skip: Skip.nullable(), mergedOrder: z.array(MergedTransaction), schedule: ExecutionSchedule.nullable(), stateHash: Hash.nullable(), xblockHash: Hash.nullable(), cblock: Cblock, executedUs: Count.nullable(), attestationDeadlineUs: Count, consensusTimeoutUs: Count })
+export type Slot = z.infer<typeof Slot>
+export const Transaction = z.strictObject({ header: TxHeader, state: z.enum(['unknown', 'sent', 'partly_included', 'executed', 'finalized', 'failed', 'expired']), kind: z.enum(['plain', 'fragments']), n: z.number().int().min(1).max(3), t: z.number().int().min(1).max(3), receivers: z.array(Proposer), fragments: z.array(FragmentInclusion), includedCount: Count, readableSlot: SlotNumber.nullable(), executedSlot: SlotNumber.nullable(), mergedPosition: Count.nullable(), result: z.enum(['success', 'error']).nullable(), logs: z.array(z.string()), failure: z.string().nullable(), expiresAfterSlot: SlotNumber.nullable(), finalization: Certificate.nullable() })
+export type Transaction = z.infer<typeof Transaction>
+export const Counters = z.strictObject({ slots: Count, finalizedCblocks: Count, skips: Count, averageCommitSpreadUs: z.number().nonnegative() })
+export const NetSnapshot = z.strictObject({ streamId: z.string(), cursor: Count, status: z.enum(['live', 'stalled', 'unavailable']), currentWindow: Window, recentSlots: z.array(Slot).max(64), upcomingWindows: z.array(Window), counters: Counters, parameters: Parameters })
+export type NetSnapshot = z.infer<typeof NetSnapshot>
+export const Balance = z.strictObject({ address: Address, lamports: U64, reserveLamports: U64, spendableLamports: U64, slot: SlotNumber })
+export const DemoMint = z.strictObject({ address: Address, symbol: z.string(), name: z.string(), decimals: Count })
+export const DemoPool = z.strictObject({ address: Address, mints: z.tuple([DemoMint, DemoMint]), reserves: z.tuple([U64, U64]), feeBps: Count, slot: SlotNumber })
+export const QuoteRequest = z.strictObject({ inputMint: Address, amountIn: U64.refine(x => x !== '0'), slippageBps: Count.max(10000) })
+export const Quote = z.strictObject({ inputMint: Address, outputMint: Address, amountIn: U64, amountOut: U64, minimumOut: U64, feeAmount: U64, slot: SlotNumber })
+export const PlainSubmission = z.strictObject({ header: TxHeader, transaction: Base64.min(1), receivers: z.array(ProposerIndex).min(1).max(3) })
+export const FragmentSubmission = z.strictObject({ header: TxHeader, n: z.number().int().min(2).max(3), t: z.number().int().min(2).max(3), index: Count.max(2), receiver: ProposerIndex, fragment: Base64.min(1), keyShare: Base64.min(1), headerSignature: Signature }).superRefine((v,c) => { if(v.t > v.n || v.index >= v.n) c.addIssue({code:'custom', message:'Require t <= n and fragment index < n.'}) })
+export const Submission = z.strictObject({ id: TxId, accepted: z.literal(true), targetSlot: SlotNumber })
+export const Member = z.strictObject({ identity: Address, hubCode: HubCode, stake: U64, proposerStake: U64, capped: z.boolean(), effectiveEpoch: Count, joinedEpoch: Count, pendingMove: HubCode.nullable(), pendingLeave: z.boolean(), cooldownUntilEpoch: Count })
+export type Member = z.infer<typeof Member>
+/** ECEF coordinates are integer metres in the WGS84 geocentric reference frame. */
+export const Hub = z.strictObject({ code: HubCode, name: z.string(), region: z.string(), ecef: z.strictObject({ x: z.number().int(), y: z.number().int(), z: z.number().int() }).describe('Integer metres in WGS84 Earth-centred, Earth-fixed coordinates.'), latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), registrant: Address, depositLamports: U64, members: z.array(Member), stake: U64, proposerStake: U64, proposerStakeCap: U64, status: z.enum(['active', 'pending', 'inactive']), needs: z.strictObject({ members: Count, stake: U64 }), createdEpoch: Count, lastActiveEpoch: Count.nullable(), releasableEpoch: Count.nullable(), releasable: z.boolean() })
+export type Hub = z.infer<typeof Hub>
+export const Hubs = page(Hub)
+export const RegistryConfig = z.strictObject({ status: z.enum(['fixture', 'waiting', 'ready']), programId: Address.nullable(), cluster: z.enum(['localnet', 'mainnet-beta']), depositLamports: U64.nullable(), registrationFeeBps: Count.max(10000).nullable(), cooldownEpochs: Count.nullable(), inactivityEpochs: Count.nullable(), codeRules: z.strictObject({ pattern: z.string().nullable(), minLength: Count.nullable(), maxLength: Count.nullable() }), minimumMembers: Count.nullable(), minimumStake: U64.nullable(), currentEpoch: Count, missingConfiguration: z.array(z.string()) })
+export const SchedulePreview = z.strictObject({ epoch: Count, seed: z.string(), source: z.enum(['fixture', 'registry']), algorithm: z.literal(3), alpha: z.number().min(0).max(1), totalWindows: Count, shares: z.array(z.strictObject({ hubCode: HubCode, proposerStake: U64, probability: z.number(), assignedWindows: Count })), regionalRuns: z.array(z.strictObject({ region: z.string(), firstWindow: Count, lastWindow: Count })), windows: z.array(Window) })
+export const FaucetPolicy = z.strictObject({ amountLamports: U64.nullable(), perKey: Count.nullable(), perIp: Count.nullable(), periodSeconds: Count.nullable(), missingConfiguration: z.array(z.string()) })
+export const FaucetStatus = z.strictObject({ address: Address, policy: FaucetPolicy, remainingForKey: Count.nullable(), remainingForIp: Count.nullable(), resetsAt: Timestamp.nullable(), eligible: z.boolean() })
+export const FaucetRequest = z.strictObject({ address: Address })
+export const FaucetGrant = z.strictObject({ id: z.string(), transactionId: TxId.optional(), address: Address, amountLamports: U64, signature: Signature, balance: Balance, grantedAt: Timestamp })
+export const Facts = z.strictObject({ source: z.enum(['fixture', 'measured']), measuredAt: Timestamp, sampleSize: Count, slotPacingUs: z.strictObject({ p50: Count, p99: Count }), commitSpreadUs: z.strictObject({ p50: Count, p99: Count }), attestationRelativeToBlockUs: z.strictObject({ p50: z.number().int(), p99: z.number().int() }), cblockFinalizationUs: z.strictObject({ p50: Count, p99: Count }),
+  /** Window handovers per hub link (e.g. "FRA-NYC"): measured p50/p99 and the link's Rotor floor (50 ms plus the second hub's votes for the 60% certificate). */
+  handoverUs: z.record(z.string(), z.strictObject({ p50: Count, p99: Count, floorUs: Count, count: Count })) })
+export const ScenarioId = z.enum(['last-look', 'censorship', 'crash', 'equivocation', 'split-commitments', 'private-front-run'])
+export const Evidence = z.strictObject({ kind: z.enum(['late_block_dropped', 'transaction_included', 'two_proposers_continue', 'slashing_proof', 'skip_certificate', 'unreadable_fragment']), slot: SlotNumber, proposer: ProposerIndex.nullable(), txId: TxId.nullable(), description: z.string(), hashes: z.array(Hash), signatures: z.array(Signature), observedFragments: Count.nullable(), threshold: Count.nullable() })
+export const LabScenario = z.strictObject({ id: ScenarioId, title: z.string(), description: z.string(), seed: z.string(), parameters: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])), lemma: z.string(), expectedOutcome: z.string() })
+export const LabRunRequest = z.strictObject({ scenario: ScenarioId, seed: z.string().min(1).max(128).optional() })
+export const LabRun = z.strictObject({ id: z.string(), scenario: LabScenario, seed: z.string(), status: z.enum(['queued', 'running', 'done', 'failed_to_start']), createdAt: Timestamp, startedAt: Timestamp.nullable(), endedAt: Timestamp.nullable(), outcome: z.string().nullable(), evidence: z.array(Evidence), failure: z.string().nullable() })
+export type LabRun = z.infer<typeof LabRun>
+export const LabRuns = page(LabRun)
+export const SpecMap = z.strictObject({ paper: z.string(), parameters: Parameters, entries: z.array(z.strictObject({ reference: z.string(), lines: z.string().nullable(), file: z.string(), function: z.string(), scenario: ScenarioId.nullable(), status: z.enum(['fixture', 'planned', 'implemented']) })), decisions: z.array(z.strictObject({ topic: z.string(), decision: z.string(), status: z.enum(['decided', 'configuration_required', 'fixture_only']) })) })
+export const Health = z.strictObject({ status: z.enum(['fixture', 'waiting', 'ready']), contractVersion: z.string(), missingConfiguration: z.array(z.string()) })
+export const SCENARIOS = ['normal', 'empty', 'waiting', 'pending', 'executed', 'finalized', 'skipped', 'sent', 'partly_included', 'failed', 'expired', 'unknown', 'active', 'inactive', 'pending_only', 'queued', 'running', 'done', 'failed_to_start', 'limit_reached', 'unfunded', 'stalled', 'unavailable', 'code_taken', 'crash', 'disagreeing_vectors', 'missing_attestation', 'equivocation', 'majority_lost'] as const
+// Inferred wire types: schema and type share a name without separate interfaces.
+export type Slice = z.infer<typeof Slice>
+export type CommitmentArrival = z.infer<typeof CommitmentArrival>
+export type FragmentInclusion = z.infer<typeof FragmentInclusion>
+export type Skip = z.infer<typeof Skip>
+export type Counters = z.infer<typeof Counters>
+export type Balance = z.infer<typeof Balance>
+export type DemoMint = z.infer<typeof DemoMint>
+export type DemoPool = z.infer<typeof DemoPool>
+export type QuoteRequest = z.infer<typeof QuoteRequest>
+export type Quote = z.infer<typeof Quote>
+export type PlainSubmission = z.infer<typeof PlainSubmission>
+export type FragmentSubmission = z.infer<typeof FragmentSubmission>
+export type Submission = z.infer<typeof Submission>
+export type Hubs = z.infer<typeof Hubs>
+export type RegistryConfig = z.infer<typeof RegistryConfig>
+export type SchedulePreview = z.infer<typeof SchedulePreview>
+export type FaucetPolicy = z.infer<typeof FaucetPolicy>
+export type FaucetStatus = z.infer<typeof FaucetStatus>
+export type FaucetRequest = z.infer<typeof FaucetRequest>
+export type FaucetGrant = z.infer<typeof FaucetGrant>
+export type Facts = z.infer<typeof Facts>
+export type ScenarioId = z.infer<typeof ScenarioId>
+export type Evidence = z.infer<typeof Evidence>
+export type LabScenario = z.infer<typeof LabScenario>
+export type LabRunRequest = z.infer<typeof LabRunRequest>
+export type LabRuns = z.infer<typeof LabRuns>
+export type SpecMap = z.infer<typeof SpecMap>
+export type Health = z.infer<typeof Health>
