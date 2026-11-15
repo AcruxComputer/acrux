@@ -117,6 +117,85 @@ Every instruction but `initialize` emits an event by self CPI (`HubRegistered`, 
 
 The program id is the public key of `keys/hub_registry-keypair.json` and is built into the binary. Deploy with `solana program deploy --program-id keys/hub_registry-keypair.json target/deploy/hub_registry.so`, then `initialize` with `scripts/init-mainnet.mjs` (its header lists the variables).
 
+## demo_pool
+
+One constant-product pool per pair of mints (classic SPL Token). Two instructions.
+
+### Accounts
+
+| Account | Address |
+|---|---|
+| `Pool` | PDA `["pool", mint_a, mint_b]`: `mint_a`, `mint_b`, `vault_a`, `vault_b`, `fee_bps` (u16), `bump` |
+| vault | PDA `["vault", pool, mint]`, a token account owned by the pool PDA |
+
+The reserves are the vaults' token balances.
+
+### `swap`
+
+Instruction data, 25 bytes:
+
+| Bytes | Field |
+|---|---|
+| 0..8 | discriminator `f8 c6 9e 91 e1 75 87 c8` |
+| 8..16 | `amount_in`, u64 little endian |
+| 16..24 | `minimum_out`, u64 little endian |
+| 24 | `a_to_b`: 1 swaps mint A for mint B, 0 swaps B for A |
+
+Accounts, in order:
+
+| # | Account | Writable | Signer |
+|---|---|---|---|
+| 0 | `user` | yes | yes |
+| 1 | `pool` | | |
+| 2 | `mint_a` | | |
+| 3 | `mint_b` | | |
+| 4 | `vault_a` | yes | |
+| 5 | `vault_b` | yes | |
+| 6 | `user_a`, the user's associated token account for mint A | yes | |
+| 7 | `user_b`, the user's associated token account for mint B | yes | |
+| 8 | SPL Token program `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` | | |
+| 9 | Associated Token program `ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL` | | |
+| 10 | System program `11111111111111111111111111111111` | | |
+
+Associated token account: PDA `[user, token_program, mint]` of the Associated Token program. The swap creates either of the user's two accounts when it is missing, paid by the user, so a swap is one instruction of this program and nothing else. The same layout is in `target/idl/demo_pool.json`.
+
+Errors: `6000 InvalidFee`, `6001 ZeroAmount`, `6002 SlippageExceeded`.
+
+### Quote
+
+Integers throughout, `reserve_in` and `reserve_out` being the vault balances on the input and output side:
+
+```
+fee        = ceil(amount_in * fee_bps / 10000)
+net        = amount_in - fee
+amount_out = floor(reserve_out * net / (reserve_in + net))
+minimum_out = floor(amount_out * (10000 - slippage_bps) / 10000)
+```
+
+The whole `amount_in` goes into the input vault, so the fee stays in the pool. With the genesis reserves, 1,000 AXA in gives fee 3,000,000 and `amount_out` 1,992,013,962 (1,992.013962 AXB).
+
+### `initialize_pool(fee_bps, amount_a, amount_b)`
+
+Creates the pool and its two vaults and moves the first reserves in from the payer's token accounts. Accounts: `payer` (signer), `mint_a`, `mint_b`, `pool`, `vault_a`, `vault_b`, `payer_a`, `payer_b`, Token program, System program.
+
+## Acrux Net genesis
+
+`genesis/acrux-net.json` is written by `node scripts/genesis.mjs` and is a pure function of the development seed. The node loads the program with `acrux net up --program CUBR9LNdTwxwp5ARBQj1EopfuH8dr8u4i7DsXcb8HbHN=<path to target/deploy/demo_pool.so>` and writes each entry of `accounts` into its SVM as it is.
+
+| Field | Content |
+|---|---|
+| `seed`, `derivation` | the development seed and how keys derive from it |
+| `programs` | `demo_pool`: address and the `.so` path relative to this folder |
+| `tokens` | AXA and AXB: symbol, name, decimals (6), mint |
+| `pool` | address, mints, vaults, `feeBps` (30), reserves (1,000,000 AXA and 2,000,000 AXB) |
+| `mintAuthority` | the development key that can mint more of both |
+| `faucet` | the faucet key, its lamports, its two token accounts and their balance |
+| `accounts` | each account as `label`, `address`, `owner`, `lamports`, `data` (base64), `executable` |
+
+The eight accounts: the two mints, the pool, its two vaults, the faucet's system account (100 SOL) and the faucet's two associated token accounts (1,000,000,000 AXA and 1,000,000,000 AXB). Each mint's supply equals its vault plus the faucet's balance. Lamports are the rent-exempt minimum under the SVM's default rent (3,480 lamports per byte-year, two years, 128 bytes of overhead).
+
+**The faucet hands out demo tokens.** Its token accounts are in genesis for that: a grant is one transaction signed by the faucet key with an idempotent associated token account creation for the receiver and an SPL Token transfer, next to the SOL grant. A browser key that holds AXA or AXB then swaps with the single `swap` instruction above.
+
 ## Keys
 
 All keys under `keys/` are local only and never committed.

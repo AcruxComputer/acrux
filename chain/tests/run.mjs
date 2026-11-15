@@ -35,7 +35,7 @@ try {
     if (i > 120) throw new Error('The validator did not start')
     await new Promise((r) => setTimeout(r, 500))
   }
-  const files = process.argv.slice(2).length ? process.argv.slice(2) : ['tests/hub_registry.test.mjs']
+  const files = process.argv.slice(2).length ? process.argv.slice(2) : ['tests/hub_registry.test.mjs', 'tests/demo_pool.test.mjs']
   status = spawnSync(process.execPath, ['--test', '--test-concurrency=1', ...files], { cwd: chainDir, stdio: 'inherit' }).status ?? 1
 } finally {
   // Stop exactly the validator this run started.

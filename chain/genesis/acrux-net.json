@@ -1,0 +1,114 @@
+{
+  "description": "Acrux Net genesis state for the demo pool. Development keys, local test funds only.",
+  "seed": "acrux-dev-seed-v1",
+  "derivation": "keypair = ed25519 keypair from seed sha256(seed + \"/\" + label)",
+  "programs": [
+    {
+      "name": "demo_pool",
+      "address": "CUBR9LNdTwxwp5ARBQj1EopfuH8dr8u4i7DsXcb8HbHN",
+      "path": "target/deploy/demo_pool.so"
+    }
+  ],
+  "tokens": [
+    {
+      "symbol": "AXA",
+      "name": "Acrux Demo A",
+      "decimals": 6,
+      "mint": "8quNnQ7D45hTYW1rZp2MDkseFcBSYGEbAbsUhPqW5gov"
+    },
+    {
+      "symbol": "AXB",
+      "name": "Acrux Demo B",
+      "decimals": 6,
+      "mint": "Fm7uriwkGYMTX2QNDiwVyvgYpycSVqBbAuJrbkfd29Ah"
+    }
+  ],
+  "pool": {
+    "address": "7JaQxgy23uTkLhMhXRE5jhPx5hma7qLWisiASmMzfSVm",
+    "mintA": "8quNnQ7D45hTYW1rZp2MDkseFcBSYGEbAbsUhPqW5gov",
+    "mintB": "Fm7uriwkGYMTX2QNDiwVyvgYpycSVqBbAuJrbkfd29Ah",
+    "vaultA": "9pz8cL3ALbkqF4QHBRewTWMSWX3PuGs4uPnNNSZvMETD",
+    "vaultB": "HR4ToJNnF1jdaBAUQad1VhTajVcgbMVLhVUepehMgSWG",
+    "feeBps": 30,
+    "reserves": [
+      "1000000000000",
+      "2000000000000"
+    ]
+  },
+  "mintAuthority": "FP39Kc2DMMC9d1bxHMa7QxonAGkjLkaZcxx31i5wZHDj",
+  "faucet": {
+    "address": "gSnpacWLJ4mrhsfmxDtCzipb5gUGwKF2yc3bimGGuD1",
+    "lamports": 100000000000,
+    "tokenAccounts": [
+      "41TM4AhhWMaYv7YE46nvH5QBnvxkNtBfUdwbJdPNBA4G",
+      "DEXLHq68GhvSj41znrr9Wdu2WEX1HmJuFhLj86B7Pczs"
+    ],
+    "tokens": "1000000000000000"
+  },
+  "accounts": [
+    {
+      "label": "mint AXA",
+      "address": "8quNnQ7D45hTYW1rZp2MDkseFcBSYGEbAbsUhPqW5gov",
+      "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "lamports": 1461600,
+      "data": "AQAAANWo0YHgRL37GUvAIljv8lnSb5erfeiJCyVHrLuin55CAJBreWeOAwAGAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+      "executable": false
+    },
+    {
+      "label": "mint AXB",
+      "address": "Fm7uriwkGYMTX2QNDiwVyvgYpycSVqBbAuJrbkfd29Ah",
+      "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "lamports": 1461600,
+      "data": "AQAAANWo0YHgRL37GUvAIljv8lnSb5erfeiJCyVHrLuin55CAKAQTlCPAwAGAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+      "executable": false
+    },
+    {
+      "label": "pool",
+      "address": "7JaQxgy23uTkLhMhXRE5jhPx5hma7qLWisiASmMzfSVm",
+      "owner": "CUBR9LNdTwxwp5ARBQj1EopfuH8dr8u4i7DsXcb8HbHN",
+      "lamports": 1858320,
+      "data": "8ZptBBGxbbx0iOiXWjTzNS5pw9a+YRzWrz0qz7qcGZllQarnzs4JDdtQ/LuQwanzV9wjM2psW/q4dNVC8QDjbQeXLD6UqMY6gyhkUlkBKtxgN/DBX6YB+fuJYqXE3QhD/QF2qyrni/Tz5NhDeOOZjkqwLqhxhjN59wnWZdn+2x3q61XDDo8pPR4A/A==",
+      "executable": false
+    },
+    {
+      "label": "pool vault AXA",
+      "address": "9pz8cL3ALbkqF4QHBRewTWMSWX3PuGs4uPnNNSZvMETD",
+      "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "lamports": 2039280,
+      "data": "dIjol1o08zUuacPWvmEc1q89Ks+6nBmZZUGq587OCQ1dpsaP0Mq1UbRtMALEsYveiei7JNhSvlbdzhMCKDa2iAAQpdToAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "executable": false
+    },
+    {
+      "label": "pool vault AXB",
+      "address": "HR4ToJNnF1jdaBAUQad1VhTajVcgbMVLhVUepehMgSWG",
+      "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "lamports": 2039280,
+      "data": "21D8u5DBqfNX3CMzamxb+rh01ULxAONtB5csPpSoxjpdpsaP0Mq1UbRtMALEsYveiei7JNhSvlbdzhMCKDa2iAAgSqnRAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "executable": false
+    },
+    {
+      "label": "faucet",
+      "address": "gSnpacWLJ4mrhsfmxDtCzipb5gUGwKF2yc3bimGGuD1",
+      "owner": "11111111111111111111111111111111",
+      "lamports": 100000000000,
+      "data": "",
+      "executable": false
+    },
+    {
+      "label": "faucet AXA",
+      "address": "41TM4AhhWMaYv7YE46nvH5QBnvxkNtBfUdwbJdPNBA4G",
+      "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "lamports": 2039280,
+      "data": "dIjol1o08zUuacPWvmEc1q89Ks+6nBmZZUGq587OCQ0KGs/53o7nkZ8VAFRAP+mgAkA0ged2zoQYW6W43+6PEACAxqR+jQMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "executable": false
+    },
+    {
+      "label": "faucet AXB",
+      "address": "DEXLHq68GhvSj41znrr9Wdu2WEX1HmJuFhLj86B7Pczs",
+      "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "lamports": 2039280,
+      "data": "21D8u5DBqfNX3CMzamxb+rh01ULxAONtB5csPpSoxjoKGs/53o7nkZ8VAFRAP+mgAkA0ged2zoQYW6W43+6PEACAxqR+jQMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "executable": false
+    }
+  ]
+}
