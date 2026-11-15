@@ -1,0 +1,38 @@
+{
+  "name": "@acrux/sdk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": "22.x"
+  },
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/seal.test.mjs",
+    "e2e": "npm run build && node test/e2e.mjs"
+  },
+  "dependencies": {
+    "@noble/ciphers": "2.4.0",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0"
+  },
+  "peerDependencies": {
+    "@acrux/contract": "^0.1.6"
+  },
+  "devDependencies": {
+    "@acrux/contract": "file:../contract",
+    "@solana/web3.js": "1.99.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  }
+}

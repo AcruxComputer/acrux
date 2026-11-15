@@ -1,0 +1,85 @@
+{
+  "feePayer": "D76ggUjzhUhttCKUfoQGQHJLbqSDoRcgVaqtmaeaYNMH",
+  "fragments": [
+    {
+      "fragment": "AbpDrIqcRefMor6pJxsBAACOmyo6r2LtTBcootGzQC5GXjROwAFCoIQLOsz7AB0Glc0j+u0hoZNuRtTyRE0EjSexchF8qQi5W7kAW90v0HpHbMFHtbJLCDz8AYFH/041R+yFRsuiPNvgXGzgp8O/L1Qyx95yilxEJsFCxN1LBnycCea9FvLkT0vdLlkGZg6xNzms0YqvoEbvJTSnoIKH",
+      "header": {
+        "computeLimit": 20000,
+        "feePayer": "D76ggUjzhUhttCKUfoQGQHJLbqSDoRcgVaqtmaeaYNMH",
+        "id": "38eeb28b8f5890315d649f206f7ce7719de3106c30f895a2f2be83f24ef01267",
+        "priorityFeePerCu": "100",
+        "targetSlot": 100,
+        "writableAccounts": [
+          "D76ggUjzhUhttCKUfoQGQHJLbqSDoRcgVaqtmaeaYNMH",
+          "CtP11HWyUcgKPp99hYWiebh8Nkvo8iBjcenC4G7mJGB6"
+        ]
+      },
+      "headerSignature": "4vivNrhagbhPPdpTN3UQ2rBquJ4NQY8qhauUPGJDGghyavAv8DxWovoEiTNKNsTcjuTpoRR1SGfbMkEPpuKfe6nt",
+      "index": 0,
+      "keyShare": "AQEUT5VFDhKKbHYxPEzkFEK2o2tP/uWGJdBNhudBOcfbUg==",
+      "n": 3,
+      "receiver": 1,
+      "t": 2
+    },
+    {
+      "fragment": "AbpDrIqcRefMor6pJxsBAACCe+/MmjTg4lWPtAzqSI++e9pOLzkngbUPT/ZHMUgE8K1+WToMp2Mg3NsnOomW616sREBmyvzsy3fNh9L0LOEMa+RUOBQVo3/i+4hcJtJlubvv57s7XriHXvSNI8vPYsMKzxrzK8JdD7towcn8jvtauJ76o7ggEj1lwuSBMMFMrNNIpbd+MBbZ78ZwbdwA",
+      "header": {
+        "computeLimit": 20000,
+        "feePayer": "D76ggUjzhUhttCKUfoQGQHJLbqSDoRcgVaqtmaeaYNMH",
+        "id": "38eeb28b8f5890315d649f206f7ce7719de3106c30f895a2f2be83f24ef01267",
+        "priorityFeePerCu": "100",
+        "targetSlot": 100,
+        "writableAccounts": [
+          "D76ggUjzhUhttCKUfoQGQHJLbqSDoRcgVaqtmaeaYNMH",
+          "CtP11HWyUcgKPp99hYWiebh8Nkvo8iBjcenC4G7mJGB6"
+        ]
+      },
+      "headerSignature": "4vivNrhagbhPPdpTN3UQ2rBquJ4NQY8qhauUPGJDGghyavAv8DxWovoEiTNKNsTcjuTpoRR1SGfbMkEPpuKfe6nt",
+      "index": 1,
+      "keyShare": "AQIyzRHBPO18D0/6l/59UTDvGhCi1pK+eE6TFgQW65dZaQ==",
+      "n": 3,
+      "receiver": 2,
+      "t": 2
+    },
+    {
+      "fragment": "AbpDrIqcRefMor6pJxsBAACWRr3Lxc73DZN7jnYBUHGrFPVOA3GI4uYD0LieYrcCXw2ZoV57rW7yb8pFuNg9QdWLHrNIb/0TZjiH/sOENVHRYothsuP3Q7rA6JNxUGuVpkJRGSuN+B0uWEE6stNftWdC10tt1X12dDUWzvU4C28NdhYzYWZx9aew6z4Vyo1WHPB5OfAQneaDrM0UJz6U",
+      "header": {
+        "computeLimit": 20000,
+        "feePayer": "D76ggUjzhUhttCKUfoQGQHJLbqSDoRcgVaqtmaeaYNMH",
+        "id": "38eeb28b8f5890315d649f206f7ce7719de3106c30f895a2f2be83f24ef01267",
+        "priorityFeePerCu": "100",
+        "targetSlot": 100,
+        "writableAccounts": [
+          "D76ggUjzhUhttCKUfoQGQHJLbqSDoRcgVaqtmaeaYNMH",
+          "CtP11HWyUcgKPp99hYWiebh8Nkvo8iBjcenC4G7mJGB6"
+        ]
+      },
+      "headerSignature": "4vivNrhagbhPPdpTN3UQ2rBquJ4NQY8qhauUPGJDGghyavAv8DxWovoEiTNKNsTcjuTpoRR1SGfbMkEPpuKfe6nt",
+      "index": 2,
+      "keyShare": "AQPZs22927guLlhKB5AKmx7YhDn5zr9fus3ZZqzSpacniQ==",
+      "n": 3,
+      "receiver": 3,
+      "t": 2
+    }
+  ],
+  "plain": {
+    "header": {
+      "computeLimit": 20000,
+      "feePayer": "D76ggUjzhUhttCKUfoQGQHJLbqSDoRcgVaqtmaeaYNMH",
+      "id": "38eeb28b8f5890315d649f206f7ce7719de3106c30f895a2f2be83f24ef01267",
+      "priorityFeePerCu": "100",
+      "targetSlot": 100,
+      "writableAccounts": [
+        "D76ggUjzhUhttCKUfoQGQHJLbqSDoRcgVaqtmaeaYNMH",
+        "CtP11HWyUcgKPp99hYWiebh8Nkvo8iBjcenC4G7mJGB6"
+      ]
+    },
+    "receivers": [
+      1,
+      2,
+      3
+    ],
+    "transaction": "AbTYvq8H4Y9Y1eHwDCg3T3yWgRy9l/D+dkZ6W4ycpP1zpvolVJ/5j5zMOZsroW1AgICnQiNGFBOBuMTh92gjuAEBAAIEs9wnse76sQj6jQU39LkIpo9gS4rxd4movwZFbTNzddSwmg2TOZf6DmrCP9llQ3O4/qS/eSw/PzjrdF9XzmTKzQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwZGb+UhFzL/7K26csOb57yM5bvF9xJrLEObOkAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQMDAAUCIE4AAAMACQNkAAAAAAAAAAICAAEMAgAAABAnAAAAAAAA"
+  },
+  "recipient": "CtP11HWyUcgKPp99hYWiebh8Nkvo8iBjcenC4G7mJGB6"
+}
