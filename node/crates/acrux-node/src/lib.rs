@@ -1,4 +1,5 @@
 pub mod facts;
+pub mod cli;
 pub mod gateway;
 pub mod genesis;
 pub mod limits;
@@ -33,6 +34,7 @@ pub mod view;
 pub mod exchange;
 pub mod agreement;
 pub mod submission;
+pub mod observer;
 
 // Crates by concern, re-exported under the module paths the node uses.
 pub use acrux_consensus as consensus;

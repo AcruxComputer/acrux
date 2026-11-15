@@ -1,0 +1,366 @@
+//! The `acrux` commands that talk to a running net or to the Hub Registry: keygen, send, node
+//! follow, and the hub instructions.
+use crate::{agreement, crypto, threshold::seal_for_receivers, types::Attestation};
+use anyhow::{bail, ensure, Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use ed25519_dalek::SigningKey;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use solana_sdk::{
+    compute_budget::ComputeBudgetInstruction,
+    hash::Hash,
+    instruction::{AccountMeta, Instruction},
+    pubkey::Pubkey,
+    signature::{read_keypair_file, write_keypair_file, Keypair, Signer},
+    system_instruction, system_program,
+    transaction::Transaction,
+};
+use std::{str::FromStr, time::Duration};
+
+pub async fn rpc(url: &str, method: &str, params: Value) -> Result<Value> {
+    let body: Value = reqwest::Client::new()
+        .post(url)
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .with_context(|| format!("{url} is not reachable"))?
+        .json()
+        .await?;
+    if let Some(error) = body.get("error") {
+        bail!("{method}: {}", error["message"].as_str().unwrap_or(&error.to_string()));
+    }
+    Ok(body["result"].clone())
+}
+
+pub fn keygen(out: &str) -> Result<()> {
+    let keypair = Keypair::new();
+    write_keypair_file(&keypair, out).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("{}", keypair.pubkey());
+    Ok(())
+}
+
+pub fn identities(out: &str) -> Result<()> {
+    std::fs::create_dir_all(out)?;
+    let config = crate::types::Configuration::default();
+    for i in 0..12 {
+        let secret = crate::identity_key(config.seed, i);
+        let keypair = Keypair::from_bytes(&secret.to_keypair_bytes()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let path = format!("{out}/validator-{i}.json");
+        write_keypair_file(&keypair, &path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("{} {} {path}", ["FRA", "NYC", "TYO"][i / 4], keypair.pubkey());
+    }
+    Ok(())
+}
+
+fn keypair(path: &str) -> Result<Keypair> {
+    read_keypair_file(path).map_err(|e| anyhow::anyhow!("Read keypair {path}: {e}"))
+}
+
+/// A transfer on Acrux Net, plain (t = 1) or split into n fragments of which t rebuild it,
+/// followed until it is finalized.
+pub async fn send(url: &str, keypair_path: &str, to: &str, lamports: u64, n: u8, t: u8, priority: u64) -> Result<()> {
+    let payer = keypair(keypair_path)?;
+    let blockhash: Hash = rpc(url, "getLatestBlockhash", json!({})).await?["blockhash"].as_str().context("blockhash")?.parse()?;
+    let started = rpc(url, "getLatestBlockhash", json!({})).await?["startedSlot"].as_u64().context("startedSlot")?;
+    let target = started + 4;
+    let tx = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(20_000),
+            ComputeBudgetInstruction::set_compute_unit_price(priority),
+            system_instruction::transfer(&payer.pubkey(), &Pubkey::from_str(to)?, lamports),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer],
+        blockhash,
+    );
+    let bytes = bincode::serialize(&tx)?;
+    let header = json!({
+        "id": hex::encode(Sha256::digest(tx.message.serialize())),
+        "feePayer": payer.pubkey().to_string(),
+        "priorityFeePerCu": priority.to_string(),
+        "computeLimit": 20_000,
+        "writableAccounts": tx.message.account_keys.iter().enumerate().filter(|(i, _)| tx.message.is_maybe_writable(*i, None)).map(|(_, k)| k.to_string()).collect::<Vec<_>>(),
+        "targetSlot": target,
+    });
+    let receivers: Vec<u8> = (1..=n).collect();
+    let id = header["id"].as_str().unwrap().to_owned();
+    if t <= 1 {
+        rpc(url, "submitTransaction", json!({"header": header, "transaction": B64.encode(&bytes), "receivers": receivers})).await?;
+    } else {
+        let signer = SigningKey::from_bytes(&payer.to_bytes()[..32].try_into()?);
+        for fragment in seal_for_receivers(&bytes, serde_json::from_value(header)?, &signer, n, t, &receivers)? {
+            rpc(url, "submitFragment", serde_json::to_value(fragment)?).await?;
+        }
+    }
+    println!("sent {id} for slot {target}{}", if t > 1 { format!(", {t} of {n} fragments") } else { String::new() });
+    let mut last = String::new();
+    loop {
+        let state = rpc(url, "getTransaction", json!({"id": id})).await.ok().and_then(|tx| tx["state"].as_str().map(str::to_owned)).unwrap_or_else(|| "unknown".into());
+        if state != last {
+            println!("  {state}");
+            last = state.clone();
+        }
+        if matches!(state.as_str(), "finalized" | "failed" | "expired") {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Follows a net the way a validator would, from its latest finalized cblock: loads that cblock's
+/// executed state and checks its lattice hash against the net's, then for every later finalized
+/// cblock receives each slot's encrypted blocks, checks every attestation's signature and Agreed(s),
+/// decrypts the agreed blocks with the released keys, checks each against its proposer's attested
+/// commitment, merges and re-executes them on its own SVM (Algorithm 4, the fees, the threshold
+/// fragments), and compares the state hash with the net's and with its finalization certificate.
+pub async fn follow(url: &str, genesis: &str) -> Result<()> {
+    let snapshot = rpc(url, "getExecutionSnapshot", json!({})).await?;
+    let programs = crate::genesis::Genesis::load(std::path::Path::new(genesis))?
+        .programs
+        .into_iter()
+        .map(|(address, path)| crate::execution::GenesisProgram { address, path })
+        .collect::<Vec<_>>();
+    let mut executor = crate::execution::SvmExecutor::new(Vec::<(String, u64)>::new(), &programs)?;
+    let state: crate::execution::ExecutorSnapshot = serde_json::from_value(snapshot["executor"].clone())?;
+    let start_hash = state.state_hash.clone();
+    executor.load(state)?;
+    let mut last = snapshot["consensusSlot"].as_u64().context("consensusSlot")?;
+    let net_hash = rpc(url, "getSlot", json!({"slot": last * 4 + 3})).await?["stateHash"].as_str().map(str::to_owned);
+    ensure!(executor.state_hash() == start_hash && net_hash.as_deref() == Some(start_hash.as_str()), "the starting state does not hash to cblock {last}'s state hash");
+    println!("from cblock {last}: {} accounts loaded, state {} matches", executor.account_count(), &start_hash[..12]);
+    let mut replay = Replay { executor, threshold: serde_json::from_value(snapshot["threshold"].clone())?, window: None };
+    let mut checked = 0u64;
+    loop {
+        let slots = rpc(url, "getRecentSlots", json!({"limit": 64})).await?;
+        let mut finalized = slots.as_array().context("slots")?.iter()
+            .filter(|s| s["slot"].as_u64().is_some_and(|n| n % 4 == 3) && s["cblock"]["status"] == "finalized")
+            .filter_map(|s| s["cblock"]["consensusSlot"].as_u64())
+            .filter(|c| *c > last)
+            .collect::<Vec<_>>();
+        finalized.sort_unstable();
+        for top in finalized {
+            if top <= last {
+                continue;
+            }
+            // A finalized cblock finalizes its ancestors: execute the chain back to the last one run.
+            let mut chain = vec![top];
+            loop {
+                let cblock = &rpc(url, "getSlot", json!({"slot": chain.last().unwrap() * 4})).await?["cblock"];
+                let parent = cblock["parent"]["consensusSlot"].as_u64().context("cblock without a parent")?;
+                if parent == last {
+                    break;
+                }
+                ensure!(parent > last, "cblock {top} does not extend cblock {last}");
+                chain.push(parent);
+            }
+            for c in chain.into_iter().rev() {
+                for s in c * 4..c * 4 + 4 {
+                    let view = rpc(url, "getSlot", json!({"slot": s})).await?;
+                    check_slot(&view).with_context(|| format!("slot {s}"))?;
+                    let blocks = rpc(url, "getSlotBlocks", json!({"slot": s})).await?;
+                    let recipients = view["window"]["proposers"].as_array().context("proposers")?.iter()
+                        .map(|p| (p["index"].as_u64().unwrap() as u8, p["identity"].as_str().unwrap().to_owned())).collect::<Vec<_>>();
+                    let state = replay.apply(s, &recipients, &blocks).with_context(|| format!("re-executing slot {s}"))?;
+                    ensure!(view["stateHash"].as_str() == Some(state.as_str()), "slot {s}: re-executed state {} differs from the net's {}", &state[..12], view["stateHash"]);
+                    checked += 1;
+                    println!("slot {s} re-executed  agreed {}  state {} matches  checked {checked}", view["agreedSet"], &state[..12]);
+                }
+                last = c;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+struct Replay {
+    executor: crate::execution::SvmExecutor,
+    threshold: crate::threshold::ThresholdCache,
+    window: Option<u64>,
+}
+
+impl Replay {
+    /// One slot, the way Algorithm 2's TryExecute runs it on a validator.
+    fn apply(&mut self, s: u64, recipients: &[(u8, String)], blocks: &Value) -> Result<String> {
+        use crate::execution::ExecutionItem;
+        use crate::threshold::AcceptOutcome;
+        use bincode::Options;
+        let w = s / 16;
+        if self.window != Some(w) {
+            self.executor.set_proposers(recipients)?;
+            self.window = Some(w);
+        }
+        let attestations = blocks["attestations"].as_array().context("attestations")?;
+        let pi = attestations.first().context("no attestation")?["pi"].as_array().context("pi")?.iter()
+            .map(|h| h.as_str().map(|h| Ok::<[u8; 32], anyhow::Error>(hex::decode(h)?.try_into().map_err(|_| anyhow::anyhow!("hash"))?)).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        let mut payloads = vec![];
+        let mut fragments = vec![];
+        for block in blocks["blocks"].as_array().context("blocks")? {
+            let q = block["proposer"].as_u64().context("proposer")? as usize;
+            let key: [u8; 32] = B64.decode(attestations.iter().find(|a| a["proposer"] == q).context("no attestation from an agreed proposer")?["key"].as_str().context("key")?)?
+                .try_into().map_err(|_| anyhow::anyhow!("key length"))?;
+            let mut slices = block["slices"].as_array().context("slices")?.iter()
+                .map(|x| Ok((serde_json::from_value::<crate::crypto::ShredMeta>(x["meta"].clone())?, B64.decode(x["cipher"].as_str().context("cipher")?)?, hex::decode(x["root"].as_str().context("root")?)?)))
+                .collect::<Result<Vec<_>>>()?;
+            slices.sort_by_key(|(meta, _, _)| meta.slice);
+            let mut plaintext = vec![];
+            let mut roots = vec![];
+            for (meta, cipher, root) in &slices {
+                ensure!(crypto::hash(&key) == meta.key_hash, "released key does not match the block's key commitment");
+                plaintext.extend(crypto::decrypt_slice(&key, s, q, meta.slice, cipher)?);
+                roots.push(<[u8; 32]>::try_from(root.as_slice())?);
+            }
+            let last = slices.last().context("block without slices")?;
+            ensure!(last.0.final_slice, "block without its final slice");
+            let parent = last.0.parent.map(|(slot, hash)| crate::consensus::BlockRef { slot, hash });
+            let commitment = crypto::hash(&bincode::serialize(&crate::types::BlockCommitment { slot: s, proposer: q, key_hash: last.0.key_hash, parent, roots })?);
+            ensure!(pi.get(q - 1).copied().flatten() == Some(commitment), "block {q} does not match its attested commitment");
+            let payload: crate::types::BlockPayload = bincode::DefaultOptions::new().with_fixint_encoding().with_limit(1024 * 1024).reject_trailing_bytes().deserialize(&plaintext)?;
+            let mut txs = vec![];
+            for t in payload.transactions {
+                let valid = self.executor.validate_transaction(&t.bytes, t.header.target_slot)?;
+                ensure!(valid.header == t.header && valid.header.target_slot <= s, "signed header or target mismatch");
+                txs.push(valid);
+            }
+            for f in payload.fragments {
+                let f = f.revalidate()?;
+                ensure!(f.receiver as usize == q, "fragment carried by the wrong proposer");
+                fragments.push((q as u8, f));
+            }
+            payloads.push((q as u8, txs));
+        }
+        let mut inclusions = payloads.iter().flat_map(|(q, txs)| txs.iter().map(move |t| (t.header.fee_payer.clone(), *q, 1u64))).collect::<Vec<_>>();
+        inclusions.extend(fragments.iter().map(|(q, f)| (f.header.fee_payer.clone(), *q, 1)));
+        self.executor.validate_inclusions(&inclusions, w)?;
+        let mut items = vec![];
+        for (q, txs) in payloads {
+            for tx in txs {
+                self.executor.charge_inclusion(&tx.header.fee_payer, q, w, 1)?;
+                items.push(ExecutionItem { transaction: tx, source_proposers: vec![q] });
+            }
+        }
+        self.threshold.expire(s);
+        for (q, fragment) in fragments {
+            self.executor.charge_inclusion(&fragment.header.fee_payer, q, w, 1)?;
+            let id = fragment.header.id.clone();
+            match self.threshold.accept_at(s, 0, q, fragment) {
+                Err(_) => self.threshold.reject(&id),
+                Ok(AcceptOutcome::Decoded { header, bytes, inclusions }) => match crate::threshold::validate_decoded(&self.executor, &header, &bytes) {
+                    Ok(tx) => {
+                        let mut sources = inclusions.iter().map(|i| i.proposer).collect::<Vec<_>>();
+                        sources.sort_unstable();
+                        sources.dedup();
+                        items.push(ExecutionItem { transaction: tx, source_proposers: sources });
+                    }
+                    Err(_) => self.threshold.reject(&header.id),
+                },
+                Ok(_) => {}
+            }
+        }
+        Ok(self.executor.execute_slot(s, items)?.state_hash)
+    }
+}
+
+fn check_slot(slot: &Value) -> Result<()> {
+    let proposers = slot["window"]["proposers"].as_array().context("proposers")?;
+    let mut attestations = vec![];
+    for a in slot["attestations"].as_array().context("attestations")? {
+        let index = a["proposer"].as_u64().context("proposer")? as usize;
+        let identity = proposers.iter().find(|p| p["index"] == index).context("attestation by a non-proposer")?["identity"].as_str().unwrap();
+        let attestation = Attestation {
+            slot: slot["slot"].as_u64().unwrap(),
+            proposer: index,
+            pi: a["pi"].as_array().context("pi")?.iter().map(|h| h.as_str().map(|h| hex::decode(h).map(|b| b.try_into().unwrap())).transpose()).collect::<Result<_, _>>()?,
+            key: B64.decode(a["key"].as_str().context("key")?)?.try_into().map_err(|_| anyhow::anyhow!("key length"))?,
+        };
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&bs58::decode(identity).into_vec()?.try_into().map_err(|_| anyhow::anyhow!("identity"))?)?;
+        let signature = bs58::decode(a["signature"].as_str().context("signature")?).into_vec()?;
+        crypto::verify_bytes(&key, &bincode::serialize(&crate::types::Wire::Attest(attestation.clone()))?, &signature).context("attestation signature")?;
+        attestations.push(attestation);
+    }
+    let agreed = agreement::agreed(&attestations, false).context("the attestations do not agree")?;
+    let claimed: Vec<usize> = serde_json::from_value(slot["agreedSet"].clone())?;
+    ensure!(agreed == claimed, "agreed set {claimed:?} differs from the attestations' {agreed:?}");
+    if slot["slot"].as_u64().unwrap() % 4 == 3 {
+        let certificates = slot["cblock"]["certificates"].as_array().context("certificates")?;
+        ensure!(
+            certificates.iter().any(|c| matches!(c["kind"].as_str(), Some("fast_finalization" | "slow_finalization")) && c["stakeShare"].as_f64() >= c["threshold"].as_f64()),
+            "no finalization certificate"
+        );
+    }
+    Ok(())
+}
+
+/// Anchor's instruction discriminator.
+fn discriminator(name: &str) -> Vec<u8> {
+    Sha256::digest(format!("global:{name}"))[..8].to_vec()
+}
+
+fn pda(program: &Pubkey, seeds: &[&[u8]]) -> Pubkey {
+    Pubkey::find_program_address(seeds, program).0
+}
+
+/// WGS84 geodetic to ECEF, whole metres at sea level.
+fn ecef(latitude: f64, longitude: f64) -> [i32; 3] {
+    let (a, e2) = (6_378_137.0f64, 6.69437999014e-3f64);
+    let (phi, lambda) = (latitude.to_radians(), longitude.to_radians());
+    let n = a / (1.0 - e2 * phi.sin().powi(2)).sqrt();
+    [(n * phi.cos() * lambda.cos()).round() as i32, (n * phi.cos() * lambda.sin()).round() as i32, (n * (1.0 - e2) * phi.sin()).round() as i32]
+}
+
+pub enum HubAction {
+    Register { code: String, latitude: f64, longitude: f64 },
+    Join { code: String },
+    Leave { code: String },
+    Move { from: String, to: String },
+    Release { code: String },
+}
+
+/// One Hub Registry instruction, signed with the identity keypair (and paid by it).
+pub async fn hub(rpc_url: &str, program: &str, keypair_path: &str, action: HubAction) -> Result<()> {
+    let program = Pubkey::from_str(program)?;
+    let signer = keypair(keypair_path)?;
+    let me = signer.pubkey();
+    let registry = pda(&program, &[b"registry"]);
+    let events = pda(&program, &[b"__event_authority"]);
+    let hub_of = |code: &str| pda(&program, &[b"hub", code.as_bytes()]);
+    let membership = pda(&program, &[b"member", me.as_ref()]);
+    let tail = [AccountMeta::new_readonly(events, false), AccountMeta::new_readonly(program, false)];
+    let (name, data, accounts) = match &action {
+        HubAction::Register { code, latitude, longitude } => {
+            let mut data = (code.len() as u32).to_le_bytes().to_vec();
+            data.extend_from_slice(code.as_bytes());
+            for v in ecef(*latitude, *longitude) {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+            ("register_hub", data, vec![AccountMeta::new(me, true), AccountMeta::new(registry, false), AccountMeta::new(hub_of(code), false), AccountMeta::new(pda(&program, &[b"fee_vault"]), false), AccountMeta::new_readonly(system_program::id(), false)])
+        }
+        HubAction::Join { code } => ("join_hub", vec![], vec![AccountMeta::new(me, true), AccountMeta::new_readonly(me, true), AccountMeta::new_readonly(registry, false), AccountMeta::new(hub_of(code), false), AccountMeta::new(membership, false), AccountMeta::new_readonly(system_program::id(), false)]),
+        HubAction::Leave { code } => ("leave_hub", vec![], vec![AccountMeta::new_readonly(me, true), AccountMeta::new_readonly(registry, false), AccountMeta::new(hub_of(code), false), AccountMeta::new(membership, false)]),
+        HubAction::Move { from, to } => ("move_hub", vec![], vec![AccountMeta::new_readonly(me, true), AccountMeta::new_readonly(registry, false), AccountMeta::new(hub_of(from), false), AccountMeta::new(hub_of(to), false), AccountMeta::new(membership, false)]),
+        HubAction::Release { code } => {
+            let hub = rpc(rpc_url, "getAccountInfo", json!([hub_of(code).to_string(), {"encoding": "base64", "commitment": "confirmed"}])).await?;
+            let data = B64.decode(hub["value"]["data"][0].as_str().context("This hub does not exist")?)?;
+            // Hub: discriminator 8, id 8, code 8, location 12, then the registrant.
+            let registrant = Pubkey::try_from(&data[36..68]).map_err(|_| anyhow::anyhow!("hub layout"))?;
+            ("release_hub", vec![], vec![AccountMeta::new_readonly(registry, false), AccountMeta::new(hub_of(code), false), AccountMeta::new(registrant, false)])
+        }
+    };
+    let instruction = Instruction { program_id: program, accounts: accounts.into_iter().chain(tail).collect(), data: [discriminator(name), data].concat() };
+    let blockhash: Hash = rpc(rpc_url, "getLatestBlockhash", json!([{"commitment": "confirmed"}])).await?["value"]["blockhash"].as_str().context("blockhash")?.parse()?;
+    let tx = Transaction::new_signed_with_payer(&[instruction], Some(&me), &[&signer], blockhash);
+    let signature = rpc(rpc_url, "sendTransaction", json!([B64.encode(bincode::serialize(&tx)?), {"encoding": "base64", "preflightCommitment": "confirmed"}])).await?;
+    let signature = signature.as_str().context("signature")?.to_owned();
+    for _ in 0..60 {
+        let status = rpc(rpc_url, "getSignatureStatuses", json!([[signature]])).await?;
+        let entry = &status["value"][0];
+        if !entry.is_null() && matches!(entry["confirmationStatus"].as_str(), Some("confirmed" | "finalized")) {
+            ensure!(entry["err"].is_null(), "{name} failed: {}", entry["err"]);
+            println!("{name} confirmed: {signature}");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    bail!("{name} was not confirmed within 30 s: {signature}")
+}

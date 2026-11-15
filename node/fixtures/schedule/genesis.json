@@ -1,0 +1,598 @@
+{
+  "epoch": 43,
+  "seed": "acrux-schedule-v1",
+  "totalValidatorStake": 30000000,
+  "windowCount": 48,
+  "hubs": [
+    {
+      "code": "FRA",
+      "region": "Europe",
+      "members": [
+        {
+          "identity": "FRA-validator-1",
+          "stake": 6000000
+        },
+        {
+          "identity": "FRA-validator-2",
+          "stake": 2000000
+        },
+        {
+          "identity": "FRA-validator-3",
+          "stake": 1200000
+        },
+        {
+          "identity": "FRA-validator-4",
+          "stake": 800000
+        }
+      ]
+    },
+    {
+      "code": "NYC",
+      "region": "North America",
+      "members": [
+        {
+          "identity": "NYC-validator-1",
+          "stake": 6000000
+        },
+        {
+          "identity": "NYC-validator-2",
+          "stake": 2000000
+        },
+        {
+          "identity": "NYC-validator-3",
+          "stake": 1200000
+        },
+        {
+          "identity": "NYC-validator-4",
+          "stake": 800000
+        }
+      ]
+    },
+    {
+      "code": "TYO",
+      "region": "Asia Pacific",
+      "members": [
+        {
+          "identity": "TYO-validator-1",
+          "stake": 6000000
+        },
+        {
+          "identity": "TYO-validator-2",
+          "stake": 2000000
+        },
+        {
+          "identity": "TYO-validator-3",
+          "stake": 1200000
+        },
+        {
+          "identity": "TYO-validator-4",
+          "stake": 800000
+        }
+      ]
+    }
+  ],
+  "expected": {
+    "epoch": 43,
+    "seed": "acrux-schedule-v1",
+    "alpha": 0.5,
+    "shares": [
+      {
+        "hubCode": "FRA",
+        "proposerStake": 6000000,
+        "probability": 0.3333333333333333,
+        "assignedWindows": 23
+      },
+      {
+        "hubCode": "NYC",
+        "proposerStake": 6000000,
+        "probability": 0.3333333333333333,
+        "assignedWindows": 12
+      },
+      {
+        "hubCode": "TYO",
+        "proposerStake": 6000000,
+        "probability": 0.3333333333333333,
+        "assignedWindows": 13
+      }
+    ],
+    "regionalRuns": [
+      {
+        "region": "Asia Pacific",
+        "firstWindow": 0,
+        "lastWindow": 12
+      },
+      {
+        "region": "Europe",
+        "firstWindow": 13,
+        "lastWindow": 35
+      },
+      {
+        "region": "North America",
+        "firstWindow": 36,
+        "lastWindow": 47
+      }
+    ],
+    "windows": [
+      {
+        "number": 0,
+        "hubCode": "TYO",
+        "region": "Asia Pacific",
+        "proposers": [
+          "TYO-validator-2",
+          "TYO-validator-3",
+          "TYO-validator-1"
+        ]
+      },
+      {
+        "number": 1,
+        "hubCode": "TYO",
+        "region": "Asia Pacific",
+        "proposers": [
+          "TYO-validator-4",
+          "TYO-validator-2",
+          "TYO-validator-1"
+        ]
+      },
+      {
+        "number": 2,
+        "hubCode": "TYO",
+        "region": "Asia Pacific",
+        "proposers": [
+          "TYO-validator-2",
+          "TYO-validator-3",
+          "TYO-validator-1"
+        ]
+      },
+      {
+        "number": 3,
+        "hubCode": "TYO",
+        "region": "Asia Pacific",
+        "proposers": [
+          "TYO-validator-2",
+          "TYO-validator-1",
+          "TYO-validator-4"
+        ]
+      },
+      {
+        "number": 4,
+        "hubCode": "TYO",
+        "region": "Asia Pacific",
+        "proposers": [
+          "TYO-validator-3",
+          "TYO-validator-2",
+          "TYO-validator-1"
+        ]
+      },
+      {
+        "number": 5,
+        "hubCode": "TYO",
+        "region": "Asia Pacific",
+        "proposers": [
+          "TYO-validator-4",
+          "TYO-validator-2",
+          "TYO-validator-1"
+        ]
+      },
+      {
+        "number": 6,
+        "hubCode": "TYO",
+        "region": "Asia Pacific",
+        "proposers": [
+          "TYO-validator-2",
+          "TYO-validator-1",
+          "TYO-validator-3"
+        ]
+      },
+      {
+        "number": 7,
+        "hubCode": "TYO",
+        "region": "Asia Pacific",
+        "proposers": [
+          "TYO-validator-2",
+          "TYO-validator-1",
+          "TYO-validator-3"
+        ]
+      },
+      {
+        "number": 8,
+        "hubCode": "TYO",
+        "region": "Asia Pacific",
+        "proposers": [
+          "TYO-validator-2",
+          "TYO-validator-4",
+          "TYO-validator-1"
+        ]
+      },
+      {
+        "number": 9,
+        "hubCode": "TYO",
+        "region": "Asia Pacific",
+        "proposers": [
+          "TYO-validator-1",
+          "TYO-validator-3",
+          "TYO-validator-2"
+        ]
+      },
+      {
+        "number": 10,
+        "hubCode": "TYO",
+        "region": "Asia Pacific",
+        "proposers": [
+          "TYO-validator-2",
+          "TYO-validator-4",
+          "TYO-validator-1"
+        ]
+      },
+      {
+        "number": 11,
+        "hubCode": "TYO",
+        "region": "Asia Pacific",
+        "proposers": [
+          "TYO-validator-2",
+          "TYO-validator-1",
+          "TYO-validator-4"
+        ]
+      },
+      {
+        "number": 12,
+        "hubCode": "TYO",
+        "region": "Asia Pacific",
+        "proposers": [
+          "TYO-validator-1",
+          "TYO-validator-3",
+          "TYO-validator-2"
+        ]
+      },
+      {
+        "number": 13,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-2",
+          "FRA-validator-3",
+          "FRA-validator-1"
+        ]
+      },
+      {
+        "number": 14,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-2",
+          "FRA-validator-1",
+          "FRA-validator-3"
+        ]
+      },
+      {
+        "number": 15,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-3",
+          "FRA-validator-1",
+          "FRA-validator-2"
+        ]
+      },
+      {
+        "number": 16,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-1",
+          "FRA-validator-2",
+          "FRA-validator-4"
+        ]
+      },
+      {
+        "number": 17,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-2",
+          "FRA-validator-1",
+          "FRA-validator-3"
+        ]
+      },
+      {
+        "number": 18,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-2",
+          "FRA-validator-3",
+          "FRA-validator-1"
+        ]
+      },
+      {
+        "number": 19,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-1",
+          "FRA-validator-4",
+          "FRA-validator-2"
+        ]
+      },
+      {
+        "number": 20,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-3",
+          "FRA-validator-2",
+          "FRA-validator-1"
+        ]
+      },
+      {
+        "number": 21,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-3",
+          "FRA-validator-1",
+          "FRA-validator-2"
+        ]
+      },
+      {
+        "number": 22,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-1",
+          "FRA-validator-2",
+          "FRA-validator-4"
+        ]
+      },
+      {
+        "number": 23,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-1",
+          "FRA-validator-3",
+          "FRA-validator-2"
+        ]
+      },
+      {
+        "number": 24,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-3",
+          "FRA-validator-1",
+          "FRA-validator-2"
+        ]
+      },
+      {
+        "number": 25,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-3",
+          "FRA-validator-1",
+          "FRA-validator-2"
+        ]
+      },
+      {
+        "number": 26,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-4",
+          "FRA-validator-1",
+          "FRA-validator-2"
+        ]
+      },
+      {
+        "number": 27,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-3",
+          "FRA-validator-2",
+          "FRA-validator-1"
+        ]
+      },
+      {
+        "number": 28,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-4",
+          "FRA-validator-1",
+          "FRA-validator-2"
+        ]
+      },
+      {
+        "number": 29,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-1",
+          "FRA-validator-2",
+          "FRA-validator-3"
+        ]
+      },
+      {
+        "number": 30,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-4",
+          "FRA-validator-1",
+          "FRA-validator-2"
+        ]
+      },
+      {
+        "number": 31,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-2",
+          "FRA-validator-1",
+          "FRA-validator-4"
+        ]
+      },
+      {
+        "number": 32,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-3",
+          "FRA-validator-1",
+          "FRA-validator-2"
+        ]
+      },
+      {
+        "number": 33,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-2",
+          "FRA-validator-3",
+          "FRA-validator-1"
+        ]
+      },
+      {
+        "number": 34,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-3",
+          "FRA-validator-1",
+          "FRA-validator-2"
+        ]
+      },
+      {
+        "number": 35,
+        "hubCode": "FRA",
+        "region": "Europe",
+        "proposers": [
+          "FRA-validator-2",
+          "FRA-validator-3",
+          "FRA-validator-1"
+        ]
+      },
+      {
+        "number": 36,
+        "hubCode": "NYC",
+        "region": "North America",
+        "proposers": [
+          "NYC-validator-2",
+          "NYC-validator-3",
+          "NYC-validator-1"
+        ]
+      },
+      {
+        "number": 37,
+        "hubCode": "NYC",
+        "region": "North America",
+        "proposers": [
+          "NYC-validator-2",
+          "NYC-validator-4",
+          "NYC-validator-1"
+        ]
+      },
+      {
+        "number": 38,
+        "hubCode": "NYC",
+        "region": "North America",
+        "proposers": [
+          "NYC-validator-4",
+          "NYC-validator-1",
+          "NYC-validator-2"
+        ]
+      },
+      {
+        "number": 39,
+        "hubCode": "NYC",
+        "region": "North America",
+        "proposers": [
+          "NYC-validator-1",
+          "NYC-validator-2",
+          "NYC-validator-4"
+        ]
+      },
+      {
+        "number": 40,
+        "hubCode": "NYC",
+        "region": "North America",
+        "proposers": [
+          "NYC-validator-3",
+          "NYC-validator-2",
+          "NYC-validator-1"
+        ]
+      },
+      {
+        "number": 41,
+        "hubCode": "NYC",
+        "region": "North America",
+        "proposers": [
+          "NYC-validator-3",
+          "NYC-validator-2",
+          "NYC-validator-1"
+        ]
+      },
+      {
+        "number": 42,
+        "hubCode": "NYC",
+        "region": "North America",
+        "proposers": [
+          "NYC-validator-4",
+          "NYC-validator-2",
+          "NYC-validator-1"
+        ]
+      },
+      {
+        "number": 43,
+        "hubCode": "NYC",
+        "region": "North America",
+        "proposers": [
+          "NYC-validator-1",
+          "NYC-validator-3",
+          "NYC-validator-2"
+        ]
+      },
+      {
+        "number": 44,
+        "hubCode": "NYC",
+        "region": "North America",
+        "proposers": [
+          "NYC-validator-4",
+          "NYC-validator-2",
+          "NYC-validator-1"
+        ]
+      },
+      {
+        "number": 45,
+        "hubCode": "NYC",
+        "region": "North America",
+        "proposers": [
+          "NYC-validator-4",
+          "NYC-validator-1",
+          "NYC-validator-2"
+        ]
+      },
+      {
+        "number": 46,
+        "hubCode": "NYC",
+        "region": "North America",
+        "proposers": [
+          "NYC-validator-2",
+          "NYC-validator-1",
+          "NYC-validator-3"
+        ]
+      },
+      {
+        "number": 47,
+        "hubCode": "NYC",
+        "region": "North America",
+        "proposers": [
+          "NYC-validator-4",
+          "NYC-validator-2",
+          "NYC-validator-1"
+        ]
+      }
+    ]
+  }
+}
