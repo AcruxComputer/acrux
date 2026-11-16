@@ -91,3 +91,40 @@ A sandbox of twelve validators runs for 12 s with the scenario's fault in window
 
 Hub commands take `--identity key.json` (the validator identity that signs and pays), `--rpc` (default the local validator, http://127.0.0.1:4990) and `--program` (default `ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm`).
 
+## Measured
+
+Acrux Net, 600 s fault-free at 50 transfers a second, twelve validators on one machine (`node scripts/summarize-run.mjs <store>` reads a run's `last-run.json`):
+
+| | |
+|---|---|
+| Skipped cblocks | 0 |
+| Finalized cblocks | 2,640, every cblock of the run |
+| State hashes | 10,564 checks across the twelve validators, 0 mismatches |
+| Execution skew between validators | at most 2 slots |
+| Slot pacing within a window | p50 50.0 ms, p99 51.3 ms |
+| Commit spread | p50 4.7 ms, p99 12.0 ms |
+| Attestation arrival after the block | p50 48.5 ms, p99 76.1 ms |
+| Cblock finalization | p50 324 ms, p99 398 ms |
+
+Window handovers per hub link. The floor is 50 ms plus the arrival of the second hub's votes for the 60% certificate, since Rotor's relays sit in every hub:
+
+| Link | p50 | p99 | Floor |
+|---|---:|---:|---:|
+| FRA-FRA | 149.1 ms | 156.1 ms | 134.9 ms |
+| NYC-NYC | 149.3 ms | 156.0 ms | 134.9 ms |
+| TYO-TYO | 180.6 ms | 189.0 ms | 166.7 ms |
+| FRA-NYC | 184.3 ms | 187.6 ms | 169.9 ms |
+| NYC-TYO | 163.6 ms | 163.7 ms | 150.8 ms |
+| TYO-FRA | 170.2 ms | 171.9 ms | 158.4 ms |
+
+What a send costs on Acrux Net (10 of each, the live net, a 0.001 SOL transfer with no priority fee; `../sdk/test/cost.mjs`):
+
+| Send | Fee | Submit to executed (median) | Submit to finalized (median) |
+|---|---:|---:|---:|
+| Plain, to 1 proposer | 6,000 lamports | 339 ms | 580 ms |
+| Plain, to all 3 proposers | 8,000 lamports | 342 ms | 585 ms |
+| 2-of-3 threshold | 8,000 lamports | 339 ms | 585 ms |
+
+The fee is the 5,000-lamport base fee plus 1,000 lamports for each included copy or fragment. A 2-of-3 send costs what a plain send to the same three proposers does, 2,000 lamports more than a plain send to one, and arrives just as fast.
+
+One proposer down for a whole window (`--crash-window`): 0 skips over 120 s, the window continues on P = {1, 2}.
