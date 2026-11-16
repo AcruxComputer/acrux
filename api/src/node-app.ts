@@ -38,7 +38,7 @@ export function createNodeApi() {
   const lab = new NodeLab(db)
   registries.acrux.start()
   registries.solana.start()
-  const app = createApi({ origins: env.CORS_ORIGINS, allowHeaders: ['Last-Event-ID'], contractVersion: CONTRACT_VERSION })
+  const app = createApi({ origins: env.CORS_ORIGINS, contractVersion: CONTRACT_VERSION })
 
   const net = async <M extends RpcMethod>(method: M, params?: unknown) => {
     try { return await gateway.call(method, params as never) }

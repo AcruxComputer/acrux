@@ -13,7 +13,6 @@ export type ApiOptions = {
   /** exact origins (scheme://host[:port]) allowed to call from a browser */
   origins: readonly string[]
   /** request headers beyond Content-Type: the fixture header, Last-Event-ID, solana-client for an RPC relay */
-  allowHeaders?: readonly string[]
   exposeHeaders?: readonly string[]
   /** true when the API keeps a session cookie */
   credentials?: boolean
@@ -49,7 +48,6 @@ export function createApi<V extends object = {}>(options: ApiOptions) {
     cors({
       origin: (origin) => (origins.has(origin) ? origin : null),
       allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowHeaders: ['Content-Type', ...(options.allowHeaders ?? [])],
       exposeHeaders: ['X-Request-Id', 'Retry-After', ...(options.contractVersion ? ['X-Contract-Version'] : []), ...(options.exposeHeaders ?? [])],
       credentials: options.credentials ?? false,
       maxAge: 600,

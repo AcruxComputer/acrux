@@ -28,8 +28,7 @@ export function createFixtureApi() {
   const lab = new FixtureLab()
   const grants: { address: string; ip: string; at: number }[] = []
   const gateway = createGatewayClient({ rpcUrl: env.GATEWAY_RPC_URL, wsUrl: 'ws://127.0.0.1:4931' })
-  const app = createApi<{ scenario: Scenario | null }>({ origins: env.CORS_ORIGINS,
-    allowHeaders: ['X-Fixture', 'X-Fixture-Session', 'Last-Event-ID'], contractVersion: CONTRACT_VERSION })
+  const app = createApi<{ scenario: Scenario | null }>({ origins: env.CORS_ORIGINS, contractVersion: CONTRACT_VERSION })
   if (env.MODE === 'fixture') app.use('*', fixtureScenario({ scenarios: SCENARIOS, errors: fixtureErrors, status: errors.status }))
   else app.use('*', async (c, next) => { c.set('scenario', null); await next() })
   app.get('/health', async c => {

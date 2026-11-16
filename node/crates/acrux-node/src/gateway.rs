@@ -19,7 +19,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowHeaders, CorsLayer};
 
 pub type SharedGateway = Arc<RwLock<GatewayState>>;
 pub type CommandReply = oneshot::Sender<std::result::Result<Value, String>>;
@@ -171,7 +171,7 @@ pub async fn run_gateway(
     let cors = CorsLayer::new()
         .allow_origin(origins())
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, header::HeaderName::from_static("solana-client")]);
+        .allow_headers(AllowHeaders::mirror_request());
     let http = Router::new()
         .route("/", post(rpc))
         .route("/rpc", post(rpc))
