@@ -7,8 +7,19 @@
       "name": "demo_pool",
       "address": "CUBR9LNdTwxwp5ARBQj1EopfuH8dr8u4i7DsXcb8HbHN",
       "path": "target/deploy/demo_pool.so"
+    },
+    {
+      "name": "hub_registry",
+      "address": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "path": "target/deploy/hub_registry.so"
     }
   ],
+  "registry": {
+    "program": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+    "address": "4eNA25M1QpgtumzFxVkfh8nDvUFVCzTW5jtbAd1KQvcF",
+    "feeVault": "Cugw8Vtd2TBPqVkVdc9LzrZm6DuzLB6z6ywhBCkrGkp5",
+    "authority": "7vERHL29edBDxaaCP7DRi53jTXdzCYwsHanKSxoMeWFy"
+  },
   "tokens": [
     {
       "symbol": "AXA",
@@ -108,6 +119,142 @@
       "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
       "lamports": 2039280,
       "data": "21D8u5DBqfNX3CMzamxb+rh01ULxAONtB5csPpSoxjoKGs/53o7nkZ8VAFRAP+mgAkA0ged2zoQYW6W43+6PEACAxqR+jQMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "executable": false
+    },
+    {
+      "label": "acrux registry",
+      "address": "4eNA25M1QpgtumzFxVkfh8nDvUFVCzTW5jtbAd1KQvcF",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 1900080,
+      "data": "L65u9ri2/NpmyROzFsOJ7LEn6ZR5/anWC3Pmvy5pjpWQbc1Sajo2gGbJE7MWw4nssSfplHn9qdYLc+a/LmmOlZBtzVJqOjaAsO/pM8zsGUi5lykyY4yq3SF9G3k+sv1Jm7Beiq3Ak74Aypo7AAAAAPQBAQAAAAAAAAAEAAAAAAAAAAQAAAADCAMAAAAAAAAA/g==",
+      "executable": false
+    },
+    {
+      "label": "acrux registry fee vault",
+      "address": "Cugw8Vtd2TBPqVkVdc9LzrZm6DuzLB6z6ywhBCkrGkp5",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 953520,
+      "data": "wLJF6DqVnYT+",
+      "executable": false
+    },
+    {
+      "label": "acrux hub FRA",
+      "address": "4Uwzgio6uxfzJCVH9pshkHKW66DjyozivnmWGfxjPzvW",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 1001677360,
+      "data": "j70EeKnqDn0BAAAAAAAAAEZSQQAAAAAAB+89ACZTCQDaPUoAZskTsxbDieyxJ+mUef2p1gtz5r8uaY6VkG3NUmo6NoAAypo7AAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP4=",
+      "executable": false
+    },
+    {
+      "label": "acrux member FRA 0",
+      "address": "4nFsipcaCRRK4cjuRfxqCGYN2K2MzArs5tmV9pRruFj8",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 1962720,
+      "data": "5420Ym2or6am31uOhuyIDjFYxPhOp9cy9oyPSUBZZGYPXVjUrtJ4yTO77Nh8FlwgXY7VxKg6pu0gUf9qnCxqjFQponZSbQ6TAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/Q==",
+      "executable": false
+    },
+    {
+      "label": "acrux member FRA 1",
+      "address": "B1YcFwnp4oiu27wTvpfvtUxHyo7jwZ8x1Xqcqwe7y9Ug",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 1962720,
+      "data": "5420Ym2or6ayXgll9oyLSMcGYhiMBjNXAJw3BQnf1Z2LX48ZFv8jWTO77Nh8FlwgXY7VxKg6pu0gUf9qnCxqjFQponZSbQ6TAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/w==",
+      "executable": false
+    },
+    {
+      "label": "acrux member FRA 2",
+      "address": "DxUWAUjMVaqmq8tR1FJg7eUiL8xhkKcUihjcHkHYFddB",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 1962720,
+      "data": "5420Ym2or6bqmLv3tZQYwDiFyOO3qov8cBa4+ZMCR5kvA8gSzi8hBTO77Nh8FlwgXY7VxKg6pu0gUf9qnCxqjFQponZSbQ6TAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/g==",
+      "executable": false
+    },
+    {
+      "label": "acrux member FRA 3",
+      "address": "EUikkNrHxzEB7frcJ816KXHhNgEF3cWYcFadSvMhvUeQ",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 1962720,
+      "data": "5420Ym2or6aC6JM09JJMEjAkT+9OpnH1o+BqN6Z3Ju2JXvWw14bpJTO77Nh8FlwgXY7VxKg6pu0gUf9qnCxqjFQponZSbQ6TAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/w==",
+      "executable": false
+    },
+    {
+      "label": "acrux hub NYC",
+      "address": "DYEffbuq8iuZdQvNz7KYj1Z8QoQYnc5HLwgQmpGtK73m",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 1001677360,
+      "data": "j70EeKnqDn0CAAAAAAAAAE5ZQwAAAAAA2qgUAJn9uP+3DT8AZskTsxbDieyxJ+mUef2p1gtz5r8uaY6VkG3NUmo6NoAAypo7AAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP4=",
+      "executable": false
+    },
+    {
+      "label": "acrux member NYC 4",
+      "address": "GEdDWHLzamJ6q2DqxqDFHkDwmvAMmPo5ThtT8TzpB7xc",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 1962720,
+      "data": "5420Ym2or6ZyG90PFqmKoInNGLEh9pSfKbDjtaPY+ELAhgtAmWIZNbpMs3zueds0jyC5WdjtOa2+hk/I7MCcA1U2wflSbjWYAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+w==",
+      "executable": false
+    },
+    {
+      "label": "acrux member NYC 5",
+      "address": "7rwp82gAkzMM4GtW1QeQkbYPsyU6UKc2M1BAuQyzVMn4",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 1962720,
+      "data": "5420Ym2or6aJfcwpo0eBSYTtydm1Yv45A84vqJO1q1MhYfnXJAuGTLpMs3zueds0jyC5WdjtOa2+hk/I7MCcA1U2wflSbjWYAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/Q==",
+      "executable": false
+    },
+    {
+      "label": "acrux member NYC 6",
+      "address": "3pfBTcqDM7SpQEFho8u2UTwc4cRqoF3CYsfGhDj3DBUE",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 1962720,
+      "data": "5420Ym2or6bX5y1Sg+3BVclD8HjEd+OK2nS+rP/7VAk0dYzTfUj117pMs3zueds0jyC5WdjtOa2+hk/I7MCcA1U2wflSbjWYAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/w==",
+      "executable": false
+    },
+    {
+      "label": "acrux member NYC 7",
+      "address": "9RXvih3QsFJ14opuYDoDE7ayHwfZhBwhQhvpeYPci1qq",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 1962720,
+      "data": "5420Ym2or6bGKHJpnGI+d39tSwk27U6yDY7NQwfTfXl+yRMyykh4WbpMs3zueds0jyC5WdjtOa2+hk/I7MCcA1U2wflSbjWYAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/w==",
+      "executable": false
+    },
+    {
+      "label": "acrux hub TYO",
+      "address": "Es8h8aX38MUaRE6WU3r1pqV6E3h6VynbKvStvmzXV8m7",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 1001677360,
+      "data": "j70EeKnqDn0DAAAAAAAAAFRZTwAAAAAAQXjD/0owMwDNRDgAZskTsxbDieyxJ+mUef2p1gtz5r8uaY6VkG3NUmo6NoAAypo7AAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPw=",
+      "executable": false
+    },
+    {
+      "label": "acrux member TYO 8",
+      "address": "4Rgm3CykQX5AeTie7e4pmgLwXVCzo7fDBAszeFeFLEA6",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 1962720,
+      "data": "5420Ym2or6bAr2sdjNmbyK34RBJYd5HyKYMVvClOK/TN66V3WZ5f1s3/qvKYseq0xcDWNYbwJCfRNC94+ttFLl3DjhjfgttaAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/g==",
+      "executable": false
+    },
+    {
+      "label": "acrux member TYO 9",
+      "address": "B9uT2ehz6AVheP8oposLA6K2rRTD8pUAzeHHBCkbepWL",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 1962720,
+      "data": "5420Ym2or6aGm+tdLYAL/KFwIQe8V0fdYSVdrKmyq92KBP2BsIJI3s3/qvKYseq0xcDWNYbwJCfRNC94+ttFLl3DjhjfgttaAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/w==",
+      "executable": false
+    },
+    {
+      "label": "acrux member TYO 10",
+      "address": "DuiDApm5cnoa2iAXhY276sEDzQHyKhwsHZdMbo7QrsYA",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 1962720,
+      "data": "5420Ym2or6ZcPyY9onc2eEF8yf5TeknIv4wgNKczgNSs4o8jFD46S83/qvKYseq0xcDWNYbwJCfRNC94+ttFLl3DjhjfgttaAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/Q==",
+      "executable": false
+    },
+    {
+      "label": "acrux member TYO 11",
+      "address": "49yHvtbs345X1YPQSgzgdmjGZ882BjeXyjMWDiCAEF8P",
+      "owner": "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm",
+      "lamports": 1962720,
+      "data": "5420Ym2or6YmIM7ucnejIgsgHe3twpYP0CFjtAIQscuwqNNJwnOBN83/qvKYseq0xcDWNYbwJCfRNC94+ttFLl3DjhjfgttaAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/w==",
       "executable": false
     }
   ]

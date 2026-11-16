@@ -9,7 +9,7 @@ import { Keypair } from '@solana/web3.js'
 export const DEV_SEED = 'acrux-dev-seed-v1'
 /** A public net's genesis keys (faucet, mints, mint authority) come from a secret seed instead. */
 export const GENESIS_SEED = process.env.ACRUX_GENESIS_SEED || DEV_SEED
-const SEEDED = new Set(['mint-a', 'mint-b', 'mint-authority', 'faucet'])
+const SEEDED = new Set(['mint-a', 'mint-b', 'mint-authority', 'faucet', 'acrux-registry'])
 
 export const LABELS = [
   'demo-pool-program', // program id of the demo pool on Acrux Net
@@ -19,6 +19,7 @@ export const LABELS = [
   'faucet', // owns the genesis token accounts the faucet pays from
   'local-authority', // local validator: upgrade authority, registry authority, genesis lamports
   'local-fee-destination', // local validator: where sweep_fees sends the fee vault
+  'acrux-registry', // Acrux's own Hub Registry: its authority and fee destination at genesis
 ]
 
 /** keypair = ed25519 from sha256(DEV_SEED + "/" + label) */

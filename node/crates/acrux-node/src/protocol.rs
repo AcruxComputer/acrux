@@ -179,6 +179,8 @@ pub struct Network {
     lab_evidence: Arc<std::sync::Mutex<Vec<Value>>>,
     lab_marked: Arc<std::sync::Mutex<Option<String>>>,
     lab_injected: bool,
+    /// Solana JSON-RPC: transaction signatures sent through `sendTransaction`, to their ids.
+    signature_ids: BTreeMap<String, String>,
 }
 #[derive(Default, Clone, Copy)]
 struct FactsCursor {
@@ -210,40 +212,48 @@ impl Network {
         commands: mpsc::Receiver<GatewayCommand>,
     ) -> Result<Self> {
         let profile = crate::profiling::Profiling::new();
-        let keys = (0..12).map(|i| crate::identity_key(config.seed, i)).collect::<Vec<_>>();
+        let keys = (0..12).map(|i| crate::identity_key(i)).collect::<Vec<_>>();
         let identities = keys
             .iter()
             .map(|k| bs58::encode(k.verifying_key().as_bytes()).into_string())
             .collect::<Vec<_>>();
         let stakes = vec![100_000_000u64; 12];
-        let places = [
-            ("FRA", "Europe", 50.0379, 8.5622),
-            ("NYC", "North America", 40.6413, -73.7781),
-            ("TYO", "Asia Pacific", 35.5494, 139.7798),
-        ];
+        let genesis = config
+            .genesis_path
+            .as_deref()
+            .map(|path| crate::genesis::Genesis::load(Path::new(path)).map(Arc::new))
+            .transpose()?;
+        // The hubs, their places and their members come from the chain's own Hub Registry in genesis.
+        let registry = match &genesis {
+            Some(genesis) => genesis.registry_hubs()?,
+            None => vec![],
+        };
+        let registry = if registry.is_empty() {
+            [("FRA", 50.0379, 8.5622), ("NYC", 40.6413, -73.7781), ("TYO", 35.5494, 139.7798)]
+                .iter()
+                .enumerate()
+                .map(|(i, (code, latitude, longitude))| crate::genesis::RegistryHub { code: (*code).into(), latitude: *latitude, longitude: *longitude, members: identities[i * 4..i * 4 + 4].to_vec() })
+                .collect()
+        } else {
+            registry
+        };
+        let hub_of = |identity: &str| registry.iter().find(|h| h.members.iter().any(|m| m == identity));
         let peers = (0..12)
             .map(|id| {
-                let p = places[id / 4];
-                Peer {
-                    id,
-                    hub: p.0.into(),
-                    latitude: p.2,
-                    longitude: p.3,
-                    stake: stakes[id],
-                }
+                let hub = hub_of(&identities[id]).with_context(|| format!("Validator {} is in no hub of the registry", identities[id]))?;
+                Ok(Peer { id, hub: hub.code.clone(), latitude: hub.latitude, longitude: hub.longitude, stake: stakes[id] })
             })
-            .collect::<Vec<_>>();
-        let hubs = places
+            .collect::<Result<Vec<_>>>()?;
+        let hubs = registry
             .iter()
-            .enumerate()
-            .map(|(i, p)| schedule::Hub {
-                code: p.0.into(),
-                region: p.1.into(),
-                members: (i * 4..i * 4 + 4)
-                    .map(|j| schedule::Member {
-                        identity: identities[j].clone(),
-                        stake: stakes[j],
-                    })
+            .map(|h| schedule::Hub {
+                code: h.code.clone(),
+                region: crate::genesis::region_of(h.latitude, h.longitude).into(),
+                members: h
+                    .members
+                    .iter()
+                    .filter_map(|m| identities.iter().position(|i| i == m))
+                    .map(|j| schedule::Member { identity: identities[j].clone(), stake: stakes[j] })
                     .collect(),
             })
             .collect::<Vec<_>>();
@@ -292,11 +302,6 @@ impl Network {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let genesis = config
-            .genesis_path
-            .as_deref()
-            .map(|path| crate::genesis::Genesis::load(Path::new(path)).map(Arc::new))
-            .transpose()?;
         let mut programs = programs;
         if let Some(genesis) = &genesis {
             programs.extend(genesis.programs.iter().map(|(address, path)| crate::execution::GenesisProgram { address: address.clone(), path: path.clone() }));
@@ -419,6 +424,7 @@ impl Network {
             lab_evidence: Arc::new(std::sync::Mutex::new(Vec::new())),
             lab_marked: Arc::new(std::sync::Mutex::new(None)),
             lab_injected: false,
+            signature_ids: BTreeMap::new(),
         })
     }
     fn window(&self, number: u64) -> schedule::Window {
@@ -659,6 +665,7 @@ impl Network {
                     lab_evidence: self.lab_evidence.clone(),
                     lab_marked: self.lab_marked.clone(),
                     lab_injected: false,
+                    signature_ids: BTreeMap::new(),
                 }),
                 nodes,
             };
@@ -2784,6 +2791,10 @@ impl Network {
                 let result=self.nodes[0].executor.as_ref().unwrap().balance(&address).map(|value|json!({"address":address,"lamports":value.to_string(),"reserveLamports":self.config.reserve.to_string(),"spendableLamports":value.saturating_sub(self.config.reserve).to_string(),"slot":self.nodes[0].last_executed.unwrap_or(0)})).map_err(|e|e.to_string());
                 let _ = reply.send(result);
             }
+            GatewayCommand::Solana { method, params, reply } => {
+                let result = self.solana_rpc(&method, params).await;
+                let _ = reply.send(result.map_err(|e| e.to_string()));
+            }
             GatewayCommand::Credit {
                 address,
                 lamports,
@@ -3224,5 +3235,80 @@ impl NodeRunner {
             }
         }
         Ok((self.id, self.network))
+    }
+}
+
+/// Solana's JSON-RPC, the part a wallet, web3.js or the `acrux hub` commands use: reads of
+/// accounts, balances, blockhashes and the epoch, and `sendTransaction` with its status.
+impl Network {
+    async fn solana_rpc(&mut self, method: &str, params: Value) -> Result<Value> {
+        let arg = |i: usize| params.get(i).cloned().unwrap_or(Value::Null);
+        let slot = self.nodes[0].last_executed.unwrap_or(0);
+        let context = json!({"slot": slot, "apiVersion": "2.2.1"});
+        let executor = self.nodes[0].executor.as_ref().unwrap();
+        let account_json = |a: &solana_sdk::account::Account| json!({
+            "lamports": a.lamports, "owner": a.owner.to_string(), "data": [B64.encode(&a.data), "base64"],
+            "executable": a.executable, "rentEpoch": u64::MAX, "space": a.data.len(),
+        });
+        Ok(match method {
+            "getHealth" => json!("ok"),
+            "getVersion" => json!({"solana-core": concat!("acrux-", env!("CARGO_PKG_VERSION")), "feature-set": 0}),
+            "getSlot" | "getBlockHeight" => json!(slot),
+            "getEpochInfo" => json!({"absoluteSlot": slot, "blockHeight": slot, "epoch": slot / 432_000, "slotIndex": slot % 432_000, "slotsInEpoch": 432_000}),
+            "getLatestBlockhash" => json!({"context": context, "value": {"blockhash": executor.latest_blockhash(), "lastValidBlockHeight": slot + crate::execution::BLOCKHASH_AGE_SLOTS - 8}}),
+            "getBalance" => json!({"context": context, "value": executor.balance(arg(0).as_str().context("address")?)?}),
+            "getAccountInfo" => json!({"context": context, "value": executor.account(arg(0).as_str().context("address")?)?.filter(|a| a.lamports > 0).as_ref().map(account_json)}),
+            "getMultipleAccounts" => {
+                let keys = arg(0).as_array().context("addresses")?.iter().map(|k| k.as_str().context("address").map(str::to_owned)).collect::<Result<Vec<_>>>()?;
+                let values = keys.iter().map(|k| Ok(executor.account(k)?.filter(|a| a.lamports > 0).as_ref().map(account_json))).collect::<Result<Vec<_>>>()?;
+                json!({"context": context, "value": values})
+            }
+            "getProgramAccounts" => json!(executor.accounts_owned_by(arg(0).as_str().context("program")?)?.into_iter().filter(|(_, a)| a.lamports > 0).map(|(k, a)| json!({"pubkey": k, "account": account_json(&a)})).collect::<Vec<_>>()),
+            "getMinimumBalanceForRentExemption" => json!(executor.rent_exempt_minimum(arg(0).as_u64().context("data length")? as usize)),
+            "getSignaturesForAddress" => json!([]),
+            "getVoteAccounts" => json!({"current": self.identities.iter().zip(&self.stakes).map(|(identity, stake)| json!({"nodePubkey": identity, "votePubkey": identity, "activatedStake": stake, "epochVoteAccount": true, "commission": 0, "lastVote": slot, "rootSlot": slot})).collect::<Vec<_>>(), "delinquent": []}),
+            "sendTransaction" => {
+                let encoded = arg(0).as_str().context("transaction")?.to_owned();
+                let bytes = match arg(1)["encoding"].as_str() {
+                    Some("base64") => B64.decode(&encoded)?,
+                    _ => bs58::decode(&encoded).into_vec()?,
+                };
+                let tx: solana_sdk::transaction::VersionedTransaction = bincode::deserialize(&bytes)?;
+                let signature = tx.signatures.first().context("unsigned transaction")?.to_string();
+                let target = self.latest_started() + 3;
+                let valid = executor.validate_transaction(&bytes, target).map_err(|e| anyhow::anyhow!("Transaction simulation failed: {e}"))?;
+                self.submit(json!({"header": valid.header, "transaction": B64.encode(&bytes), "receivers": [1, 2, 3]})).await?;
+                self.signature_ids.insert(signature.clone(), valid.header.id.clone());
+                if self.signature_ids.len() > 100_000 {
+                    let first = self.signature_ids.keys().next().cloned().unwrap();
+                    self.signature_ids.remove(&first);
+                }
+                json!(signature)
+            }
+            "getSignatureStatuses" => {
+                let mut statuses = vec![];
+                for signature in arg(0).as_array().context("signatures")? {
+                    let id = signature.as_str().and_then(|s| self.signature_ids.get(s)).cloned();
+                    let record = match id {
+                        Some(id) => match self.gateway.read().await.transactions.get(&id).cloned() {
+                            Some(tx) => Some(tx),
+                            None => self.store.get(&format!("transaction/{id}"))?,
+                        },
+                        None => None,
+                    };
+                    statuses.push(match record.as_ref().and_then(|tx| tx["state"].as_str()) {
+                        Some(state @ ("executed" | "finalized" | "failed")) => json!({
+                            "slot": record.as_ref().unwrap()["executedSlot"],
+                            "confirmations": if state == "finalized" { Value::Null } else { json!(0) },
+                            "err": if record.as_ref().unwrap()["result"] == "success" { Value::Null } else { json!({"InstructionError": [0, {"Custom": 0}], "message": record.as_ref().unwrap()["failure"]}) },
+                            "confirmationStatus": if state == "finalized" { "finalized" } else { "confirmed" },
+                        }),
+                        _ => Value::Null,
+                    });
+                }
+                json!({"context": context, "value": statuses})
+            }
+            other => anyhow::bail!("Method not found: {other}"),
+        })
     }
 }

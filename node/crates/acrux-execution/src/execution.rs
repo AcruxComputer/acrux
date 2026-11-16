@@ -784,6 +784,14 @@ impl SvmExecutor {
             self.accounts.remove(&key);
         }
     }
+    /// Every account the given program owns, for `getProgramAccounts`.
+    pub fn accounts_owned_by(&self, owner: &str) -> Result<Vec<(String, Account)>> {
+        let owner = Pubkey::from_str(owner)?;
+        Ok(self.accounts.iter().filter(|(_, a)| a.owner == owner).map(|(k, a)| (k.to_string(), a.as_ref().clone())).collect())
+    }
+    pub fn rent_exempt_minimum(&self, len: usize) -> u64 {
+        self.svm.minimum_balance_for_rent_exemption(len)
+    }
     pub fn account_count(&self) -> usize {
         self.accounts.len()
     }

@@ -2,7 +2,15 @@
 
 New Constellation on Alpenglow: every 50 ms slot, three co-located proposers each stream an encrypted block, exchange signed commitments within 2δlocal, then release their keys in attestations; validators agree on the set P, decrypt, merge by priority across four tracks, execute on the SVM and vote once per four-slot cblock.
 
-This workspace is the node, Acrux Net (twelve validators in FRA, NYC and TYO), the Fault Lab runner and the `acrux` CLI.
+Acrux is a chain of its own, a faster Solana fork: Solana's transactions and programs on the SVM, ordered by concurrent proposers. Acrux Net is that chain: twelve validators in FRA, NYC and TYO. This workspace is its node, the Fault Lab runner and the `acrux` CLI.
+
+## ACRUX
+
+ACRUX is the chain's native token, with 9 decimals: amounts are in lamports, 1 ACRUX = 1,000,000,000 lamports, the unit every `lamports` field of the RPC, the API, the SDK and the CLI carries. Fees are paid in it (the base fee of 5,000 lamports per signature, half burned; 1,000 lamports per included copy or fragment; the priority fee), the fee payer's reserve is 0.001 ACRUX, and the faucet grants test ACRUX (2 ACRUX a grant, `FAUCET_GRANT_LAMPORTS`).
+
+## Hub Registry on Acrux
+
+The genesis loads the same `hub_registry` program as Solana's (`ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm`) with its accounts: the registry (deposit 1 ACRUX, fee 500 bps, cooldown 1 epoch, inactivity 4 epochs, n_min 4), the hubs FRA, NYC and TYO, and the twelve validators' memberships. The node takes its hubs, their places and their members from those accounts: the link delays between validators and Algorithm 3's proposer schedule both come from the registry. `acrux hub register|join|leave|move|release --rpc <Acrux RPC>` sends the instructions to Acrux, as `--rpc <Solana RPC>` does to Solana mainnet. An epoch on Acrux is 432,000 slots.
 
 ## Crates
 
@@ -59,6 +67,8 @@ JSON-RPC on `--gateway-port`: `getSnapshot`, `getSlot`, `getRecentSlots`, `getCu
 - `getFacts` is the last ten minutes of the net, measured on the node clock: pacing within windows, handover per hub link with that link's floor, commit spread, attestation arrival relative to the block, cblock finalization.
 - A threshold transaction's fragments, key shares and header signature are byte for byte what `acrux-execution/src/threshold.rs` decodes; `@acrux/sdk` and `seal_for_receivers` produce them.
 
+**Solana's JSON-RPC** on the same endpoint, for wallets, web3.js and the `acrux hub` commands: a request with array params is Solana's. Methods: `getHealth`, `getVersion`, `getSlot`, `getBlockHeight`, `getEpochInfo`, `getLatestBlockhash`, `getBalance`, `getAccountInfo`, `getMultipleAccounts`, `getProgramAccounts`, `getMinimumBalanceForRentExemption`, `getVoteAccounts`, `getSignaturesForAddress`, `sendTransaction` (base58 or base64; it goes to the next slots' three proposers) and `getSignatureStatuses` (`confirmed` once executed, `finalized` once its cblock is). Programs come with the genesis (`--program ADDRESS=PATH`, or the genesis file's `programs`).
+
 ## Fault Lab
 
 ```bash
@@ -80,7 +90,7 @@ A sandbox of twelve validators runs for 12 s with the scenario's fault in window
 
 | Command | |
 |---|---|
-| `acrux net up` / `acrux cluster up --hubs FRA,NYC,TYO` | a local Acrux net |
+| `acrux net up` / `acrux cluster up --hubs FRA,NYC,TYO` | a local Acrux net (`--genesis` names the genesis file) |
 | `acrux keygen --out key.json` | a Solana keypair file; prints the address |
 | `acrux send --keypair key.json --to <address> --lamports N [--n 3 --t 2]` | a plain or t-of-n transfer, followed to finality |
 | `acrux node follow <rpc-url>` | follows a net from its latest finalized cblock: loads that cblock's state and checks its hash, then for every finalized slot checks each attestation's signature and Agreed(s), decrypts the agreed blocks with the released keys, checks them against the attested commitments, re-executes them on its own SVM and compares the state hash with the net's and with the finalization certificate |
@@ -89,7 +99,7 @@ A sandbox of twelve validators runs for 12 s with the scenario's fault in window
 | `acrux schedule` | Algorithm 3 for hubs given as JSON on stdin (the API's schedule preview) |
 | `acrux lab run` | one Fault Lab scenario |
 
-Hub commands take `--identity key.json` (the validator identity that signs and pays), `--rpc` (default the local validator, http://127.0.0.1:4990) and `--program` (default `ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm`).
+Hub commands take `--identity key.json` (the validator identity that signs and pays), `--rpc` (an Acrux RPC such as https://rpc.acrux.computer for Acrux's registry, a Solana RPC for mainnet's; default the local Solana validator, http://127.0.0.1:4990) and `--program` (default `ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm`, the same on both chains).
 
 ## Measured
 
@@ -117,7 +127,7 @@ Window handovers per hub link. The floor is 50 ms plus the arrival of the second
 | NYC-TYO | 163.6 ms | 163.7 ms | 150.8 ms |
 | TYO-FRA | 170.2 ms | 171.9 ms | 158.4 ms |
 
-What a send costs on Acrux Net (10 of each, the live net, a 0.001 SOL transfer with no priority fee; `../sdk/test/cost.mjs`):
+What a send costs on Acrux Net (10 of each, the live net, a 0.001 ACRUX transfer with no priority fee; `../sdk/test/cost.mjs`):
 
 | Send | Fee | Submit to executed (median) | Submit to finalized (median) |
 |---|---:|---:|---:|

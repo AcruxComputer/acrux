@@ -91,6 +91,8 @@ enum ClusterCommand {
         metrics_port: u16,
         #[arg(long, default_value = "target/runs/cluster")]
         store: String,
+        #[arg(long, default_value = "../chain/genesis/acrux-net.json")]
+        genesis: String,
     },
 }
 #[derive(Subcommand)]
@@ -242,9 +244,9 @@ async fn run() -> anyhow::Result<()> {
             genesis_path: Some(genesis),
             ..Default::default()
         },
-        Command::Cluster { command: ClusterCommand::Up { hubs, gateway_port, ws_port, base_port, metrics_port, store } } => {
+        Command::Cluster { command: ClusterCommand::Up { hubs, gateway_port, ws_port, base_port, metrics_port, store, genesis } } => {
             anyhow::ensure!(hubs.split(',').map(str::trim).collect::<Vec<_>>() == ["FRA", "NYC", "TYO"], "This build's genesis has the hubs FRA, NYC and TYO");
-            Configuration { gateway_port, websocket_port: ws_port, base_port, metrics_port, store_path: store, genesis_path: Some("../chain/genesis/acrux-net.json".into()), ..Default::default() }
+            Configuration { gateway_port, websocket_port: ws_port, base_port, metrics_port, store_path: store, genesis_path: Some(genesis), ..Default::default() }
         }
         Command::Schedule | Command::Identities { .. } | Command::Keygen { .. } | Command::Send { .. } | Command::Node { .. } | Command::Hub { .. } => unreachable!("handled above"),
         Command::Lab { command: LabCommand::Run { scenario, seed, base_port, out, genesis } } => {

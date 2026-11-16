@@ -97,7 +97,7 @@ impl Genesis {
         })
     }
 
-    /// A SOL transfer plus, per demo mint, the receiver's associated token account and a grant.
+    /// An ACRUX transfer plus, per demo mint, the receiver's associated token account and a grant.
     pub fn faucet_instructions(&self, receiver: &Pubkey, lamports: u64) -> Result<Vec<Instruction>> {
         let token = Pubkey::from_str(TOKEN_PROGRAM)?;
         let ata = Pubkey::from_str(ATA_PROGRAM)?;
@@ -168,6 +168,72 @@ impl Genesis {
             "feeAmount": fee.to_string(),
             "slot": slot,
         }))
+    }
+}
+
+/// A hub of the Hub Registry in genesis, with the identities of its effective members.
+pub struct RegistryHub {
+    pub code: String,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub members: Vec<String>,
+}
+
+const HUB_DISCRIMINATOR: [u8; 8] = [143, 189, 4, 120, 169, 234, 14, 125];
+const MEMBERSHIP_DISCRIMINATOR: [u8; 8] = [231, 141, 180, 98, 109, 168, 175, 166];
+
+impl Genesis {
+    /// The Hub Registry's hubs and members as genesis writes them (hub_registry's Hub and
+    /// Membership accounts), in hub id order; empty when the genesis carries no registry.
+    pub fn registry_hubs(&self) -> Result<Vec<RegistryHub>> {
+        let mut hubs = vec![];
+        let mut members = vec![];
+        for (address, account) in &self.accounts {
+            let d = &account.data;
+            if d.len() >= 8 && d[..8] == HUB_DISCRIMINATOR {
+                let id = u64::from_le_bytes(d[8..16].try_into()?);
+                let code = String::from_utf8(d[16..24].iter().copied().take_while(|b| *b != 0).collect())?;
+                let xyz = [24, 28, 32].map(|o| i32::from_le_bytes(d[o..o + 4].try_into().unwrap()) as f64);
+                let (latitude, longitude) = geodetic(xyz);
+                hubs.push((id, address.clone(), RegistryHub { code, latitude, longitude, members: vec![] }));
+            } else if d.len() >= 8 && d[..8] == MEMBERSHIP_DISCRIMINATOR {
+                let identity = bs58::encode(&d[8..40]).into_string();
+                let hub = bs58::encode(&d[40..72]).into_string();
+                // Effective at genesis, with nothing pending (pending is the byte after three u64s).
+                if u64::from_le_bytes(d[88..96].try_into()?) == 0 && d[96] == 0 {
+                    members.push((hub, identity));
+                }
+            }
+        }
+        hubs.sort_by_key(|(id, _, _)| *id);
+        for (hub, identity) in members {
+            hubs.iter_mut().find(|(_, address, _)| *address == hub).context("Membership of an unknown hub")?.2.members.push(identity);
+        }
+        Ok(hubs.into_iter().map(|(_, _, hub)| hub).collect())
+    }
+}
+
+/// WGS84 ECEF (metres) to geodetic latitude and longitude in degrees, Bowring's method.
+fn geodetic([x, y, z]: [f64; 3]) -> (f64, f64) {
+    let (a, f) = (6_378_137.0f64, 1.0 / 298.257223563);
+    let b = a * (1.0 - f);
+    let (e2, ep2) = (f * (2.0 - f), (a * a - b * b) / (b * b));
+    let p = x.hypot(y);
+    let theta = (z * a).atan2(p * b);
+    let latitude = (z + ep2 * b * theta.sin().powi(3)).atan2(p - e2 * a * theta.cos().powi(3));
+    (latitude.to_degrees(), y.atan2(x).to_degrees())
+}
+
+/// The regions a run of windows stays inside (SIMD-0675), by location.
+pub fn region_of(latitude: f64, longitude: f64) -> &'static str {
+    if longitude < -30.0 {
+        if latitude >= 12.0 { "North America" } else { "South America" }
+    } else if longitude < 60.0 {
+        if latitude >= 35.0 { "Europe" } else { "Africa and Middle East" }
+    } else if latitude >= -10.0 {
+        "Asia Pacific"
+    } else {
+        "Oceania"
     }
 }
 

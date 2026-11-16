@@ -192,9 +192,9 @@ Creates the pool and its two vaults and moves the first reserves in from the pay
 | `faucet` | the faucet key, its lamports, its two token accounts and their balance |
 | `accounts` | each account as `label`, `address`, `owner`, `lamports`, `data` (base64), `executable` |
 
-The eight accounts: the two mints, the pool, its two vaults, the faucet's system account (100 SOL) and the faucet's two associated token accounts (1,000,000,000 AXA and 1,000,000,000 AXB). Each mint's supply equals its vault plus the faucet's balance. Lamports are the rent-exempt minimum under the SVM's default rent (3,480 lamports per byte-year, two years, 128 bytes of overhead).
+The eight accounts: the two mints, the pool, its two vaults, the faucet's system account (100 ACRUX) and the faucet's two associated token accounts (1,000,000,000 AXA and 1,000,000,000 AXB). Each mint's supply equals its vault plus the faucet's balance. Lamports are the rent-exempt minimum under the SVM's default rent (3,480 lamports per byte-year, two years, 128 bytes of overhead).
 
-**The faucet hands out demo tokens.** Its token accounts are in genesis for that: a grant is one transaction signed by the faucet key with an idempotent associated token account creation for the receiver and an SPL Token transfer, next to the SOL grant. A browser key that holds AXA or AXB then swaps with the single `swap` instruction above.
+**The faucet hands out demo tokens.** Its token accounts are in genesis for that: a grant is one transaction signed by the faucet key with an idempotent associated token account creation for the receiver and an SPL Token transfer, next to the ACRUX grant. A browser key that holds AXA or AXB then swaps with the single `swap` instruction above.
 
 ## Keys
 

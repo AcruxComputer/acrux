@@ -6,9 +6,10 @@ pub mod lab;
 pub mod limits;
 
 /// Validator `i`'s identity: from `ACRUX_IDENTITY_SEED` on a public net (a secret, since these
-/// identities hold the net's Hub Registry memberships), else from the run's numeric seed.
-pub fn identity_key(seed: u64, i: usize) -> ed25519_dalek::SigningKey {
-    let seed = std::env::var("ACRUX_IDENTITY_SEED").unwrap_or_else(|_| seed.to_string());
+/// identities hold the net's Hub Registry memberships), else the published development seed. Every
+/// run on one genesis, Fault Lab sandboxes included, has the validators its registry names.
+pub fn identity_key(i: usize) -> ed25519_dalek::SigningKey {
+    let seed = std::env::var("ACRUX_IDENTITY_SEED").unwrap_or_else(|_| "20261116".into());
     ed25519_dalek::SigningKey::from_bytes(&crypto::hash(format!("acrux-local-identity-{seed}-{i}").as_bytes()))
 }
 

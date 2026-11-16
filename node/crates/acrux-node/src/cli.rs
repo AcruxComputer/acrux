@@ -42,9 +42,8 @@ pub fn keygen(out: &str) -> Result<()> {
 
 pub fn identities(out: &str) -> Result<()> {
     std::fs::create_dir_all(out)?;
-    let config = crate::types::Configuration::default();
     for i in 0..12 {
-        let secret = crate::identity_key(config.seed, i);
+        let secret = crate::identity_key(i);
         let keypair = Keypair::from_bytes(&secret.to_keypair_bytes()).map_err(|e| anyhow::anyhow!("{e}"))?;
         let path = format!("{out}/validator-{i}.json");
         write_keypair_file(&keypair, &path).map_err(|e| anyhow::anyhow!("{e}"))?;

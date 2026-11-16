@@ -47,6 +47,12 @@ pub enum GatewayCommand {
     DemoPool {
         reply: CommandReply,
     },
+    /// Solana's JSON-RPC, called with array params.
+    Solana {
+        method: String,
+        params: Value,
+        reply: CommandReply,
+    },
     /// For `acrux node follow`: the executed state at the latest finalized cblock.
     ExecutionSnapshot {
         reply: CommandReply,
@@ -238,11 +244,23 @@ async fn rpc(State(state): State<SharedGateway>, ConnectInfo(peer): ConnectInfo<
     }
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let limits = crate::limits::limits();
-    let allowed = if matches!(method, "submitTransaction" | "submitFragment") { limits.submit(client) } else { limits.read(client) };
+    let allowed = if matches!(method, "submitTransaction" | "submitFragment" | "sendTransaction") { limits.submit(client) } else { limits.read(client) };
     if !allowed {
         return (StatusCode::TOO_MANY_REQUESTS, rpc_error(id, -32005, "RATE_LIMITED", "Too many requests from this address; slow down.")).into_response();
     }
     let params = request.get("params").cloned().unwrap_or(json!({}));
+    // Solana's methods take array params; Acrux's take an object. Solana-only methods may omit them.
+    let solana_only = matches!(method, "getHealth" | "getVersion" | "getBlockHeight" | "getEpochInfo" | "getAccountInfo" | "getMultipleAccounts" | "getProgramAccounts" | "getMinimumBalanceForRentExemption" | "getSignaturesForAddress" | "getVoteAccounts" | "sendTransaction" | "getSignatureStatuses");
+    if params.is_array() || (solana_only && !params.is_object()) || (solana_only && params.as_object().is_some_and(|o| o.is_empty())) {
+        let params = if params.is_array() { params } else { json!([]) };
+        return match command(&state, |reply| GatewayCommand::Solana { method: method.to_owned(), params, reply }).await {
+            Ok(result) => Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response(),
+            Err(message) => {
+                let code = if message.starts_with("Method not found") { -32601 } else { -32002 };
+                Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})).into_response()
+            }
+        };
+    }
     if !params.is_object() {
         return rpc_error(id, -32602, "INVALID_INPUT", "Params must be an object.").into_response();
     }
