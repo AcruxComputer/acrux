@@ -1,0 +1,394 @@
+{
+  "paper": "New Constellation v1.0, Kniep and Wattenhofer, 2026-11-14",
+  "parameters": {
+    "k": 3,
+    "kappa": 4,
+    "w": 16,
+    "deltaLocalUs": 10000,
+    "deltaBlockUs": 50000,
+    "deltaGlobalUs": 250000,
+    "timeoutUs": 750000,
+    "tracks": 4,
+    "reserveLamports": "1000000",
+    "trackCapacityCu": 2000000,
+    "fragmentExpirySlots": 8,
+    "alpha": 0.5,
+    "minimumHubMembers": 4,
+    "minimumHubStake": "12000000"
+  },
+  "entries": [
+    {
+      "reference": "Algorithm 1",
+      "lines": "1-6",
+      "file": "node/crates/acrux-node/src/protocol.rs",
+      "function": "Network::start_window / Network::tick",
+      "scenario": "crash",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 1",
+      "lines": "7-9",
+      "file": "node/crates/acrux-node/src/protocol.rs",
+      "function": "Network::begin_block",
+      "scenario": "last-look",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 1",
+      "lines": "10-13",
+      "file": "node/crates/acrux-node/src/protocol.rs",
+      "function": "Network::prepare_early / Network::complete_early",
+      "scenario": null,
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 1",
+      "lines": "14-16",
+      "file": "node/crates/acrux-node/src/exchange.rs",
+      "function": "ExchangeEngine::launch",
+      "scenario": "last-look",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 1",
+      "lines": "17",
+      "file": "node/crates/acrux-node/src/protocol.rs",
+      "function": "Network::try_vote / Network::receive / Wire::Handover",
+      "scenario": null,
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 1",
+      "lines": "18-19",
+      "file": "node/crates/acrux-node/src/protocol.rs",
+      "function": "Network::tick",
+      "scenario": null,
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 1",
+      "lines": "20-23",
+      "file": "node/crates/acrux-node/src/exchange.rs",
+      "function": "ExchangeEngine::receive_commit",
+      "scenario": "split-commitments",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 1",
+      "lines": "24-32",
+      "file": "node/crates/acrux-node/src/exchange.rs",
+      "function": "ExchangeEngine::launch / ExchangeState::attestation_vector",
+      "scenario": "last-look",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 2",
+      "lines": "1-8",
+      "file": "node/crates/acrux-node/src/protocol.rs",
+      "function": "LocalSlot / WindowRun / Network::start_window / Network::try_vote",
+      "scenario": "crash",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 2",
+      "lines": "9-10",
+      "file": "node/crates/acrux-node/src/protocol.rs",
+      "function": "Network::tick / Network::try_vote",
+      "scenario": "crash",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 2",
+      "lines": "11-16",
+      "file": "node/crates/acrux-node/src/protocol.rs",
+      "function": "Network::receive / Wire::Relay",
+      "scenario": "equivocation",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 2",
+      "lines": "17-23",
+      "file": "node/crates/acrux-node/src/protocol.rs",
+      "function": "Network::receive / Wire::Attest",
+      "scenario": "split-commitments",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 2",
+      "lines": "24-30",
+      "file": "node/crates/acrux-node/src/protocol.rs",
+      "function": "Network::try_execute",
+      "scenario": "censorship",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 2",
+      "lines": "31-37",
+      "file": "node/crates/acrux-node/src/protocol.rs",
+      "function": "Network::try_execute",
+      "scenario": "crash",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 2",
+      "lines": "38-42",
+      "file": "node/crates/acrux-execution/src/execution.rs",
+      "function": "SvmExecutor::execute_slot",
+      "scenario": "censorship",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 2",
+      "lines": "43-52",
+      "file": "node/crates/acrux-node/src/protocol.rs",
+      "function": "Network::try_vote",
+      "scenario": "crash",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 2",
+      "lines": "53-59",
+      "file": "node/crates/acrux-node/src/protocol.rs",
+      "function": "Network::try_execute / Network::try_vote",
+      "scenario": "split-commitments",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 3",
+      "lines": "1-4",
+      "file": "node/crates/acrux-schedule/src/lib.rs",
+      "function": "build_schedule",
+      "scenario": null,
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 3",
+      "lines": "5",
+      "file": "node/crates/acrux-schedule/src/lib.rs",
+      "function": "build_schedule (windows sorted into regional runs, the seeded draw order kept inside each region)",
+      "scenario": null,
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 3",
+      "lines": "6-15",
+      "file": "node/crates/acrux-schedule/src/lib.rs",
+      "function": "build_schedule",
+      "scenario": null,
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 4",
+      "lines": "1-8",
+      "file": "node/crates/acrux-execution/src/selection.rs",
+      "function": "sort_transactions / select_with_fees",
+      "scenario": "censorship",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 4",
+      "lines": "9-11",
+      "file": "node/crates/acrux-execution/src/execution.rs",
+      "function": "SvmExecutor::execute_slot",
+      "scenario": "censorship",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 4",
+      "lines": "12-29",
+      "file": "node/crates/acrux-execution/src/selection.rs",
+      "function": "select_with_fees",
+      "scenario": "censorship",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 4",
+      "lines": "30-37",
+      "file": "node/crates/acrux-execution/src/execution.rs",
+      "function": "SvmExecutor::charge_inclusion / SvmExecutor::execute_slot",
+      "scenario": "censorship",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 4",
+      "lines": "38-50",
+      "file": "node/crates/acrux-execution/src/selection.rs",
+      "function": "select_with_fees",
+      "scenario": "censorship",
+      "status": "implemented"
+    },
+    {
+      "reference": "Theorem 2.1",
+      "lines": null,
+      "file": "node/crates/acrux-consensus/src/lib.rs",
+      "function": "Votor::drive / Votor::ready_parent",
+      "scenario": "crash",
+      "status": "implemented"
+    },
+    {
+      "reference": "Lemma 2.2",
+      "lines": null,
+      "file": "node/crates/acrux-node/src/protocol.rs",
+      "function": "Network::try_execute / Network::try_vote",
+      "scenario": "censorship",
+      "status": "implemented"
+    },
+    {
+      "reference": "Lemma 2.3",
+      "lines": null,
+      "file": "node/crates/acrux-crypto/src/lib.rs",
+      "function": "encrypt_slice / decrypt_slice",
+      "scenario": "last-look",
+      "status": "implemented"
+    },
+    {
+      "reference": "Lemma 2.4",
+      "lines": null,
+      "file": "node/crates/acrux-node/src/protocol.rs",
+      "function": "Network::receive",
+      "scenario": "equivocation",
+      "status": "implemented"
+    },
+    {
+      "reference": "Section 3.2",
+      "lines": null,
+      "file": "node/crates/acrux-execution/src/threshold.rs",
+      "function": "FragmentSubmission::verify / ThresholdCache::accept_at / validate_decoded / Network::submit_fragment",
+      "scenario": "private-front-run",
+      "status": "implemented"
+    },
+    {
+      "reference": "Section 3.4",
+      "lines": null,
+      "file": "node/crates/acrux-execution/src/execution.rs",
+      "function": "SvmExecutor::charge_inclusion / SvmExecutor::execute_slot",
+      "scenario": null,
+      "status": "implemented"
+    },
+    {
+      "reference": "Lemma 2.4",
+      "lines": null,
+      "file": "node/crates/acrux-node/src/exchange.rs",
+      "function": "ExchangeEngine::receive_commit (two signed commitments become a Wire::Equivocation proof)",
+      "scenario": "equivocation",
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 2",
+      "lines": "53-59",
+      "file": "node/crates/acrux-node/src/agreement.rs",
+      "function": "agreed",
+      "scenario": "split-commitments",
+      "status": "implemented"
+    },
+    {
+      "reference": "Fault Lab",
+      "lines": null,
+      "file": "node/crates/acrux-node/src/lab.rs",
+      "function": "run (sandbox cluster, events.jsonl, outcome.json)",
+      "scenario": null,
+      "status": "implemented"
+    },
+    {
+      "reference": "Fault Lab",
+      "lines": null,
+      "file": "node/crates/acrux-node/src/protocol.rs",
+      "function": "Network::lab_inject / Network::lab_conclude",
+      "scenario": null,
+      "status": "implemented"
+    },
+    {
+      "reference": "Section 3.4",
+      "lines": null,
+      "file": "node/crates/acrux-execution/src/execution.rs",
+      "function": "SvmExecutor::advance_blockhash (recent blockhashes, replay window)",
+      "scenario": null,
+      "status": "implemented"
+    },
+    {
+      "reference": "Algorithm 2",
+      "lines": "24-42",
+      "file": "node/crates/acrux-node/src/cli.rs",
+      "function": "Replay::apply (acrux node follow decrypts, merges and re-executes every finalized slot)",
+      "scenario": null,
+      "status": "implemented"
+    }
+  ],
+  "decisions": [
+    {
+      "topic": "Round 2 implementation status",
+      "decision": "Implemented denotes a present local code path, not a verified proof of the corresponding theorem or full protocol conformance.",
+      "status": "decided"
+    },
+    {
+      "topic": "Alpenglow v1.1",
+      "decision": "Current per-validator Votor: initial notar/skip exclusive. Notar-fallback once per target after40% initial target notar stake, or20% target notar plus60% combined initial notar/skip. Skip-fallback after40% initial stake minus largest notar target. Fallback targets independent;60% union quorums and80% fast finalization. BadWindow interpreted per consensus slot: own skip/fallback blocks own final vote; a final vote prohibits subsequent local fallback. Exact conformance requires review.",
+      "status": "configuration_required"
+    },
+    {
+      "topic": "Regional runs",
+      "decision": "Windows are sorted into regional runs: each region's windows stay contiguous, in their seeded draw order, and the schedule moves region to region.",
+      "status": "decided"
+    },
+    {
+      "topic": "Handover",
+      "decision": "prepare_early streams encrypted prefix slices after previous-window execution; complete_early binds the selected parent in the final slice after ParentReady. ParentReady is certificate-driven; nodes forward authenticated certificate vote proofs and signed handover shreds/attestations. Conformance and sustained performance remain separate verification requirements.",
+      "status": "configuration_required"
+    },
+    {
+      "topic": "Encryption",
+      "decision": "ChaCha20-Poly1305 encrypts each slice under a fresh block key; the commitment binds ciphertext roots and the key hash. Rotor shreds use Reed-Solomon 64/32 and signed Merkle proofs.",
+      "status": "decided"
+    },
+    {
+      "topic": "Integer amounts",
+      "decision": "Lamports and stake use unsigned decimal strings. priorityFeePerCu is an unsigned decimal string of micro-lamports per CU. Hub ECEF coordinates are integer metres in WGS84. Stake thresholds use integer arithmetic in Votor.",
+      "status": "decided"
+    },
+    {
+      "topic": "Parameter values",
+      "decision": "Local defaults: Table1; m4; reserve1,000,000 lamports; track capacity2,000,000 CU; fragment expiry8 slots; inclusion1,000 lamports per accepted copy; base fee5,000 lamports per signature. API local defaults: registry deposit1 SOL, registrationFeeBps500, cooldown1 epoch, inactivity4 epochs; faucet2 SOL,3 grants/key and10/IP per24h. No flat registration fee. Production program identity remains separate configuration.",
+      "status": "configuration_required"
+    },
+    {
+      "topic": "Round 2 acceptance",
+      "decision": "Final 120-second no-fault acceptance failed: 131 finalized cblocks, slot clocks through1315, all validators stopped at executed899. Pacing p50/p99 50028/993417us; commit spread9599/44485us; finalization479532/1296604us. State hashes matched at563 compared heights,543 with all12 validators; maximum skew223,final0. Real plain and2-of-3 transfers finalized, but skips and stalled execution remain. Keep the frontend fixture gateway.",
+      "status": "configuration_required"
+    },
+    {
+      "topic": "Threshold wire",
+      "decision": "Version 1 fragment envelope: nonce12, ciphertext length u32 little-endian, Reed-Solomon shard. Key-share envelope: version1, x=index+1, 32 GF(256) bytes. Header signature and AEAD associated data use compact JSON fields id,feePayer,priorityFeePerCu,computeLimit,writableAccounts,targetSlot in that order. Expiry begins at first accepted inclusion; the local default is eight slots.",
+      "status": "decided"
+    },
+    {
+      "topic": "Historical reads",
+      "decision": "Recent views are bounded; gateway reads fall back to current-run redb records. The default store directory is target/runs/net. Local restart deliberately begins a new genesis and store rather than resuming votes or execution.",
+      "status": "decided"
+    },
+    {
+      "topic": "Remaining transaction failure paths",
+      "decision": "Integration error isolation and complete transaction state behavior require continued checks. The node faucet queues a real signed transfer; API MODE=node preserves its transactionId and signature and returns prior balance for polling.",
+      "status": "configuration_required"
+    },
+    {
+      "topic": "Round2b execution model",
+      "decision": "Each validator owns an OS thread and current-thread runtime. CPU-heavy work is offloaded; commitment authentication is prioritized; traversal and recent views are bounded. A single observer queue renders shared telemetry, storage writes bounded batches, and checkpoints share an immutable executed-ID log. Twenty-one release tests passed; final observer-enabled sustained acceptance remains pending.",
+      "status": "decided"
+    },
+    {
+      "topic": "Geographic timing",
+      "decision": "Configured one-way delay ranges: FRA/NYC38.964-40.964ms, FRA/TYO54.838-56.838ms, NYC/TYO62.415-64.415ms. With four equally staked validators per hub,60% certificates require at least8/12 and therefore remote evidence. Some certificate-driven handovers exceed a50ms slot; report boundary gaps rather than claiming uninterrupted50ms cadence.",
+      "status": "decided"
+    },
+    {
+      "topic": "Module boundaries",
+      "decision": "No crate split has been performed because the requested conditional milestone is not yet met. Runtime fixes remain within the existing modules.",
+      "status": "decided"
+    },
+    {
+      "topic": "Round2b crash result",
+      "decision": "Observer-enabled60-second crash run:0 skipped cblocks,261 finalized; within-window pacing p99 51751us, global pacing p99 181944us;maxlag4,maxskew2;all1052 compared state-hash heights match across12 validators. Slot32 usedP={1,2},firstnotar570179us. Final no-fault600-second run pending.",
+      "status": "decided"
+    }
+  ]
+}
