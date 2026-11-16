@@ -17,10 +17,11 @@ import { clientIp, createWindows } from './engines/server/limits.js'
 import { env } from './config.js'
 import { connectDatabase } from './db.js'
 import { NodeLab } from './node-lab.js'
-import { RegistryIndexer, hubView, memberView, regionOf, totalStake } from './registry.js'
+import { RegistryIndexer, acruxStake, hubView, memberView, regionOf, solanaStake, type Chain } from './registry.js'
 import { schedulePreview } from './schedule.js'
 
-const epochQuery = z.strictObject({ epoch: z.coerce.number().int().nonnegative().optional() })
+const chainQuery = z.strictObject({ chain: z.enum(['acrux', 'solana']).optional() })
+const epochQuery = z.strictObject({ epoch: z.coerce.number().int().nonnegative().optional(), chain: z.enum(['acrux', 'solana']).optional() })
 const runId = z.string().uuid()
 const specPath = fileURLToPath(new URL('../../spec/map.json', import.meta.url))
 
@@ -28,9 +29,15 @@ export function createNodeApi() {
   const database = connectDatabase(env.DATABASE_URL!)
   const db = database.db
   const gateway = createGatewayClient({ rpcUrl: env.GATEWAY_RPC_URL, wsUrl: env.GATEWAY_RPC_URL.replace(/^http/, 'ws').replace(/:(\d+)/, (_, p) => `:${Number(p) + 1}`) })
-  const registry = new RegistryIndexer(db, env.SOLANA_RPC_URL, env.REGISTRY_PROGRAM_ID!, env.REGISTRY_POLL_SECONDS * 1000)
+  // The Hub Registry on both chains: Acrux's own, read through its Solana-compatible RPC every
+  // two seconds, and Solana mainnet's, within the shared RPC budget.
+  const registries: Record<Chain, RegistryIndexer> = {
+    acrux: new RegistryIndexer(db, 'acrux', env.GATEWAY_RPC_URL, env.REGISTRY_PROGRAM_ID!, 2000, acruxStake(env.GATEWAY_RPC_URL), 'acrux'),
+    solana: new RegistryIndexer(db, 'solana', env.SOLANA_RPC_URL, env.REGISTRY_PROGRAM_ID!, env.REGISTRY_POLL_SECONDS * 1000, solanaStake(), env.REGISTRY_CLUSTER),
+  }
   const lab = new NodeLab(db)
-  registry.start()
+  registries.acrux.start()
+  registries.solana.start()
   const app = createApi({ origins: env.CORS_ORIGINS, allowHeaders: ['Last-Event-ID'], contractVersion: CONTRACT_VERSION })
 
   const net = async <M extends RpcMethod>(method: M, params?: unknown) => {
@@ -40,11 +47,12 @@ export function createNodeApi() {
       fail('NET_UNAVAILABLE', 'Acrux Net is unavailable.', { retryable: true, stage: 'read' })
     }
   }
-  const readyRegistry = () => {
-    if (!registry.state.readAt) fail('PROGRAM_UNAVAILABLE', 'The Hub Registry has not been read yet.', { retryable: true, stage: 'read' })
-    return registry.configView()
+  const readyRegistry = (chain: Chain) => {
+    if (!registries[chain].state.readAt) fail('PROGRAM_UNAVAILABLE', `The Hub Registry on ${chain === 'acrux' ? 'Acrux' : 'Solana'} has not been read yet.`, { retryable: true, stage: 'read' })
+    return registries[chain].configView()
   }
-  const hubRows = () => db.hub.findMany({ include: { members: { orderBy: { stakeLamports: 'desc' } } }, orderBy: { code: 'asc' } })
+  const hubRows = (chain?: Chain) => db.hub.findMany({ where: chain ? { chain } : {}, include: { members: { orderBy: { stakeLamports: 'desc' } } }, orderBy: [{ chain: 'asc' }, { code: 'asc' }] })
+  const ready = () => (['acrux', 'solana'] as const).filter(chain => registries[chain].state.readAt)
 
   app.get('/health', async c => {
     let status: 'waiting' | 'ready' = 'waiting'
@@ -53,32 +61,40 @@ export function createNodeApi() {
       const health = await response.json() as { status?: string }
       if (response.ok && health.status === 'ready') status = 'ready'
     } catch { /* An unreachable node is waiting. */ }
-    return c.json({ status, contractVersion: CONTRACT_VERSION, missingConfiguration: registry.state.readAt ? [] : ['Hub Registry RPC'] })
+    return c.json({ status, contractVersion: CONTRACT_VERSION, missingConfiguration: (['acrux', 'solana'] as const).filter(chain => !registries[chain].state.readAt).map(chain => `Hub Registry on ${chain}`) })
   })
   app.get('/openapi.json', c => c.json(JSON.parse(readFileSync(fileURLToPath(import.meta.resolve('@acrux/contract/openapi.json')), 'utf8'))))
 
+  // Hubs of both chains, each carrying its chain; `?chain=` narrows to one.
   app.get('/v1/hubs', async c => {
-    const config = readyRegistry()
-    return c.json(paginate((await hubRows()).map(row => hubView(row, config)), readQuery(c, PageQuery)))
+    const page = readQuery(c, PageQuery.extend({ chain: z.enum(['acrux', 'solana']).optional() }))
+    const chains = page.chain ? [page.chain] : ready()
+    if (!chains.length) readyRegistry('acrux')
+    const configs = Object.fromEntries(chains.map(chain => [chain, readyRegistry(chain)]))
+    const rows = (await hubRows(page.chain)).filter(row => configs[row.chain])
+    return c.json(paginate(rows.map(row => hubView(row, configs[row.chain]!)), page))
   })
+  // A code can exist on both chains: `?chain=` picks one, else Acrux's comes first.
   app.get('/v1/hubs/:code', async c => {
-    const code = readParam(c, 'code', HubCode), config = readyRegistry()
-    const row = await db.hub.findUnique({ where: { code }, include: { members: { orderBy: { stakeLamports: 'desc' } } } })
+    const code = readParam(c, 'code', HubCode), { chain } = readQuery(c, chainQuery)
+    const rows = await db.hub.findMany({ where: { code, ...(chain ? { chain } : {}) }, include: { members: { orderBy: { stakeLamports: 'desc' } } }, orderBy: { chain: 'asc' } })
+    const row = rows[0]
     if (!row) fail('NOT_FOUND', 'This hub was not found.')
-    return c.json(hubView(row, config))
+    return c.json(hubView(row, readyRegistry(row.chain as Chain)))
   })
-  app.get('/v1/registry/config', c => c.json(registry.configView()))
+  app.get('/v1/registry/config', c => c.json(registries[readQuery(c, chainQuery).chain ?? 'solana'].configView()))
   app.get('/v1/registry/members/:identity', async c => {
-    const identity = readParam(c, 'identity', Address)
-    const member = await db.member.findUnique({ where: { identity } })
+    const identity = readParam(c, 'identity', Address), { chain } = readQuery(c, chainQuery)
+    const member = await db.member.findFirst({ where: { identity, ...(chain ? { chain } : {}) }, orderBy: { chain: 'asc' } })
     if (!member) fail('NOT_FOUND', 'This validator has no hub membership.')
     return c.json(memberView(member))
   })
   app.get('/v1/schedule', async c => {
-    const config = readyRegistry(), { epoch = config.currentEpoch + 1 } = readQuery(c, epochQuery)
-    const hubs = (await hubRows()).map(row => ({ code: row.code, region: regionOf(row.latitude, row.longitude),
-      members: row.members.filter(m => BigInt(m.proposerStakeLamports.toString()) > 0n).map(m => ({ identity: m.identity, stake: Number(BigInt(m.stakeLamports.toString()) / 1_000_000_000n) })) }))
-    return c.json(await schedulePreview(epoch, hubs, Number(totalStake / 1_000_000_000n)))
+    const query = readQuery(c, epochQuery), chain = query.chain ?? 'solana'
+    const config = readyRegistry(chain), epoch = query.epoch ?? config.currentEpoch + 1
+    const hubs = (await hubRows(chain)).map(row => ({ code: row.code, region: regionOf(row.latitude, row.longitude),
+      members: row.members.filter(m => BigInt(m.proposerStakeLamports.toString()) > 0n).map(m => ({ identity: m.identity, stake: Number(BigInt(m.stakeLamports.toString()) / 1_000n) })) }))
+    return c.json(await schedulePreview(epoch, hubs, Number(registries[chain].stake.total() / 1_000n)))
   })
 
   app.get('/v1/facts', async c => c.json(await net('getFacts', {})))
@@ -163,5 +179,5 @@ export function createNodeApi() {
       } finally { stop() }
     })
   })
-  return { app, close: async () => { registry.stop(); await database.close() } }
+  return { app, close: async () => { registries.acrux.stop(); registries.solana.stop(); await database.close() } }
 }

@@ -1,4 +1,5 @@
-// The Hub Registry read model. Each tick (REGISTRY_POLL_SECONDS) it reads the epoch and the program's
+// The Hub Registry read model, one per chain: Acrux's own registry (read through Acrux's
+// Solana-compatible RPC) and the one on Solana mainnet. Each tick (REGISTRY_POLL_SECONDS) it reads the epoch and the program's
 // newest signature, two calls; only when either changed does it read the program's accounts on the
 // Solana RPC, join them with the stake snapshot and the node's own stake caps (`acrux schedule`, the
 // code path the node's schedule runs), and writes hubs and members to Postgres in one transaction.
@@ -64,16 +65,40 @@ export function regionOf(latitude: number, longitude: number) {
   return latitude >= -10 ? 'Asia Pacific' : 'Oceania'
 }
 
+export type Chain = 'acrux' | 'solana'
+/** Where a chain's stake comes from: the total, and each identity's stake, in lamports. */
+export type StakeSource = { refresh(): Promise<void>; total(): bigint; of(identity: string): bigint }
+
 type Snapshot = { totalStakeLamports: string; validators: Record<string, string> }
-const snapshot: Snapshot = JSON.parse(readFileSync(new URL('../fixtures/stake-snapshot.json', import.meta.url), 'utf8'))
-export const totalStake = BigInt(snapshot.totalStakeLamports)
-/** Stake from the snapshot; an identity it doesn't list draws 50k to 6.4M SOL from its own hash. */
-export function stakeOf(identity: string) {
-  const listed = snapshot.validators[identity]
-  if (listed) return BigInt(listed)
-  const u = createHash('sha256').update(identity).digest().readUInt32LE(0) / 2 ** 32
-  return BigInt(Math.round(50_000 * 2 ** (u * 7))) * 1_000_000_000n
+/** Solana: a mainnet-shaped snapshot; an identity it doesn't list draws 50k to 6.4M SOL from its own hash. */
+export function solanaStake(): StakeSource {
+  const snapshot: Snapshot = JSON.parse(readFileSync(new URL('../fixtures/stake-snapshot.json', import.meta.url), 'utf8'))
+  return {
+    refresh: async () => {},
+    total: () => BigInt(snapshot.totalStakeLamports),
+    of: identity => {
+      const listed = snapshot.validators[identity]
+      if (listed) return BigInt(listed)
+      const u = createHash('sha256').update(identity).digest().readUInt32LE(0) / 2 ** 32
+      return BigInt(Math.round(50_000 * 2 ** (u * 7))) * 1_000_000_000n
+    },
+  }
 }
+/** Acrux: the stake of the chain's own validators (`getVoteAccounts`); others have none. */
+export function acruxStake(gatewayUrl: string): StakeSource {
+  let stakes = new Map<string, bigint>()
+  return {
+    refresh: async () => {
+      const response = await fetch(gatewayUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getVoteAccounts', params: [] }), signal: AbortSignal.timeout(5000) })
+      const accounts = (await response.json() as { result?: { current: { nodePubkey: string; activatedStake: number }[] } }).result?.current ?? []
+      stakes = new Map(accounts.map(a => [a.nodePubkey, BigInt(a.activatedStake)]))
+    },
+    total: () => [...stakes.values()].reduce((s, v) => s + v, 0n),
+    of: identity => stakes.get(identity) ?? 0n,
+  }
+}
+/** The schedule binary takes stakes in units of 1,000 lamports, exact for both chains' stakes. */
+const UNIT = 1_000n
 
 export type RegistryState = { config: ChainRegistry | null; epoch: number; slot: number; readAt: number | null; error: string | null }
 
@@ -81,7 +106,7 @@ export class RegistryIndexer {
   state: RegistryState = { config: null, epoch: 0, slot: 0, readAt: null, error: null }
   private timer?: NodeJS.Timeout
   private seen = ''
-  constructor(private db: PrismaClient, private rpcUrl: string, private programId: string, private pollMs: number) {}
+  constructor(private db: PrismaClient, readonly chain: Chain, private rpcUrl: string, private programId: string, private pollMs: number, readonly stake: StakeSource, private cluster: 'localnet' | 'mainnet-beta' | 'acrux') {}
 
   start() { const tick = () => this.refresh().catch(e => { this.state.error = String(e?.message ?? e) }).finally(() => { this.timer = setTimeout(tick, this.pollMs) }); tick() }
   stop() { clearTimeout(this.timer) }
@@ -98,8 +123,11 @@ export class RegistryIndexer {
       this.rpc<{ epoch: number; absoluteSlot: number }>('getEpochInfo', [{ commitment: 'confirmed' }]),
       this.rpc<{ signature: string }[]>('getSignaturesForAddress', [this.programId, { limit: 1, commitment: 'confirmed' }]),
     ])
-    const seen = `${epochInfo.epoch}:${newest[0]?.signature ?? ''}`
+    // Acrux's RPC keeps no signature history, so Acrux's registry is read every tick.
+    const seen = `${epochInfo.epoch}:${newest[0]?.signature ?? epochInfo.absoluteSlot}`
     if (seen === this.seen) return
+    await this.stake.refresh()
+    const stakeOf = (identity: string) => this.stake.of(identity), totalStake = this.stake.total()
     const accounts = await this.rpc<{ pubkey: string; account: { data: [string, string] } }[]>('getProgramAccounts', [this.programId, { encoding: 'base64', commitment: 'confirmed' }])
     const epoch = BigInt(epochInfo.epoch)
     let config: ChainRegistry | null = null
@@ -115,22 +143,22 @@ export class RegistryIndexer {
     const counted = (m: ChainMembership) => m.effectiveEpoch <= epoch && !(m.pending !== 'none' && m.pendingEpoch <= epoch)
     const byAddress = new Map(hubs.map(h => [h.address, h]))
     const effective = hubs.map(h => ({ code: h.code, region: regionOf(geodetic(h.x, h.y, h.z).latitude, geodetic(h.x, h.y, h.z).longitude),
-      members: memberships.filter(m => m.hub === h.address && counted(m)).map(m => ({ identity: m.identity, stake: Number(stakeOf(m.identity) / 1_000_000_000n) })) }))
+      members: memberships.filter(m => m.hub === h.address && counted(m) && stakeOf(m.identity) > 0n).map(m => ({ identity: m.identity, stake: Number(stakeOf(m.identity) / UNIT) })) }))
     const caps = new Map((await hubStakes(effective)).map(h => [h.code, h]))
     const minimumStake = totalStake / 100n
     const minMembers = config?.minMembers ?? 4
     await this.db.$transaction(async tx => {
-      await tx.member.deleteMany({})
-      await tx.hub.deleteMany({})
+      await tx.member.deleteMany({ where: { chain: this.chain } })
+      await tx.hub.deleteMany({ where: { chain: this.chain } })
       for (const h of hubs) {
         const { latitude, longitude } = geodetic(h.x, h.y, h.z)
         const capped = caps.get(h.code)
         const members = effective.find(e => e.code === h.code)!.members
-        const proposerStake = capped ? BigInt(capped.stake) * 1_000_000_000n : members.reduce((s, m) => s + BigInt(m.stake) * 1_000_000_000n, 0n)
+        const proposerStake = capped ? BigInt(capped.stake) * UNIT : members.reduce((s, m) => s + BigInt(m.stake) * UNIT, 0n)
         const active = members.length >= minMembers && proposerStake >= minimumStake
         const lastActive = active ? epoch : h.lastActiveEpoch > h.createdEpoch ? h.lastActiveEpoch : null
         const releasableEpoch = (lastActive ?? h.createdEpoch) + (config?.inactivityEpochs ?? 4n)
-        await tx.hub.create({ data: { code: h.code, registryAddress: h.address, registrant: h.registrant, ecefX: h.x, ecefY: h.y, ecefZ: h.z, latitude, longitude,
+        await tx.hub.create({ data: { chain: this.chain, code: h.code, registryAddress: h.address, registrant: h.registrant, ecefX: h.x, ecefY: h.y, ecefZ: h.z, latitude, longitude,
           depositLamports: h.depositLamports.toString(), status: active ? 'active' : epoch >= releasableEpoch ? 'inactive' : 'pending',
           createdEpoch: h.createdEpoch, lastActiveEpoch: lastActive, releasableEpoch, indexedSlot: BigInt(epochInfo.absoluteSlot) } })
       }
@@ -139,8 +167,8 @@ export class RegistryIndexer {
         if (!hub) continue
         const capRow = caps.get(hub.code)?.members.find(c => c.identity === m.identity)
         const stake = stakeOf(m.identity)
-        await tx.member.create({ data: { identity: m.identity, membershipAddress: m.address, hubCode: hub.code, stakeLamports: stake.toString(),
-          proposerStakeLamports: capRow ? (BigInt(capRow.proposerStake) * 1_000_000_000n).toString() : counted(m) ? stake.toString() : '0',
+        await tx.member.create({ data: { chain: this.chain, identity: m.identity, membershipAddress: m.address, hubCode: hub.code, stakeLamports: stake.toString(),
+          proposerStakeLamports: capRow ? (BigInt(capRow.proposerStake) * UNIT).toString() : counted(m) ? stake.toString() : '0',
           capped: capRow?.capped ?? false, effectiveEpoch: m.effectiveEpoch, cooldownUntilEpoch: m.cooldownUntilEpoch,
           pendingHubCode: m.pending === 'move' ? byAddress.get(m.pendingHub)?.code ?? null : null,
           leavingEpoch: m.pending === 'leave' ? m.pendingEpoch : null, indexedSlot: BigInt(epochInfo.absoluteSlot),
@@ -154,11 +182,11 @@ export class RegistryIndexer {
   /** The contract's RegistryConfig from the chain's Registry account. */
   configView(): RegistryConfig {
     const c = this.state.config
-    return { status: c ? 'ready' : 'waiting', programId: this.programId, cluster: 'localnet',
+    return { status: c ? 'ready' : 'waiting', chain: this.chain, programId: this.programId, cluster: this.cluster,
       depositLamports: c ? c.depositLamports.toString() : null, registrationFeeBps: c?.registrationFeeBps ?? null,
       cooldownEpochs: c ? Number(c.cooldownEpochs) : null, inactivityEpochs: c ? Number(c.inactivityEpochs) : null,
       codeRules: { pattern: c ? `^[A-Z]{${c.codeMinLen},${c.codeMaxLen}}$` : null, minLength: c?.codeMinLen ?? null, maxLength: c?.codeMaxLen ?? null },
-      minimumMembers: c?.minMembers ?? null, minimumStake: (totalStake / 100n).toString(), currentEpoch: this.state.epoch,
+      minimumMembers: c?.minMembers ?? null, minimumStake: (this.stake.total() / 100n).toString(), currentEpoch: this.state.epoch,
       missingConfiguration: c ? [] : ['the registry account (initialize has not run on this cluster)'] }
   }
 }
@@ -174,7 +202,7 @@ export function hubView(row: HubRow, config: RegistryConfig): Hub {
   const minimumStake = BigInt(config.minimumStake ?? '0')
   const epoch = BigInt(config.currentEpoch)
   return {
-    code: row.code, name: row.code, region: regionOf(row.latitude, row.longitude),
+    chain: row.chain as Chain, code: row.code, name: row.code, region: regionOf(row.latitude, row.longitude),
     ecef: { x: row.ecefX, y: row.ecefY, z: row.ecefZ }, latitude: row.latitude, longitude: row.longitude,
     registrant: row.registrant, depositLamports: row.depositLamports.toString(),
     members: row.members.map(memberView), stake: stake.toString(), proposerStake: proposerStake.toString(), proposerStakeCap: cap.toString(),
@@ -187,7 +215,7 @@ export function hubView(row: HubRow, config: RegistryConfig): Hub {
 }
 
 export function memberView(m: HubRow['members'][number]): Member {
-  return { identity: m.identity, hubCode: m.hubCode, stake: m.stakeLamports.toString(), proposerStake: m.proposerStakeLamports.toString(), capped: m.capped,
+  return { chain: m.chain as Chain, identity: m.identity, hubCode: m.hubCode, stake: m.stakeLamports.toString(), proposerStake: m.proposerStakeLamports.toString(), capped: m.capped,
     effectiveEpoch: Number(m.effectiveEpoch), joinedEpoch: Number(m.joinedEpoch), pendingMove: m.pendingHubCode,
     pendingLeave: m.leavingEpoch !== null, cooldownUntilEpoch: Number(m.cooldownUntilEpoch) }
 }

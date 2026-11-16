@@ -44,11 +44,11 @@ function makeHub(code: string, name: string, region: string, latitude: number, l
     if (stakes[j]! <= cap) break
   }
   const members: Member[] = stakes.map((stake, i) => ({
-    identity: fixtureAddress(`${code}-validator-${i + 1}`), hubCode: code, stake: stake.toString(),
+    chain: 'acrux', identity: fixtureAddress(`${code}-validator-${i + 1}`), hubCode: code, stake: stake.toString(),
     proposerStake: (stake > cap ? cap : stake).toString(), capped: stake > cap,
     effectiveEpoch: 41, joinedEpoch: 40, pendingMove: null, pendingLeave: false, cooldownUntilEpoch: 41,
   }))
-  return { code, name, region, latitude, longitude, ecef: ecef(latitude, longitude),
+  return { chain: 'acrux', code, name, region, latitude, longitude, ecef: ecef(latitude, longitude),
     registrant: fixtureAddress(`${code}-registrant`), depositLamports: '1000000000', members,
     stake: stakes.reduce((sum, n) => sum + n, 0n).toString(),
     proposerStake: members.reduce((sum, m) => sum + BigInt(m.proposerStake), 0n).toString(),
@@ -67,7 +67,7 @@ singapore.status = 'inactive'; singapore.members = []; singapore.stake = '0'; si
 singapore.needs = { members: 3, stake: '1000000000' }; singapore.lastActiveEpoch = 35; singapore.releasableEpoch = 40; singapore.releasable = true
 export const hubs: Hub[] = [frankfurt, newYork, tokyo, london, singapore]
 export const registryConfig: z.infer<typeof RegistryConfig> = {
-  status: 'fixture', programId: null, cluster: 'localnet', depositLamports: null,
+  status: 'fixture', chain: 'solana', programId: null, cluster: 'localnet', depositLamports: null,
   registrationFeeBps: null, cooldownEpochs: null, inactivityEpochs: null,
   codeRules: { pattern: null, minLength: null, maxLength: null }, minimumMembers: null, minimumStake: null,
   currentEpoch: 42, missingConfiguration: ['REGISTRY_PROGRAM_ID', 'REGISTRY_DEPOSIT_LAMPORTS', 'REGISTRY_REGISTRATION_FEE_BPS', 'REGISTRY_COOLDOWN_EPOCHS', 'REGISTRY_INACTIVITY_EPOCHS', 'REGISTRY_CODE_PATTERN', 'REGISTRY_MIN_MEMBERS', 'REGISTRY_MIN_STAKE'],

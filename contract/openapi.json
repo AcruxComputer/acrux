@@ -3,7 +3,7 @@
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "info": {
     "title": "Acrux API",
-    "version": "0.1.8",
+    "version": "0.1.9",
     "description": "Round 1 fixture contract. Amounts are decimal integer strings. Times are relative microseconds with UTC slot wallTime."
   },
   "servers": [
@@ -5043,6 +5043,13 @@
       "Hub": {
         "type": "object",
         "properties": {
+          "chain": {
+            "type": "string",
+            "enum": [
+              "acrux",
+              "solana"
+            ]
+          },
           "code": {
             "type": "string",
             "minLength": 1
@@ -5106,6 +5113,13 @@
             "items": {
               "type": "object",
               "properties": {
+                "chain": {
+                  "type": "string",
+                  "enum": [
+                    "acrux",
+                    "solana"
+                  ]
+                },
                 "identity": {
                   "type": "string",
                   "minLength": 32,
@@ -5161,6 +5175,7 @@
                 }
               },
               "required": [
+                "chain",
                 "identity",
                 "hubCode",
                 "stake",
@@ -5256,6 +5271,7 @@
           }
         },
         "required": [
+          "chain",
           "code",
           "name",
           "region",
@@ -5289,6 +5305,13 @@
             "items": {
               "type": "object",
               "properties": {
+                "chain": {
+                  "type": "string",
+                  "enum": [
+                    "acrux",
+                    "solana"
+                  ]
+                },
                 "code": {
                   "type": "string",
                   "minLength": 1
@@ -5352,6 +5375,13 @@
                   "items": {
                     "type": "object",
                     "properties": {
+                      "chain": {
+                        "type": "string",
+                        "enum": [
+                          "acrux",
+                          "solana"
+                        ]
+                      },
                       "identity": {
                         "type": "string",
                         "minLength": 32,
@@ -5407,6 +5437,7 @@
                       }
                     },
                     "required": [
+                      "chain",
                       "identity",
                       "hubCode",
                       "stake",
@@ -5502,6 +5533,7 @@
                 }
               },
               "required": [
+                "chain",
                 "code",
                 "name",
                 "region",
@@ -6134,6 +6166,13 @@
       "Member": {
         "type": "object",
         "properties": {
+          "chain": {
+            "type": "string",
+            "enum": [
+              "acrux",
+              "solana"
+            ]
+          },
           "identity": {
             "type": "string",
             "minLength": 32,
@@ -6189,6 +6228,7 @@
           }
         },
         "required": [
+          "chain",
           "identity",
           "hubCode",
           "stake",
@@ -8470,6 +8510,13 @@
         ],
         "additionalProperties": false
       },
+      "RegistryChain": {
+        "type": "string",
+        "enum": [
+          "acrux",
+          "solana"
+        ]
+      },
       "RegistryConfig": {
         "type": "object",
         "properties": {
@@ -8479,6 +8526,13 @@
               "fixture",
               "waiting",
               "ready"
+            ]
+          },
+          "chain": {
+            "type": "string",
+            "enum": [
+              "acrux",
+              "solana"
             ]
           },
           "programId": {
@@ -8497,7 +8551,8 @@
             "type": "string",
             "enum": [
               "localnet",
-              "mainnet-beta"
+              "mainnet-beta",
+              "acrux"
             ]
           },
           "depositLamports": {
@@ -8629,6 +8684,7 @@
         },
         "required": [
           "status",
+          "chain",
           "programId",
           "cluster",
           "depositLamports",

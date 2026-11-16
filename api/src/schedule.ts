@@ -1,5 +1,5 @@
 // Algorithm 3 through the node's own binary (`acrux schedule`), so the preview and the net's
-// schedule are one code path. Stakes cross the boundary in whole SOL, as the node's fixture has them.
+// schedule are one code path. Stakes cross the boundary in units of 1,000 lamports.
 import { spawn } from 'node:child_process'
 import type { SchedulePreview } from '@acrux/contract'
 import { env } from './config.js'
@@ -28,10 +28,10 @@ export async function hubStakes(hubs: HubInput[]) {
   return (await run({ epoch: 0, seed: SCHEDULE_SEED, windows: 1, totalStake: 1, hubs })).hubStakes
 }
 
-/** Algorithm 3's preview for an epoch, with whole-SOL stakes; totalStake in whole SOL. */
+/** Algorithm 3's preview for an epoch; stakes and totalStake in units of 1,000 lamports. */
 export async function schedulePreview(epoch: number, hubs: HubInput[], totalStake: number): Promise<SchedulePreview> {
   const { hubStakes: stakes, schedule } = await run({ epoch, seed: SCHEDULE_SEED, windows: WINDOWS_PER_EPOCH, totalStake, hubs })
-  const lamports = (sol: number) => (BigInt(sol) * 1_000_000_000n).toString()
+  const lamports = (units: number) => (BigInt(units) * 1_000n).toString()
   if (!schedule) return { epoch, seed: SCHEDULE_SEED, source: 'registry', algorithm: 3, alpha: 0.5, totalWindows: 0, shares: [], regionalRuns: [], windows: [] }
   const member = (code: string, identity: string) => stakes.find(h => h.code === code)!.members.find(m => m.identity === identity)!
   return {

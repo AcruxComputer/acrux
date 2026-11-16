@@ -27,6 +27,8 @@ export const env = parseEnv(z.object({
   /** Registry poll interval: 2 s against the local validator; 30 s on mainnet keeps the waiting
    * registry under four calls a minute. */
   REGISTRY_POLL_SECONDS: z.coerce.number().positive().default(2),
+  /** The cluster of the Solana Hub Registry: the local validator here, mainnet-beta on the host. */
+  REGISTRY_CLUSTER: z.enum(['localnet', 'mainnet-beta']).default('localnet'),
   /** Lab runs one address may start an hour, and the most runs waiting or running at once. */
   LAB_RUNS_PER_IP_HOUR: z.coerce.number().int().positive().default(6),
   LAB_QUEUE_MAX: z.coerce.number().int().positive().default(10),

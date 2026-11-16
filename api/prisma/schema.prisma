@@ -20,8 +20,9 @@ enum LabRunStatus {
 }
 
 model Hub {
-  code                String   @id @db.VarChar(16)
-  registryAddress     String   @unique @map("registry_address") @db.VarChar(44)
+  chain               String   @default("solana") @db.VarChar(8)
+  code                String   @db.VarChar(16)
+  registryAddress     String   @map("registry_address") @db.VarChar(44)
   registrant          String   @db.VarChar(44)
   ecefX               Int      @map("ecef_x")
   ecefY               Int      @map("ecef_y")
@@ -36,17 +37,19 @@ model Hub {
   indexedSlot         BigInt   @map("indexed_slot")
   updatedAt           DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
   members             Member[]
-  events              RegistryEvent[]
 
+  @@id([chain, code])
+  @@unique([chain, registryAddress])
   @@index([status])
   @@map("hubs")
 }
 
 model Member {
-  identity            String   @id @db.VarChar(44)
-  membershipAddress   String   @unique @map("membership_address") @db.VarChar(44)
+  chain               String   @default("solana") @db.VarChar(8)
+  identity            String   @db.VarChar(44)
+  membershipAddress   String   @map("membership_address") @db.VarChar(44)
   hubCode             String   @map("hub_code") @db.VarChar(16)
-  hub                 Hub      @relation(fields: [hubCode], references: [code])
+  hub                 Hub      @relation(fields: [chain, hubCode], references: [chain, code])
   stakeLamports       Decimal  @map("stake_lamports") @db.Decimal(20, 0)
   proposerStakeLamports Decimal @map("proposer_stake_lamports") @db.Decimal(20, 0)
   capped              Boolean
@@ -59,6 +62,8 @@ model Member {
   updatedAt           DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   @@index([hubCode, effectiveEpoch])
+  @@id([chain, identity])
+  @@unique([chain, membershipAddress])
   @@map("members")
 }
 
@@ -69,7 +74,6 @@ model RegistryEvent {
   slot                BigInt
   kind                String
   hubCode             String?  @map("hub_code") @db.VarChar(16)
-  hub                 Hub?     @relation(fields: [hubCode], references: [code])
   identity            String?  @db.VarChar(44)
   payload             Json
   occurredAt          DateTime @map("occurred_at") @db.Timestamptz(3)
