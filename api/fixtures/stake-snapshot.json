@@ -1,0 +1,19 @@
+{
+  "description": "Mainnet-shaped stake for the local registry: total active stake near mainnet, the Acrux Net validators at the stakes of large and mid-size mainnet validators. Identities not listed draw a deterministic stake from the same range. Replaced at deploy by an epoch snapshot read from a mainnet RPC.",
+  "epoch": 0,
+  "totalStakeLamports": "400000000000000000",
+  "validators": {
+    "CEQDZB4W4YR8vK2oXdmcMKLELUdFPYKSPaynLdQxUeY8": "6200000000000000",
+    "D1GjjR4RR8gysLpbZ2ceq3a1g4HvdpcrK7Saqqjc7tu6": "2100000000000000",
+    "GnmUrTe5pY42ramcdyKVWL8v5ywkxMbQny1mk4iEE4q2": "1300000000000000",
+    "9p1h6LYW1xEj4Aahpj1DQD5Nr1jFvEsNE7mMZUjz3rZa": "750000000000000",
+    "8gS7yGhZhDV6CGsThAg1Upie2mJJxKG96pcpkbc3Rke8": "5400000000000000",
+    "AFi7QtU3zEVjai4zHCj64rgxEd1vB77am9SuP3fxFH1m": "2600000000000000",
+    "FXo7LER1jqa1KrUot79hVu5cmdEJb1FcgTBiz83WpbLS": "1100000000000000",
+    "ELXVkGg1L6Jjv3KFDuUJA2kmJgP347YuZfCvpGQowuck": "900000000000000",
+    "DyARJDKdkWUKTEKL4CVf3Jvj9kMSpQsAmzgT74K7Rm3K": "4800000000000000",
+    "A4TXbAxGdKUj4YcbLSX64FjhnnWL4tb5j49dcDsTQfM7": "1900000000000000",
+    "7D6MkimK7XnCq6QQpWb1kzvZhPXNFKebP4NTa7z2k5rz": "1500000000000000",
+    "3ZqWV93v4N1D1FYRMwh9PgzBLtnik2wd98YbnLa8BtPp": "620000000000000"
+  }
+}

@@ -1,0 +1,143 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum HubStatus {
+  pending
+  active
+  inactive
+}
+
+enum LabRunStatus {
+  queued
+  running
+  done
+  failed_to_start
+}
+
+model Hub {
+  code                String   @id @db.VarChar(16)
+  registryAddress     String   @unique @map("registry_address") @db.VarChar(44)
+  registrant          String   @db.VarChar(44)
+  ecefX               Int      @map("ecef_x")
+  ecefY               Int      @map("ecef_y")
+  ecefZ               Int      @map("ecef_z")
+  latitude            Float
+  longitude           Float
+  depositLamports     Decimal  @map("deposit_lamports") @db.Decimal(20, 0)
+  status              HubStatus @default(pending)
+  createdEpoch        BigInt   @map("created_epoch")
+  lastActiveEpoch     BigInt?  @map("last_active_epoch")
+  releasableEpoch     BigInt?  @map("releasable_epoch")
+  indexedSlot         BigInt   @map("indexed_slot")
+  updatedAt           DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+  members             Member[]
+  events              RegistryEvent[]
+
+  @@index([status])
+  @@map("hubs")
+}
+
+model Member {
+  identity            String   @id @db.VarChar(44)
+  membershipAddress   String   @unique @map("membership_address") @db.VarChar(44)
+  hubCode             String   @map("hub_code") @db.VarChar(16)
+  hub                 Hub      @relation(fields: [hubCode], references: [code])
+  stakeLamports       Decimal  @map("stake_lamports") @db.Decimal(20, 0)
+  proposerStakeLamports Decimal @map("proposer_stake_lamports") @db.Decimal(20, 0)
+  capped              Boolean
+  effectiveEpoch      BigInt   @map("effective_epoch")
+  cooldownUntilEpoch  BigInt   @map("cooldown_until_epoch")
+  pendingHubCode      String?  @map("pending_hub_code") @db.VarChar(16)
+  leavingEpoch        BigInt?  @map("leaving_epoch")
+  indexedSlot         BigInt   @map("indexed_slot")
+  updatedAt           DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([hubCode, effectiveEpoch])
+  @@map("members")
+}
+
+model RegistryEvent {
+  id                  BigInt   @id @default(autoincrement())
+  signature           String   @db.VarChar(88)
+  instructionIndex    Int      @map("instruction_index")
+  slot                BigInt
+  kind                String
+  hubCode             String?  @map("hub_code") @db.VarChar(16)
+  hub                 Hub?     @relation(fields: [hubCode], references: [code])
+  identity            String?  @db.VarChar(44)
+  payload             Json
+  occurredAt          DateTime @map("occurred_at") @db.Timestamptz(3)
+
+  @@unique([signature, instructionIndex])
+  @@index([hubCode, slot])
+  @@map("registry_events")
+}
+
+model FaucetGrant {
+  id                  String   @id @default(uuid())
+  address             String   @db.VarChar(44)
+  ipHash              String   @map("ip_hash")
+  amountLamports      Decimal  @map("amount_lamports") @db.Decimal(20, 0)
+  transactionId       String?  @unique @map("transaction_id")
+  grantedAt           DateTime @default(now()) @map("granted_at") @db.Timestamptz(3)
+
+  @@index([address, grantedAt])
+  @@index([ipHash, grantedAt])
+  @@map("faucet_grants")
+}
+
+model LabRun {
+  id                  String       @id @default(uuid())
+  scenario            String
+  seed                String
+  parameters          Json
+  status              LabRunStatus @default(queued)
+  outcome             Json?
+  failure             Json?
+  createdAt           DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  startedAt           DateTime?    @map("started_at") @db.Timestamptz(3)
+  finishedAt          DateTime?    @map("finished_at") @db.Timestamptz(3)
+  events              LabRunEvent[]
+
+  @@index([createdAt])
+  @@map("lab_runs")
+}
+
+model LabRunEvent {
+  runId               String   @map("run_id")
+  sequence            Int
+  run                 LabRun   @relation(fields: [runId], references: [id], onDelete: Cascade)
+  type                String
+  relativeUs          BigInt   @map("relative_us")
+  event               Json
+
+  @@id([runId, sequence])
+  @@map("lab_run_events")
+}
+
+model FactsSnapshot {
+  id                  String   @id @default(uuid())
+  source              String
+  sampleSize          Int      @map("sample_size")
+  measuredFrom        DateTime @map("measured_from") @db.Timestamptz(3)
+  measuredTo          DateTime @map("measured_to") @db.Timestamptz(3)
+  facts               Json
+
+  @@index([measuredTo])
+  @@map("facts_snapshots")
+}
+
+model IndexerCursor {
+  address             String   @id @db.VarChar(44)
+  latestSignature     String?  @map("latest_signature") @db.VarChar(88)
+  latestSlot          BigInt?  @map("latest_slot")
+  discoveredBy        String?  @map("discovered_by") @db.VarChar(88)
+  updatedAt           DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("indexer_cursors")
+}
