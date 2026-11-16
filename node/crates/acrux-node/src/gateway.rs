@@ -171,7 +171,7 @@ pub async fn run_gateway(
     let cors = CorsLayer::new()
         .allow_origin(origins())
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE]);
+        .allow_headers([header::CONTENT_TYPE, header::HeaderName::from_static("solana-client")]);
     let http = Router::new()
         .route("/", post(rpc))
         .route("/rpc", post(rpc))
