@@ -12,6 +12,19 @@ Acrux is the first implementation of New Constellation (Kniep and Wattenhofer, 2
 | `contract/` | `@acrux/contract`: zod schemas and types for the API, the gateway's JSON-RPC and every event, plus clients. |
 | `sdk/` | `@acrux/sdk`: `connect`, `send(tx, { n, t })`, `tx.follow`, `slots.subscribe`. See [sdk/README.md](sdk/README.md). |
 | `spec/map.json` | Every algorithm line and lemma of the paper, mapped to file, function and Fault Lab scenario. |
+| `deploy/` | The node and API images and the single-host stack. See [deploy/README.md](deploy/README.md). |
+
+## Run locally
+
+| Service | Port | Start |
+|---|---|---|
+| Postgres | 127.0.0.1:4921 | `docker run -d --name acrux-postgres -p 127.0.0.1:4921:5432 -e POSTGRES_USER=acrux -e POSTGRES_PASSWORD=acrux -e POSTGRES_DB=acrux postgres:17-alpine` |
+| Local Solana validator, Hub Registry | 4990 RPC, 4991 WebSocket, 4992 faucet, 4993 gossip | `bash chain/scripts/validator.sh chain/.ledger 75 &` then `node chain/scripts/init-localnet.mjs` (after the chain build in [chain/README.md](chain/README.md)) |
+| Acrux Net | 4930 JSON-RPC, 4931 events, 4989 metrics (private), 4950-4961 QUIC | `cargo build --release -p acrux-node`, then `./target/release/acrux net up` from `node/` |
+| API | 4920 | `cd api && npm install && npm run build && npm start` with `MODE=node` (`.env.example` lists every name; build `contract/` first) |
+| Fault Lab sandboxes | 5016-5027 | started by the API, one run at a time |
+
+Each start of the net is a fresh genesis. `npm start` in `api/` applies migrations, then serves.
 
 ## Consume the contract
 

@@ -1,0 +1,72 @@
+# Acrux on one Linux host: Acrux Net, the API with its Fault Lab sandboxes, Postgres, and Caddy in
+# front with TLS. Run from this folder: docker compose --env-file acrux.env up -d
+name: acrux
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: acrux-postgres
+    environment: { POSTGRES_USER: acrux, POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}", POSTGRES_DB: acrux }
+    volumes: [acrux-pg:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD", "pg_isready", "-U", "acrux"], interval: 5s, retries: 20 }
+    restart: unless-stopped
+
+  net:
+    image: acrux-net:${ACRUX_VERSION:-latest}
+    build: { context: ../.., dockerfile: deploy/Dockerfile, target: net }
+    container_name: acrux-net
+    # The net's 50 ms slots come first when the host is busy; lab sandboxes take what is left.
+    cpu_shares: 4096
+    environment:
+      ACRUX_BIND: 0.0.0.0
+      ACRUX_TRUST_PROXY: "1"
+      ACRUX_CORS_ORIGINS: "${SITE_ORIGINS}"
+      ACRUX_RPC_RATE: "${ACRUX_RPC_RATE:-50}"
+      ACRUX_SUBMIT_RATE: "${ACRUX_SUBMIT_RATE:-5}"
+      ACRUX_WS_PER_IP: "${ACRUX_WS_PER_IP:-8}"
+      ACRUX_TRAFFIC_RATE: "${ACRUX_TRAFFIC_RATE:-50}"
+      ACRUX_IDENTITY_SEED: "${ACRUX_IDENTITY_SEED}"
+    # Every start is a fresh genesis; the store keeps the current run and the one before it.
+    volumes:
+      - acrux-net:/var/lib/acrux
+      - "${ACRUX_GENESIS_FILE}:/app/chain/genesis/acrux-net.json:ro"
+    restart: unless-stopped
+
+  api:
+    image: acrux-api:${ACRUX_VERSION:-latest}
+    build: { context: ../.., dockerfile: deploy/Dockerfile, target: api }
+    container_name: acrux-api
+    # The API runs the Fault Lab's sandbox clusters, so it yields CPU to the live net.
+    cpu_shares: 512
+    depends_on: { postgres: { condition: service_healthy }, net: { condition: service_started } }
+    environment:
+      MODE: node
+      DATABASE_URL: "postgresql://acrux:${POSTGRES_PASSWORD}@postgres:5432/acrux"
+      CORS_ORIGINS: "${SITE_ORIGINS}"
+      GATEWAY_RPC_URL: http://net:4930
+      GATEWAY_INTERNAL_URL: http://net:4989
+      SOLANA_RPC_URL: "${SOLANA_RPC_URL}"
+      REGISTRY_PROGRAM_ID: "${REGISTRY_PROGRAM_ID}"
+      REGISTRY_POLL_SECONDS: "${REGISTRY_POLL_SECONDS:-30}"
+      FAUCET_GRANT_LAMPORTS: "${FAUCET_GRANT_LAMPORTS:-2000000000}"
+      FAUCET_PER_KEY_LIMIT: "${FAUCET_PER_KEY_LIMIT:-3}"
+      FAUCET_PER_IP_LIMIT: "${FAUCET_PER_IP_LIMIT:-10}"
+      FAUCET_WINDOW_SECONDS: "${FAUCET_WINDOW_SECONDS:-86400}"
+      LAB_RUNS_PER_IP_HOUR: "${LAB_RUNS_PER_IP_HOUR:-6}"
+      LAB_QUEUE_MAX: "${LAB_QUEUE_MAX:-10}"
+      ACRUX_IDENTITY_SEED: "${ACRUX_IDENTITY_SEED}"
+    volumes: ["${ACRUX_GENESIS_FILE}:/app/chain/genesis/acrux-net.json:ro"]
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    container_name: acrux-caddy
+    depends_on: [net, api]
+    ports: ["80:80", "443:443"]
+    environment: { ACRUX_DOMAIN: "${ACRUX_DOMAIN}" }
+    volumes: [./Caddyfile:/etc/caddy/Caddyfile:ro, acrux-caddy:/data]
+    restart: unless-stopped
+
+volumes:
+  acrux-pg: { name: acrux-pg }
+  acrux-net: { name: acrux-net }
+  acrux-caddy: { name: acrux-caddy }

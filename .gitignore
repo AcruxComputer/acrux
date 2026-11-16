@@ -1,5 +1,12 @@
 node_modules/
+dist/
 target/
 .env
+.env.*
+!.env.example
+*.log
 .ledger/
+test-ledger/
 keys/
+*-keypair.json
+dist-pack/

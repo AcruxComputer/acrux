@@ -1,0 +1,10 @@
+# Public endpoints. Port 4989 (metrics and the faucet's grant route) is never proxied.
+rpc.{$ACRUX_DOMAIN} {
+	reverse_proxy net:4930
+}
+events.{$ACRUX_DOMAIN} {
+	reverse_proxy net:4931
+}
+api.{$ACRUX_DOMAIN} {
+	reverse_proxy api:4920
+}
