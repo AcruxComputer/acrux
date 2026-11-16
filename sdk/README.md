@@ -1,16 +1,14 @@
 # @acrux/sdk
 
-Send a transaction into a leaderless Acrux slot from TypeScript. Runs in the browser and on Node 22.
+Send a transaction into a leaderless Acrux slot from TypeScript. Runs in the browser and on Node 20 or later.
 
 ## Install
 
-The SDK builds on `@acrux/contract`. From this repository:
-
 ```bash
-(cd contract && npm install && npm run build)
-(cd sdk && npm install && npm run build)
-npm install ./contract ./sdk
+npm install https://acrux.computer/downloads/acrux-sdk-0.1.1.tgz
 ```
+
+The SDK's contract, `@acrux/contract` 0.1.8, installs with it from https://acrux.computer/downloads/acrux-contract-0.1.8.tgz.
 
 ## Connect
 

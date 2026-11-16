@@ -13,7 +13,7 @@ FROM debian:bookworm-slim AS net
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /acrux /usr/local/bin/acrux
 COPY chain/genesis/ /app/chain/genesis/
-COPY chain/target/deploy/demo_pool.so /app/chain/target/deploy/demo_pool.so
+COPY chain/target/deploy/demo_pool.so chain/target/deploy/hub_registry.so /app/chain/target/deploy/
 WORKDIR /app/node
 ENV ACRUX_BIND=0.0.0.0
 EXPOSE 4930 4931 4989
@@ -26,7 +26,7 @@ COPY contract/ contract/
 RUN cd contract && npm ci && npm run build
 COPY spec/ spec/
 COPY chain/genesis/ chain/genesis/
-COPY chain/target/deploy/demo_pool.so chain/target/deploy/demo_pool.so
+COPY chain/target/deploy/demo_pool.so chain/target/deploy/hub_registry.so chain/target/deploy/
 COPY api/package.json api/package-lock.json api/
 RUN cd api && npm ci
 COPY api/ api/

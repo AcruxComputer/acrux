@@ -1,11 +1,11 @@
 {
   "name": "@acrux/sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "sideEffects": false,
   "engines": {
-    "node": "22.x"
+    "node": ">=20"
   },
   "files": [
     "dist"
@@ -24,13 +24,10 @@
   "dependencies": {
     "@noble/ciphers": "2.4.0",
     "@noble/curves": "2.4.0",
-    "@noble/hashes": "2.4.0"
-  },
-  "peerDependencies": {
-    "@acrux/contract": "^0.1.6"
+    "@noble/hashes": "2.4.0",
+    "@acrux/contract": "https://acrux.computer/downloads/acrux-contract-0.1.8.tgz"
   },
   "devDependencies": {
-    "@acrux/contract": "file:../contract",
     "@solana/web3.js": "1.99.0",
     "@types/node": "^22.0.0",
     "typescript": "^5.9.3"

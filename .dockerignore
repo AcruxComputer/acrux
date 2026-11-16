@@ -1,0 +1,15 @@
+**/node_modules
+**/.env
+**/.env.*
+**/*.log
+**/dist
+node/target
+sdk
+chain/node_modules
+chain/.ledger
+chain/keys
+chain/target/*
+!chain/target/deploy
+chain/target/deploy/*
+!chain/target/deploy/demo_pool.so
+!chain/target/deploy/hub_registry.so

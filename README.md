@@ -1,13 +1,13 @@
 # Acrux
 
-New Constellation on Alpenglow, running.
+Solana at 50 ms.
 
-Acrux is the first implementation of New Constellation (Kniep and Wattenhofer, 2026): every 50 ms slot, three co-located proposers each stream an encrypted block, exchange signed commitments within 2δlocal, then release their keys in attestations. Validators agree on the set P, decrypt, merge by priority across four tracks, execute on the SVM and vote once per four-slot cblock. Site: [acrux.computer](https://acrux.computer).
+Acrux is a Solana fork with New Constellation consensus (Kniep and Wattenhofer, 2026): Solana's transactions and programs on the SVM, ordered by concurrent proposers. Every 50 ms slot, three co-located proposers each stream an encrypted block, exchange signed commitments within 2δlocal, then release their keys in attestations. Validators agree on the set P, decrypt, merge by priority across four tracks, execute and vote once per four-slot cblock. ACRUX is the chain's native token ([node/README.md](node/README.md#acrux)). Site: [acrux.computer](https://acrux.computer).
 
 | Folder | What it is |
 |---|---|
 | `node/` | `acrux-node` (Rust): Algorithms 1 to 4 on Alpenglow, Acrux Net, the Fault Lab runner and the `acrux` CLI. See [node/README.md](node/README.md). |
-| `chain/` | Anchor workspace: `hub_registry` (for Solana) and `demo_pool` (for Acrux Net's genesis). See [chain/README.md](chain/README.md). |
+| `chain/` | Anchor workspace: `hub_registry` (on Solana and in Acrux's genesis) and `demo_pool` (in Acrux's genesis). See [chain/README.md](chain/README.md). |
 | `api/` | The API: TypeScript, Hono, Prisma 7 on Postgres. Registry read model, schedule preview, faucet, transaction lookup, lab runs, facts. |
 | `contract/` | `@acrux/contract`: zod schemas and types for the API, the gateway's JSON-RPC and every event, plus clients. |
 | `sdk/` | `@acrux/sdk`: `connect`, `send(tx, { n, t })`, `tx.follow`, `slots.subscribe`. See [sdk/README.md](sdk/README.md). |
