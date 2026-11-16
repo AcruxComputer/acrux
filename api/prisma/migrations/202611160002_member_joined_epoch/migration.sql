@@ -1,0 +1,1 @@
+ALTER TABLE "members" ADD COLUMN "joined_epoch" BIGINT NOT NULL DEFAULT 0;

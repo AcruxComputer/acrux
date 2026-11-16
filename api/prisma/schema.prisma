@@ -51,6 +51,7 @@ model Member {
   proposerStakeLamports Decimal @map("proposer_stake_lamports") @db.Decimal(20, 0)
   capped              Boolean
   effectiveEpoch      BigInt   @map("effective_epoch")
+  joinedEpoch         BigInt   @default(0) @map("joined_epoch")
   cooldownUntilEpoch  BigInt   @map("cooldown_until_epoch")
   pendingHubCode      String?  @map("pending_hub_code") @db.VarChar(16)
   leavingEpoch        BigInt?  @map("leaving_epoch")
