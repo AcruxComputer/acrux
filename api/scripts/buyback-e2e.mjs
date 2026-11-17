@@ -341,7 +341,7 @@ async function runLocalnet() {
       return { claim, swap, burn, parts }
     }
 
-    assert.equal(config.postGraduationBps, 2500)
+    assert.equal(config.postGraduationBps, 2000)
     const first = await runAndVerify({ floorRetry: true, label: 'floor refusal preserves the exact curve claim reservation across retries and restart, then swaps it at 100%' })
     assert.equal(first.parts.cpmmLamports, 0n)
     // The keeper's own buy has accrued a small new curve fee below the 50m minimum.
@@ -384,11 +384,11 @@ async function runLocalnet() {
     const baseIs0 = snapshot.cpmm.pool.mint0.equals(mint.publicKey)
     const claimTokens = baseIs0 ? snapshot.cpmm.creatorPayout0 : snapshot.cpmm.creatorPayout1
     const claimLamports = snapshot.creatorVault + (baseIs0 ? snapshot.cpmm.creatorPayout1 : snapshot.cpmm.creatorPayout0)
-    const cpmm = await runAndVerify({ label: 'mixed curve and CPMM claim applies 100% curve plus 25% CPMM shares, preserving unselected ACRUX and wallet SOL' })
+    const cpmm = await runAndVerify({ label: 'mixed curve and CPMM claim applies 100% curve plus 20% CPMM shares, preserving unselected ACRUX and wallet SOL' })
     assert.equal(cpmm.parts.cpmmTokens, claimTokens)
     assert.equal(BigInt(cpmm.claim.lamports.toString()), claimLamports, 'Record net creator fee after Raydium share, excluding WSOL rent')
     assert.ok(cpmm.parts.curveLamports > 0n && cpmm.parts.cpmmLamports > 0n, 'Exercise the mixed claim source path')
-    assert.equal(BigInt(cpmm.swap.lamports.toString()), cpmm.parts.curveLamports + cpmm.parts.cpmmLamports * 2500n / 10_000n)
+    assert.equal(BigInt(cpmm.swap.lamports.toString()), cpmm.parts.curveLamports + cpmm.parts.cpmmLamports * 2000n / 10_000n)
     assert.ok(retainedTokens > 0n)
 
     // Size one more local trade so its net creator payout alone clears the default swap minimum.
@@ -406,10 +406,10 @@ async function runLocalnet() {
     await send(connection, (await cpmmTradePlan(buyer.publicKey, NATIVE_MINT, cpmmSolInput)).instructions, [buyer], tables)
     const nextSale = (await getAccount(connection, buyerAta, 'confirmed', TOKEN_2022_PROGRAM_ID)).amount / 100n
     await send(connection, (await cpmmTradePlan(buyer.publicKey, mint.publicKey, nextSale)).instructions, [buyer], tables)
-    const cpmmOnly = await runAndVerify({ label: 'CPMM-only claim swaps exactly 25% of delivered SOL and burns only its selected token share plus swap delivery' })
+    const cpmmOnly = await runAndVerify({ label: 'CPMM-only claim swaps exactly 20% of delivered SOL and burns only its selected token share plus swap delivery' })
     assert.equal(cpmmOnly.parts.curveLamports, 0n)
     assert.ok(cpmmOnly.parts.cpmmLamports > 0n && cpmmOnly.parts.cpmmTokens > 0n)
-    assert.equal(BigInt(cpmmOnly.swap.lamports.toString()), cpmmOnly.parts.cpmmLamports * 2500n / 10_000n)
+    assert.equal(BigInt(cpmmOnly.swap.lamports.toString()), cpmmOnly.parts.cpmmLamports * 2000n / 10_000n)
     // Rehearsal rows are isolated by random mint and wallet, and remain available for inspection.
   } finally {
     await database?.close()

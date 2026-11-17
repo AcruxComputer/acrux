@@ -32,6 +32,7 @@ const started = performance.now()
 const signature = await sendAndConfirmTransaction(connection, tx, [payer], { commitment: 'confirmed' })
 console.log(`sendAndConfirmTransaction: ${signature} confirmed in ${Math.round(performance.now() - started)} ms`)
 console.log(`onAccountChange: ${to.toBase58()} now holds ${(await seen) / LAMPORTS_PER_SOL}`)
+slots = 0
 await sleep(1000)
 await connection.removeSlotChangeListener(slotSub)
 console.log(`onSlotChange: ${slots} slots in the last second`)

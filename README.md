@@ -24,7 +24,7 @@ Acrux is a Solana fork with New Constellation consensus (Kniep and Wattenhofer, 
 | API | 4920 | `cd api && npm install && npm run build && npm start` with `MODE=node` (`.env.example` lists every name; build `contract/` first) |
 | Fault Lab sandboxes | 5016-5027 | started by the API, one run at a time |
 
-Each start of the net is a fresh genesis. `npm start` in `api/` applies migrations, then serves.
+A start of the net continues its chain from the last finalized cblock (`--fresh` begins a new one). `npm start` in `api/` applies migrations, then serves.
 
 ## Consume the contract
 

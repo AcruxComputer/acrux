@@ -123,16 +123,29 @@ export function createNodeApi() {
     ])
     return { key: Math.max(0, env.FAUCET_PER_KEY_LIMIT! - forKey), ip: Math.max(0, env.FAUCET_PER_IP_LIMIT! - forIp) }
   }
+  // When this address can be granted again: once the oldest grant in the window of each spent
+  // limit (the key's, the IP's) leaves it; null while it is eligible.
+  const freesAt = async (address: string, ip: string, left: { key: number, ip: number }) => {
+    const since = window(), oldest = (where: { address: string } | { ipHash: string }) =>
+      db.faucetGrant.findFirst({ where: { ...where, grantedAt: { gte: since } }, orderBy: { grantedAt: 'asc' } })
+    const grants = await Promise.all([left.key ? null : oldest({ address }), left.ip ? null : oldest({ ipHash: ipHash(ip) })])
+    const at = Math.max(0, ...grants.map(g => g ? g.grantedAt.getTime() + env.FAUCET_WINDOW_SECONDS! * 1000 : 0))
+    return at ? new Date(at) : null
+  }
   const policy = () => ({ amountLamports: env.FAUCET_GRANT_LAMPORTS!, perKey: env.FAUCET_PER_KEY_LIMIT!, perIp: env.FAUCET_PER_IP_LIMIT!, periodSeconds: env.FAUCET_WINDOW_SECONDS!, missingConfiguration: [] })
   app.get('/v1/faucet/:address', async c => {
-    const address = readParam(c, 'address', Address), left = await remaining(address, clientIp(c))
-    const oldest = await db.faucetGrant.findFirst({ where: { address, grantedAt: { gte: window() } }, orderBy: { grantedAt: 'asc' } })
+    const address = readParam(c, 'address', Address), ip = clientIp(c), left = await remaining(address, ip)
+    const frees = await freesAt(address, ip, left)
     return c.json({ address, policy: policy(), remainingForKey: left.key, remainingForIp: left.ip,
-      resetsAt: oldest ? new Date(oldest.grantedAt.getTime() + env.FAUCET_WINDOW_SECONDS! * 1000).toISOString() : null, eligible: left.key > 0 && left.ip > 0 })
+      resetsAt: frees?.toISOString() ?? null, eligible: left.key > 0 && left.ip > 0 })
   })
   app.post('/v1/faucet', async c => {
     const { address } = await readJson(c, FaucetRequest), ip = clientIp(c), left = await remaining(address, ip)
-    if (!left.key || !left.ip) fail('FAUCET_LIMIT', 'The faucet limit for this key or IP has been reached.', { retryable: true, retryAfterSeconds: env.FAUCET_WINDOW_SECONDS, stage: 'send' })
+    if (!left.key || !left.ip) {
+      const frees = await freesAt(address, ip, left)
+      const retryAfterSeconds = Math.max(1, Math.ceil(((frees?.getTime() ?? Date.now()) - Date.now()) / 1000))
+      fail('FAUCET_LIMIT', 'The faucet limit for this key or IP has been reached.', { retryable: true, retryAfterSeconds, stage: 'send' })
+    }
     let response: Response
     try { response = await fetch(new URL('/internal/faucet', env.GATEWAY_INTERNAL_URL), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address, amountLamports: env.FAUCET_GRANT_LAMPORTS }) }) }
     catch { fail('NET_UNAVAILABLE', 'Acrux Net is unavailable.', { retryable: true, stage: 'send' }) }

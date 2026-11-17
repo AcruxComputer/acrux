@@ -79,6 +79,10 @@ pub struct GatewayState {
     pub current_window: Value,
     pub upcoming_windows: Vec<Value>,
     pub counters: Value,
+    /// Finalized cblocks and skips before this run, for a chain continued from its saved state.
+    pub counter_base: (u64, u64),
+    /// The transactions people sent, kept for days, when the net persists.
+    pub kept: Option<Arc<crate::history::History>>,
     pub facts: Value,
     pub parameters: Value,
     pub balances: BTreeMap<String, u64>,
@@ -103,6 +107,8 @@ impl GatewayState {
             upcoming_windows: vec![],
             facts: Value::Null,
             counters: json!({"slots":0,"finalizedCblocks":0,"skips":0,"averageCommitSpreadUs":0}),
+            counter_base: (0, 0),
+            kept: None,
             parameters: Value::Null,
             balances: BTreeMap::new(),
             stream_id: format!("acrux-{}", rand::random::<u64>()),
@@ -293,7 +299,9 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
             let encoding = params.as_array().into_iter().flatten().find_map(|p| p.get("encoding").and_then(Value::as_str)).unwrap_or("");
             eprintln!("solana-rpc {method} {encoding}");
         }
-        if !bounded_strings(&params) || params.get(0).and_then(Value::as_array).is_some_and(|keys| keys.len() > 100) {
+        // Solana's own caps on a list argument: 256 signatures a status call, 100 accounts otherwise.
+        let list_cap = if method == "getSignatureStatuses" { 256 } else { 100 };
+        if !bounded_strings(&params) || params.get(0).and_then(Value::as_array).is_some_and(|keys| keys.len() > list_cap) {
             return Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": "Invalid params: a string or list is too long."}})).into_response();
         }
         return match command(&state, |reply| GatewayCommand::Solana { method: method.to_owned(), params, reply }).await {
@@ -346,29 +354,41 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
                     &gateway.slots.get(&slot).cloned(),
                     gateway.store.as_ref(),
                     &format!("slot/{slot}"),
-                    "Slot not found.",
+                    "Slot not found: the gateway holds about the last 20 minutes of slots. A transaction sent to the net is kept for days; look it up by its signature or id.",
                 )
             }
             None => Err(("INVALID_INPUT", "slot must be a nonnegative safe integer.")),
         },
-        "getTransaction" => match match params.get("signature").and_then(Value::as_str) {
-            Some(signature) if signature.len() <= MAX_SIGNATURE_CHARS => state.read().await.signatures.get(signature).cloned(),
-            _ => params.get("id").and_then(Value::as_str).filter(|id| valid_hash(id)).map(str::to_owned),
-        } {
-            Some(tx) => {
-                let tx = tx.as_str();
+        "getTransaction" => {
+            let signature = params.get("signature").and_then(Value::as_str).filter(|s| s.len() <= MAX_SIGNATURE_CHARS);
+            let id = params.get("id").and_then(Value::as_str).filter(|id| valid_hash(id));
+            if signature.is_none() && id.is_none() {
+                Err((
+                    "INVALID_INPUT",
+                    "Give id, a lowercase 32-byte hexadecimal hash, or signature, a Solana signature of an executed transaction.",
+                ))
+            } else {
                 let gateway = state.read().await;
-                stored_read(
-                    &gateway.transactions.get(tx).cloned(),
-                    gateway.store.as_ref(),
-                    &format!("transaction/{tx}"),
-                    "Transaction not found.",
-                )
+                let held = match signature {
+                    Some(signature) => gateway.signatures.get(signature).cloned(),
+                    None => id.map(str::to_owned),
+                };
+                match held.and_then(|tx| stored_read(&gateway.transactions.get(&tx).cloned(), gateway.store.as_ref(), &format!("transaction/{tx}"), "").ok()) {
+                    Some(record) => Ok(record),
+                    None => kept_record(gateway.kept.as_deref(), signature, id),
+                }
             }
-            None => Err((
-                "INVALID_INPUT",
-                "Give id, a lowercase 32-byte hexadecimal hash, or signature, a Solana signature of an executed transaction.",
-            )),
+        }
+        "getOutsideUse" => match state.read().await.kept.clone() {
+            Some(kept) => match kept.use_by_hour(params.get("hours").and_then(Value::as_u64).unwrap_or(24).clamp(1, 168)) {
+                Ok(hours) => Ok(json!({"hours": hours.into_iter().map(|(hour, transactions, payers)| json!({
+                    "hour": crate::protocol::utc(hour * 3_600_000),
+                    "transactions": transactions,
+                    "feePayers": payers,
+                })).collect::<Vec<_>>()})),
+                Err(_) => Err(("INTERNAL_ERROR", "The kept transactions could not be read.")),
+            },
+            None => Err(("NET_UNAVAILABLE", "This net keeps no transactions.")),
         },
         "getLatestBlockhash" => {
             if params.as_object().is_some_and(|fields| !fields.is_empty()) {
@@ -523,6 +543,25 @@ fn valid_hash(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+/// A transaction the gateway's own records no longer hold, from the kept transactions.
+fn kept_record(kept: Option<&crate::history::History>, signature: Option<&str>, id: Option<&str>) -> std::result::Result<Value, (&'static str, &'static str)> {
+    let missing = ("NOT_FOUND", "Transaction not found.");
+    let Some(kept) = kept else { return Err(missing) };
+    let signature = match signature {
+        Some(signature) => Some(signature.to_owned()),
+        None => kept.signature_of(id.unwrap_or("")).map_err(|_| ("INTERNAL_ERROR", "The kept transactions could not be read."))?,
+    };
+    let Some(signature) = signature else { return Err(missing) };
+    match kept.get(&signature) {
+        Ok(Some(entry)) => Ok(entry.record().unwrap_or_else(|| {
+            let e = &entry.executed;
+            json!({"header": {"id": e.id}, "signature": signature, "state": "finalized", "executedSlot": e.slot,
+                "result": if e.err.is_none() { "success" } else { "failed" }, "error": e.err, "logs": e.logs, "fee": e.fee.to_string()})
+        })),
+        Ok(None) => Err(missing),
+        Err(_) => Err(("INTERNAL_ERROR", "The kept transactions could not be read.")),
+    }
 }
 fn stored_read(
     memory: &Option<Value>,
@@ -813,10 +852,6 @@ async fn open_stream(
     upgrade: WebSocketUpgrade,
     acrux: bool,
 ) -> Response {
-    let limits = crate::limits::limits();
-    let Some(permit) = limits.open_socket(limits.client(peer, &headers)) else {
-        return (StatusCode::TOO_MANY_REQUESTS, Json(error("RATE_LIMITED", "Too many event-stream connections, from this address or in all."))).into_response();
-    };
     if !valid_origin(&headers) {
         return (
             StatusCode::FORBIDDEN,
@@ -824,6 +859,15 @@ async fn open_stream(
         )
             .into_response();
     }
+    let limits = crate::limits::limits();
+    let Some(permit) = limits.open_socket(limits.client(peer, &headers)) else {
+        // A browser never sees a refused handshake's status, so the stream opens and closes at
+        // once with 1013 (try again later) and the reason RATE_LIMITED.
+        return upgrade.on_upgrade(|mut socket| async move {
+            let close = axum::extract::ws::CloseFrame { code: 1013, reason: "RATE_LIMITED".into() };
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), socket.send(WsMessage::Close(Some(close)))).await;
+        });
+    };
     upgrade
         .max_message_size(8192)
         .on_upgrade(move |socket| async move {
@@ -897,10 +941,12 @@ async fn signature_reached(state: &SharedGateway, signature: &str, finalized: bo
 }
 /// One Solana PubSub request: the reply, and a notification to send at once when one is due.
 async fn solana_request(state: &SharedGateway, subs: &mut BTreeMap<u64, SolanaSub>, next: &mut u64, request: &Value) -> Vec<Value> {
-    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    // A notification (no id), such as web3.js's heartbeat `ping`, gets no answer, as JSON-RPC says.
+    let Some(id) = request.get("id").cloned() else { return vec![] };
     let params = request.get("params").cloned().unwrap_or(json!([]));
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-    let finalized = |config: &Value| !matches!(config["commitment"].as_str(), Some("confirmed" | "processed"));
+    // `confirmed` waits for finality: an executed transaction can still roll back with a skipped cblock.
+    let finalized = |config: &Value| config["commitment"].as_str() != Some("processed");
     if method.ends_with("Unsubscribe") {
         let removed = params.get(0).and_then(Value::as_u64).is_some_and(|sub| subs.remove(&sub).is_some());
         return vec![solana_reply(&id, Ok(json!(removed)))];
@@ -1030,7 +1076,10 @@ async fn stream(mut socket: WebSocket, state: SharedGateway, acrux: bool) {
                     if let Some(snapshot)=snapshot{last_sequence=snapshot["sequence"].as_u64().unwrap_or(0);if !send(&mut socket,snapshot).await{break;}}for event in replay{last_sequence=event["sequence"].as_u64().unwrap_or(last_sequence);if !send(&mut socket,event).await{return;}}
                 },
                 Some(Ok(WsMessage::Pong(_)))=>pong=true,
-                Some(Ok(WsMessage::Close(_)))|None|Some(Err(_))=>break,
+                // Answer a client's close so its closing handshake completes: a dropped socket reads
+                // as an abnormal close, and web3.js then reconnects every second, for ever.
+                Some(Ok(WsMessage::Close(_)))=>{let _=futures_util::SinkExt::close(&mut socket).await;break;},
+                None|Some(Err(_))=>break,
                 _=>{},
             },
             event=events.recv()=>{match event{Ok(shared)=>{
@@ -1064,6 +1113,11 @@ async fn metrics(State(state): State<SharedGateway>) -> impl IntoResponse {
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0)
         ));
+    }
+    // Outside use this hour: transactions people sent (not the built-in traffic or the faucet's
+    // credits) and their distinct fee payers.
+    if let Some((_, sent, payers)) = state.kept.as_ref().and_then(|kept| kept.use_by_hour(1).ok()).and_then(|h| h.first().copied()) {
+        output.push_str(&format!("acrux_outside_transactions_hour {sent}\nacrux_outside_fee_payers_hour {payers}\n"));
     }
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],

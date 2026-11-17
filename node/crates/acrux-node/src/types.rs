@@ -98,6 +98,14 @@ pub struct Configuration {
     pub genesis_path: Option<String>,
     pub fault: Option<Fault>,
     pub run_seconds: Option<u64>,
+    /// Keep the chain's finalized state in the store and continue from it on the next start.
+    #[serde(default)]
+    pub persist: bool,
+    /// How long a persisting net keeps the transactions people send, in days and at most in count.
+    #[serde(default)]
+    pub keep_days: u64,
+    #[serde(default)]
+    pub keep_max: u64,
 }
 impl Default for Configuration {
     fn default() -> Self {
@@ -122,6 +130,9 @@ impl Default for Configuration {
             genesis_path: None,
             fault: None,
             run_seconds: None,
+            persist: false,
+            keep_days: 7,
+            keep_max: 200_000,
         }
     }
 }

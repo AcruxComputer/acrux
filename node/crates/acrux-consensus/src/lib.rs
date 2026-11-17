@@ -119,6 +119,9 @@ pub struct Votor {
     next_window: u64,
     started: bool,
     pruned_below: u64,
+    /// The first window's first slot after a resume: the slots between the finalized cblock and it
+    /// were never produced and count as skipped.
+    floor: u64,
 }
 
 impl Votor {
@@ -167,6 +170,7 @@ impl Votor {
             next_window: 0,
             started: false,
             pruned_below: 0,
+            floor: 0,
         })
     }
 
@@ -180,6 +184,25 @@ impl Votor {
         vec![Action::ParentReady {
             window_first_slot: 0,
             parent: None,
+        }]
+    }
+
+    /// Call once at startup instead of `genesis`, to continue a chain from its finalized cblock:
+    /// the next window builds on it.
+    pub fn resume(&mut self, finalized: BlockRef) -> Vec<Action> {
+        if self.started {
+            return Vec::new();
+        }
+        self.started = true;
+        let first = (finalized.slot / CONSENSUS_SLOTS_PER_WINDOW + 1) * CONSENSUS_SLOTS_PER_WINDOW;
+        self.blocks.insert(finalized, Block { id: finalized, parent: None });
+        self.finalized = Some(finalized);
+        self.floor = first;
+        self.pruned_below = finalized.slot;
+        self.next_window = first + CONSENSUS_SLOTS_PER_WINDOW;
+        vec![Action::ParentReady {
+            window_first_slot: first,
+            parent: Some(finalized),
         }]
     }
 
@@ -368,7 +391,8 @@ impl Votor {
             .any(|((_, kind, hash), _)| *hash == Some(id.hash) && *kind != CertificateKind::Skip)
     }
     fn skipped(&self, slot: u64) -> bool {
-        self.certificates
+        (slot < self.floor && self.finalized.is_some_and(|f| slot > f.slot))
+            || self.certificates
             .contains_key(&(slot, CertificateKind::Skip, None))
     }
     fn extends(&self, mut id: BlockRef, ancestor: BlockRef) -> bool {
@@ -405,7 +429,7 @@ impl Votor {
                     return false;
                 }
                 if first {
-                    self.certified(parent)
+                    (self.certified(parent) || self.finalized == Some(parent))
                         && ((parent.slot + 1)..block.id.slot).all(|s| self.skipped(s))
                 } else {
                     self.certified(parent)
@@ -760,10 +784,11 @@ impl Votor {
                 }
             }
         }
-        if self.finalized.is_none() && (0..boundary).all(|s| self.skipped(s)) {
-            Some(None)
-        } else {
-            None
+        // The finalized cblock is always a parent, its certificate pruned or never held (a resume).
+        match self.finalized {
+            None if (0..boundary).all(|s| self.skipped(s)) => Some(None),
+            Some(f) if f.slot < boundary && ((f.slot + 1)..boundary).all(|s| self.skipped(s)) => Some(Some(f)),
+            _ => None,
         }
     }
 }
@@ -881,6 +906,27 @@ mod tests {
                 .unwrap();
         }
         assert!(combined.fallback.contains_key(&(0, Some(b.hash))));
+    }
+
+    #[test]
+    fn a_resumed_chain_builds_and_finalizes_on_its_finalized_cblock() {
+        let mut v = Votor::new(0, vec![1; 5]).unwrap();
+        let f = id(41, 7);
+        assert_eq!(v.resume(f), vec![Action::ParentReady { window_first_slot: 44, parent: Some(f) }]);
+        let a = id(44, 1);
+        let actions = v.local_block(Block { id: a, parent: Some(f) }).unwrap();
+        assert!(actions.contains(&Action::SendVote(vote(0, a, VoteKind::Notar))));
+        for validator in 1..4 {
+            v.receive(Message::Vote(vote(validator, a, VoteKind::Notar))).unwrap();
+        }
+        assert_eq!(v.finalized(), Some(a));
+        // A window skipped whole after the resume still gets the last finalized cblock as parent.
+        for slot in 45..52 {
+            for validator in 0..3 {
+                v.receive(Message::Vote(Vote { validator, slot, hash: None, kind: VoteKind::SkipFallback })).unwrap();
+            }
+        }
+        assert!(v.ready_parent(52) == Some(Some(a)));
     }
 
     #[test]

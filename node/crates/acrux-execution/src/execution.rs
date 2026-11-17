@@ -78,6 +78,19 @@ pub struct ExecutionResult {
     pub error: Option<String>,
     pub base_fee: u64,
     pub priority_fee: u64,
+    /// The message's accounts, in its key order, before this transaction's base and priority
+    /// fees and after it: Solana's preBalances and postBalances, and the token accounts among them.
+    #[serde(skip)]
+    pub before: AccountView,
+    #[serde(skip)]
+    pub after: AccountView,
+}
+
+/// Lamports of each account key, and each key's token account (SPL Token or Token-2022) by index.
+#[derive(Clone, Debug, Default)]
+pub struct AccountView {
+    pub lamports: Vec<u64>,
+    pub tokens: Vec<(u8, Account)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,6 +128,25 @@ impl ExecutorCheckpoint {
     /// The state's lattice hash in base58: for the genesis checkpoint, the chain's genesis hash.
     pub fn hash(&self) -> String {
         bs58::encode(self.accumulator).into_string()
+    }
+
+    /// The accounts this state holds that `earlier` does not hold as they are, and the addresses
+    /// it no longer holds: what a store of `earlier` writes to become this state.
+    pub fn account_changes(&self, earlier: Option<&ExecutorCheckpoint>) -> (Vec<(Pubkey, Arc<Account>)>, Vec<Pubkey>) {
+        let empty = BTreeMap::new();
+        let before = earlier.map_or(&empty, |e| &e.accounts);
+        let changed = self.accounts.iter().filter(|(k, a)| before.get(k).map_or(true, |b| !Arc::ptr_eq(a, b) && b != *a)).map(|(k, a)| (*k, a.clone())).collect();
+        let removed = before.keys().filter(|k| !self.accounts.contains_key(k)).copied().collect();
+        (changed, removed)
+    }
+
+    /// The same for the executed transaction ids.
+    pub fn executed_changes(&self, earlier: Option<&ExecutorCheckpoint>) -> (Vec<(String, u64)>, Vec<String>) {
+        let empty = BTreeMap::new();
+        let before = earlier.map_or(&empty, |e| &e.executed);
+        let added = self.executed.iter().filter(|(k, v)| before.get(*k) != Some(*v)).map(|(k, v)| (k.clone(), *v)).collect();
+        let removed = before.keys().filter(|k| !self.executed.contains_key(*k)).cloned().collect();
+        (added, removed)
     }
 }
 
@@ -176,6 +208,42 @@ impl SvmExecutor {
             track_capacity_cu: self.track_capacity_cu,
             state_hash: hex::encode(checkpoint.accumulator),
         }
+    }
+
+    /// A checkpoint's state without its accounts and executed ids, which a store keeps by key.
+    pub fn snapshot_meta(&self, checkpoint: &ExecutorCheckpoint) -> ExecutorSnapshot {
+        ExecutorSnapshot {
+            accounts: vec![],
+            executed: vec![],
+            recent: checkpoint.recent.iter().map(|(h, s)| (h.to_string(), *s)).collect(),
+            inclusion_used: checkpoint.inclusion_used.iter().map(|((w, p, q), v)| (*w, p.to_string(), *q, *v)).collect(),
+            fees: checkpoint.fees.clone(),
+            track_capacity_cu: self.track_capacity_cu,
+            state_hash: hex::encode(checkpoint.accumulator),
+        }
+    }
+
+    /// An executor holding exactly a saved state, every account in it executables included: the
+    /// state a restart continues from. Its state hash is the saved one when every account came
+    /// across intact and was saved under this build's rules; the caller checks.
+    pub fn from_state(programs: &[GenesisProgram], state: ExecutorSnapshot) -> Result<Self> {
+        let mut this = Self::new(Vec::<(String, u64)>::new(), programs)?;
+        let mut accounts = state.accounts.into_iter().map(|(k, a)| Ok((Pubkey::from_str(&k)?, a))).collect::<Result<Vec<_>>>()?;
+        let keep = accounts.iter().map(|(k, _)| *k).collect::<BTreeSet<_>>();
+        for key in this.accounts.keys().filter(|k| !keep.contains(k)).copied().collect::<Vec<_>>() {
+            this.put(key, Account::default())?;
+        }
+        // A program loads from its program data account, so every executable comes after the rest.
+        accounts.sort_by_key(|(k, a)| (a.executable, *k));
+        for (key, account) in accounts {
+            this.put(key, account)?;
+        }
+        this.executed = state.executed.into_iter().collect();
+        this.recent = state.recent.into_iter().map(|(h, s)| Ok((Hash::from_str(&h)?, s))).collect::<Result<_>>()?;
+        this.inclusion_used = state.inclusion_used.into_iter().map(|(w, p, q, v)| Ok(((w, Pubkey::from_str(&p)?, q), v))).collect::<Result<_>>()?;
+        this.fees = state.fees;
+        this.track_capacity_cu = state.track_capacity_cu;
+        Ok(this)
     }
 
     /// Replaces this executor's state with a snapshot's; the result's state hash is the snapshot's
@@ -697,6 +765,8 @@ impl SvmExecutor {
                 error: Some("Blockhash expired before the transaction executed".into()),
                 base_fee: 0,
                 priority_fee: 0,
+                before: AccountView::default(),
+                after: AccountView::default(),
             })
             .collect();
         for candidate in &ordered {
@@ -711,6 +781,11 @@ impl SvmExecutor {
                 .checked_mul(self.fees.base_fee_per_signature)
                 .context("Base fee overflow")?;
             let payer = Pubkey::from_str(&item.transaction.header.fee_payer)?;
+            let tx: VersionedTransaction = bincode::deserialize(&item.transaction.bytes)?;
+            let keys = tx.message.static_account_keys().to_vec();
+            let mut before = self.account_view(&keys);
+            // The priority fee left the payer when the slot's selection ran.
+            before.lamports[0] += priority_fee;
             if let Err(error) = self.debit(payer, base_fee, true) {
                 self.remember_executed(candidate.id.clone(), &item.transaction.bytes);
                 results.push(ExecutionResult {
@@ -721,6 +796,8 @@ impl SvmExecutor {
                     error: Some(error.to_string()),
                     base_fee: 0,
                     priority_fee,
+                    after: self.account_view(&keys),
+                    before,
                 });
                 continue;
             }
@@ -744,7 +821,6 @@ impl SvmExecutor {
                 .checked_add(svm_base_fee)
                 .context("Simulation balance overflow")?;
             self.svm.set_account(payer, simulation_account)?;
-            let tx: VersionedTransaction = bincode::deserialize(&item.transaction.bytes)?;
             let simulated = self.svm.simulate_transaction(tx);
             self.svm.set_account(payer, real_account)?;
             let outcome = match simulated {
@@ -772,6 +848,8 @@ impl SvmExecutor {
                             error: None,
                             base_fee,
                             priority_fee,
+                            before: AccountView::default(),
+                            after: AccountView::default(),
                         }
                     } else {
                         ExecutionResult {
@@ -782,6 +860,8 @@ impl SvmExecutor {
                             error: Some("Execution would spend the fee-payer reserve".into()),
                             base_fee,
                             priority_fee,
+                            before: AccountView::default(),
+                            after: AccountView::default(),
                         }
                     }
                 }
@@ -793,8 +873,11 @@ impl SvmExecutor {
                     error: Some(error.err.to_string()),
                     base_fee,
                     priority_fee,
+                    before: AccountView::default(),
+                    after: AccountView::default(),
                 },
             };
+            let outcome = ExecutionResult { after: self.account_view(&keys), before, ..outcome };
             self.remember_executed(candidate.id.clone(), &item.transaction.bytes);
             results.push(outcome);
         }
@@ -808,6 +891,19 @@ impl SvmExecutor {
             results,
             state_hash: self.state_hash(),
         })
+    }
+
+    fn account_view(&self, keys: &[Pubkey]) -> AccountView {
+        let token = [spl_token_id(), spl_token_2022_id()];
+        let mut view = AccountView::default();
+        for (index, key) in keys.iter().enumerate() {
+            let account = self.svm.get_account(key).unwrap_or_default();
+            view.lamports.push(account.lamports);
+            if token.contains(&account.owner) && account.data.len() >= 165 {
+                view.tokens.push((index as u8, account));
+            }
+        }
+        view
     }
 
     fn set_slot_clock(&mut self, slot: u64) -> Result<()> {
@@ -852,22 +948,16 @@ impl SvmExecutor {
         Ok(())
     }
     fn put(&mut self, key: Pubkey, account: Account) -> Result<()> {
+        // An account left with no lamports no longer exists, as on Solana: its data and owner go
+        // with it, so its address can be created again (a program deploy closes its buffer so).
+        let account = if account.lamports == 0 { Account::default() } else { account };
         self.svm.set_account(key, account)?;
         self.refresh(key);
         Ok(())
     }
     fn refresh(&mut self, key: Pubkey) {
-        if let Some(account) = self.svm.get_account(&key) {
-            let mut digest = Sha256::new();
-            digest.update(b"acrux-account-v1");
-            digest.update(key.as_ref());
-            digest.update(account.lamports.to_le_bytes());
-            digest.update(account.owner.as_ref());
-            digest.update([account.executable as u8]);
-            digest.update(account.rent_epoch.to_le_bytes());
-            digest.update((account.data.len() as u64).to_le_bytes());
-            digest.update(&account.data);
-            let hash: [u8; 32] = digest.finalize().into();
+        if let Some(account) = self.svm.get_account(&key).filter(|account| account.lamports > 0) {
+            let hash = account_digest(&key, &account);
             if self.account_hashes.get(&key) == Some(&hash) {
                 return;
             }
@@ -950,6 +1040,38 @@ pub fn priority_fee(micro_lamports_per_cu: u64, compute_limit: u64) -> Result<u6
     )
     .map_err(|_| anyhow!("Priority fee overflow"))
 }
+/// The lattice hash of a set of accounts as every Acrux version so far computes it (each account's
+/// digest summed mod 2^256), in hex: how a state from an earlier version is checked before it is
+/// loaded under this one's rules.
+pub fn lattice_hash<'a>(accounts: impl IntoIterator<Item = (Pubkey, &'a Account)>) -> String {
+    let mut accumulator = [0; 32];
+    for (key, account) in accounts {
+        add256(&mut accumulator, &account_digest(&key, account));
+    }
+    hex::encode(accumulator)
+}
+
+fn account_digest(key: &Pubkey, account: &Account) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"acrux-account-v1");
+    digest.update(key.as_ref());
+    digest.update(account.lamports.to_le_bytes());
+    digest.update(account.owner.as_ref());
+    digest.update([account.executable as u8]);
+    digest.update(account.rent_epoch.to_le_bytes());
+    digest.update((account.data.len() as u64).to_le_bytes());
+    digest.update(&account.data);
+    digest.finalize().into()
+}
+
+fn spl_token_id() -> Pubkey {
+    Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap()
+}
+
+fn spl_token_2022_id() -> Pubkey {
+    Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap()
+}
+
 fn add256(sum: &mut [u8; 32], rhs: &[u8; 32]) {
     let mut carry = 0u16;
     for (a, b) in sum.iter_mut().zip(rhs) {
@@ -1032,6 +1154,46 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_state_restores_the_same_chain() {
+        let payer = Keypair::new();
+        let receiver = Pubkey::new_unique();
+        let proposer = Pubkey::new_unique();
+        let mut executor = SvmExecutor::new([(payer.pubkey().to_string(), 10_000_000)], &[]).unwrap();
+        executor.set_proposers(&[(1, proposer.to_string())]).unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(&payer.pubkey(), &receiver, 2_000_000)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            Hash::from_str(&executor.latest_blockhash()).unwrap(),
+        );
+        let bytes = bincode::serialize(&tx).unwrap();
+        let validated = executor.validate_transaction(&bytes, 0).unwrap();
+        executor.charge_inclusion(&payer.pubkey().to_string(), 1, 0, 1).unwrap();
+        executor.execute_slot(0, vec![ExecutionItem { transaction: validated, source_proposers: vec![1] }]).unwrap();
+        let checkpoint = executor.checkpoint();
+        let mut state = executor.snapshot_meta(&checkpoint);
+        state.accounts = checkpoint.account_changes(None).0.into_iter().map(|(k, a)| (k.to_string(), a.as_ref().clone())).collect();
+        state.executed = checkpoint.executed_changes(None).0;
+        assert!(state.accounts.iter().any(|(_, a)| a.executable));
+        let mut restored = SvmExecutor::from_state(&[], state.clone()).unwrap();
+        restored.set_proposers(&[(1, proposer.to_string())]).unwrap();
+        assert_eq!(restored.state_hash(), executor.state_hash());
+        assert_eq!(restored.balance(&receiver.to_string()).unwrap(), 2_000_000);
+        assert_eq!(restored.latest_blockhash(), executor.latest_blockhash());
+        let id = executor.check_transaction(&bytes, 1).unwrap().header.id;
+        assert!(executor.is_executed(&id) && restored.is_executed(&id), "an executed transaction stays executed");
+        for e in [&mut executor, &mut restored] {
+            e.execute_slot(1, vec![]).unwrap();
+        }
+        assert_eq!(restored.state_hash(), executor.state_hash());
+        // Nothing changed since: no account to write.
+        assert!(executor.checkpoint().account_changes(Some(&restored.checkpoint())).1.is_empty());
+        assert_eq!(lattice_hash(state.accounts.iter().map(|(k, a)| (Pubkey::from_str(k).unwrap(), a))), state.state_hash);
+        state.accounts.pop();
+        assert_ne!(SvmExecutor::from_state(&[], state.clone()).unwrap().state_hash(), state.state_hash, "a missing account changes the hash");
+    }
+
+    #[test]
     fn reserve_and_per_window_inclusion_rate() {
         let payer = Pubkey::new_unique();
         let proposer = Pubkey::new_unique();
@@ -1078,6 +1240,19 @@ mod tests {
         assert_eq!(executor.balance(&payer.pubkey().to_string()).unwrap(), 10_000_000 - 1_026_000);
         // The proposer: inclusion 1,000, half the base fee 2,500, the priority fee 20,000.
         assert_eq!(executor.balance(&proposer.to_string()).unwrap(), 23_500);
+    }
+
+    #[test]
+    fn an_account_drained_to_zero_lamports_no_longer_exists() {
+        let key = Pubkey::new_unique();
+        let mut executor = SvmExecutor::new(Vec::<(String, u64)>::new(), &[]).unwrap();
+        let empty = executor.state_hash();
+        executor.put(key, Account { lamports: 1_000_000, data: vec![7; 64], owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 }).unwrap();
+        assert_ne!(executor.state_hash(), empty);
+        executor.put(key, Account { lamports: 0, data: vec![7; 64], owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 }).unwrap();
+        let left = executor.svm.get_account(&key).unwrap_or_default();
+        assert!(left.data.is_empty() && left.owner == system_program::id());
+        assert_eq!(executor.state_hash(), empty);
     }
 
     #[test]

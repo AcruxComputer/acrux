@@ -202,7 +202,7 @@ impl Observer {
                         event.data,
                     );
                 }
-                g.counters = json!({"slots":g.slots.keys().next_back().map_or(0,|s|s+1),"finalizedCblocks":finalized.len(),"skips":skipped.len(),"averageCommitSpreadUs":exchange.average_spread()});
+                g.counters = json!({"slots":g.slots.keys().next_back().map_or(0,|s|s+1),"finalizedCblocks":g.counter_base.0+finalized.len() as u64,"skips":g.counter_base.1+skipped.len() as u64,"averageCommitSpreadUs":exchange.average_spread()});
                 while g.slots.len() > 64 {
                     let first = *g.slots.keys().next().unwrap();
                     g.slots.remove(&first);

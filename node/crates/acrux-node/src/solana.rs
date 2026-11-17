@@ -2,6 +2,7 @@
 //! its signature, and the signatures that touched each address, newest last, for as long as the
 //! store keeps slots.
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use solana_sdk::transaction::VersionedTransaction;
 use std::collections::{BTreeMap, VecDeque};
@@ -13,6 +14,7 @@ pub static FAILED: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| json
 /// Signatures kept per address; Solana's own `getSignaturesForAddress` pages at 1,000.
 const PER_ADDRESS: usize = 1_000;
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Executed {
     pub id: String,
     pub slot: u64,
@@ -23,6 +25,38 @@ pub struct Executed {
     pub err: Option<String>,
     pub logs: Vec<String>,
     pub units: u64,
+    /// Lamports of the message's account keys before and after, fees included.
+    pub pre_balances: Vec<u64>,
+    pub post_balances: Vec<u64>,
+    pub pre_tokens: Vec<TokenBalance>,
+    pub post_tokens: Vec<TokenBalance>,
+}
+
+/// A token account among a transaction's keys, as Solana's pre and post token balances list it.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TokenBalance {
+    pub index: u8,
+    pub mint: String,
+    pub owner: String,
+    pub program: String,
+    pub amount: u64,
+    pub decimals: u8,
+}
+
+impl TokenBalance {
+    /// A token account's balance; `decimals` reads the mint's.
+    pub fn read(index: u8, account: &solana_sdk::account::Account, decimals: impl Fn(&str) -> Option<u8>) -> Option<Self> {
+        let data = &account.data;
+        if data.len() < 165 || data[108] == 0 {
+            return None;
+        }
+        let mint = pubkey(&data[0..32]);
+        Some(Self { index, decimals: decimals(&mint)?, mint, owner: pubkey(&data[32..64]), program: account.owner.to_string(), amount: u64_at(data, 64) })
+    }
+
+    fn json(&self) -> Value {
+        json!({"accountIndex": self.index, "mint": self.mint, "owner": self.owner, "programId": self.program, "uiTokenAmount": token_amount(self.amount, self.decimals)})
+    }
 }
 
 #[derive(Default)]
@@ -69,6 +103,20 @@ impl SolanaIndex {
         self.transactions.get(signature)
     }
 
+    /// Transactions executed from slot `from` through slot `through`, oldest first.
+    pub fn executed_between(&self, from: u64, through: u64) -> Vec<(&str, &Executed)> {
+        let mut found = self
+            .by_slot
+            .iter()
+            .rev()
+            .skip_while(|(slot, _)| *slot > through)
+            .take_while(|(slot, _)| *slot >= from)
+            .filter_map(|(slot, signature)| self.transactions.get(signature).filter(|e| e.slot == *slot).map(|e| (signature.as_str(), e)))
+            .collect::<Vec<_>>();
+        found.reverse();
+        found
+    }
+
     /// Newest first, as Solana answers: up to `limit`, starting after `before` and stopping at
     /// `until` when given.
     pub fn signatures_for(&self, address: &str, limit: usize, before: Option<&str>, until: Option<&str>) -> Vec<(&str, &Executed)> {
@@ -101,6 +149,22 @@ pub fn transaction_json(executed: &Executed, encoding: &str) -> Value {
     let transaction = match encoding {
         "base64" => json!([B64.encode(&executed.bytes), "base64"]),
         "base58" => json!([bs58::encode(&executed.bytes).into_string(), "base58"]),
+        "jsonParsed" => {
+            let keys = tx.message.static_account_keys();
+            json!({
+                "signatures": tx.signatures.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "message": {
+                    "accountKeys": keys.iter().enumerate().map(|(i, k)| json!({
+                        "pubkey": k.to_string(),
+                        "signer": tx.message.is_signer(i),
+                        "writable": tx.message.is_maybe_writable(i, None),
+                        "source": "transaction",
+                    })).collect::<Vec<_>>(),
+                    "recentBlockhash": tx.message.recent_blockhash().to_string(),
+                    "instructions": tx.message.instructions().iter().map(|ix| parsed_instruction(keys, ix)).collect::<Vec<_>>(),
+                },
+            })
+        }
         _ => {
             let header = tx.message.header();
             json!({
@@ -132,12 +196,12 @@ pub fn transaction_json(executed: &Executed, encoding: &str) -> Value {
             "err": executed.err.as_ref().map(|_| FAILED.clone()),
             "status": match &executed.err { None => json!({"Ok": null}), Some(_) => json!({"Err": *FAILED}) },
             "fee": executed.fee,
-            "preBalances": [],
-            "postBalances": [],
+            "preBalances": executed.pre_balances,
+            "postBalances": executed.post_balances,
             "innerInstructions": [],
             "logMessages": executed.logs,
-            "preTokenBalances": [],
-            "postTokenBalances": [],
+            "preTokenBalances": executed.pre_tokens.iter().map(TokenBalance::json).collect::<Vec<_>>(),
+            "postTokenBalances": executed.post_tokens.iter().map(TokenBalance::json).collect::<Vec<_>>(),
             "rewards": [],
             "loadedAddresses": {"writable": [], "readonly": []},
             "computeUnitsConsumed": executed.units,
@@ -225,4 +289,79 @@ pub fn account_json(account: &solana_sdk::account::Account, encoding: &str, deci
         _ => json!([B64.encode(&account.data), "base64"]),
     };
     json!({"lamports": account.lamports, "owner": owner, "data": data, "executable": account.executable, "rentEpoch": u64::MAX, "space": account.data.len()})
+}
+
+/// One instruction as Solana's `jsonParsed` gives it: System, SPL Token, Token-2022, the Associated
+/// Token Account program and Memo parsed; any other, Compute Budget included as on Solana, with its
+/// program, accounts and base58 data.
+fn parsed_instruction(keys: &[solana_sdk::pubkey::Pubkey], ix: &solana_sdk::instruction::CompiledInstruction) -> Value {
+    let program = keys.get(ix.program_id_index as usize).map(|k| k.to_string()).unwrap_or_default();
+    let accounts = ix.accounts.iter().map(|a| keys.get(*a as usize).map(|k| k.to_string()).unwrap_or_default()).collect::<Vec<_>>();
+    let parsed = match program.as_str() {
+        "11111111111111111111111111111111" => parse_system(&accounts, &ix.data).map(|p| ("system", p)),
+        TOKEN => parse_spl_token(&accounts, &ix.data).map(|p| ("spl-token", p)),
+        TOKEN_2022 => parse_spl_token(&accounts, &ix.data).map(|p| ("spl-token-2022", p)),
+        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL" => parse_associated(&accounts, &ix.data).map(|p| ("spl-associated-token-account", p)),
+        "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr" | "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo" => {
+            std::str::from_utf8(&ix.data).ok().map(|text| ("spl-memo", json!(text)))
+        }
+        _ => None,
+    };
+    match parsed {
+        Some((name, parsed)) => json!({"program": name, "programId": program, "parsed": parsed, "stackHeight": null}),
+        None => json!({"programId": program, "accounts": accounts, "data": bs58::encode(&ix.data).into_string(), "stackHeight": null}),
+    }
+}
+
+fn kind(name: &str, info: Value) -> Option<Value> {
+    Some(json!({"type": name, "info": info}))
+}
+
+fn parse_system(a: &[String], data: &[u8]) -> Option<Value> {
+    let tag = u32::from_le_bytes(data.get(0..4)?.try_into().ok()?);
+    let at = |i: usize| a.get(i).cloned();
+    match tag {
+        0 => kind("createAccount", json!({"source": at(0)?, "newAccount": at(1)?, "lamports": u64_at(data.get(..12)?, 4), "space": u64_at(data.get(..20)?, 12), "owner": pubkey(data.get(20..52)?)})),
+        1 => kind("assign", json!({"account": at(0)?, "owner": pubkey(data.get(4..36)?)})),
+        2 => kind("transfer", json!({"source": at(0)?, "destination": at(1)?, "lamports": u64_at(data.get(..12)?, 4)})),
+        8 => kind("allocate", json!({"account": at(0)?, "space": u64_at(data.get(..12)?, 4)})),
+        _ => None,
+    }
+}
+
+fn parse_spl_token(a: &[String], data: &[u8]) -> Option<Value> {
+    let at = |i: usize| a.get(i).cloned();
+    let amount = || data.get(1..9).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    match *data.first()? {
+        0 | 20 => {
+            let (mint_authority, freeze) = (pubkey(data.get(2..34)?), data.get(34..67).filter(|f| f[0] == 1).map(|f| pubkey(&f[1..33])));
+            let mut info = json!({"mint": at(0)?, "decimals": data[1], "mintAuthority": mint_authority});
+            if let Some(freeze) = freeze {
+                info["freezeAuthority"] = json!(freeze);
+            }
+            kind(if data[0] == 0 { "initializeMint" } else { "initializeMint2" }, info)
+        }
+        1 => kind("initializeAccount", json!({"account": at(0)?, "mint": at(1)?, "owner": at(2)?})),
+        18 => kind("initializeAccount3", json!({"account": at(0)?, "mint": at(1)?, "owner": pubkey(data.get(1..33)?)})),
+        3 => kind("transfer", json!({"source": at(0)?, "destination": at(1)?, "authority": at(2)?, "amount": amount()?.to_string()})),
+        4 => kind("approve", json!({"source": at(0)?, "delegate": at(1)?, "owner": at(2)?, "amount": amount()?.to_string()})),
+        7 => kind("mintTo", json!({"mint": at(0)?, "account": at(1)?, "mintAuthority": at(2)?, "amount": amount()?.to_string()})),
+        8 => kind("burn", json!({"account": at(0)?, "mint": at(1)?, "authority": at(2)?, "amount": amount()?.to_string()})),
+        9 => kind("closeAccount", json!({"account": at(0)?, "destination": at(1)?, "owner": at(2)?})),
+        12 => kind("transferChecked", json!({"source": at(0)?, "mint": at(1)?, "destination": at(2)?, "authority": at(3)?, "tokenAmount": token_amount(amount()?, *data.get(9)?)})),
+        14 => kind("mintToChecked", json!({"mint": at(0)?, "account": at(1)?, "mintAuthority": at(2)?, "tokenAmount": token_amount(amount()?, *data.get(9)?)})),
+        15 => kind("burnChecked", json!({"account": at(0)?, "mint": at(1)?, "authority": at(2)?, "tokenAmount": token_amount(amount()?, *data.get(9)?)})),
+        17 => kind("syncNative", json!({"account": at(0)?})),
+        _ => None,
+    }
+}
+
+fn parse_associated(a: &[String], data: &[u8]) -> Option<Value> {
+    let name = match data.first() {
+        None | Some(0) => "create",
+        Some(1) => "createIdempotent",
+        _ => return None,
+    };
+    let at = |i: usize| a.get(i).cloned();
+    kind(name, json!({"source": at(0)?, "account": at(1)?, "wallet": at(2)?, "mint": at(3)?, "systemProgram": at(4)?, "tokenProgram": at(5)?}))
 }

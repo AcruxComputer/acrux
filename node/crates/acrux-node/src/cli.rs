@@ -383,3 +383,94 @@ pub async fn hub(rpc_url: &str, program: &str, keypair_path: &str, action: HubAc
     }
     bail!("{name} was not confirmed within 30 s: {signature}")
 }
+
+/// The cut-over from a net that keeps no state of its own (0.3.7 and earlier): takes its latest
+/// finalized cblock's state over RPC, every account executables included, checks it against the
+/// net's state hash for that cblock, and writes it as the saved state `acrux net up` continues
+/// from. The new build's rules apply from the next cblock on: an account left with no lamports no
+/// longer exists. The built-in traffic's keys were the old run's, so new ones are funded as at genesis.
+pub async fn import(url: &str, store: &str, genesis: &str) -> Result<()> {
+    use crate::execution::{lattice_hash, ExecutorSnapshot, SvmExecutor};
+    use solana_sdk::account::Account;
+    let path = std::path::Path::new(store).join("state.redb");
+    ensure!(!path.exists(), "{} already holds a saved state", path.display());
+    let snapshot = rpc(url, "getExecutionSnapshot", json!({})).await?;
+    let cblock = snapshot["consensusSlot"].as_u64().context("consensusSlot")?;
+    let mut state: ExecutorSnapshot = serde_json::from_value(snapshot["executor"].clone())?;
+    let threshold: crate::threshold::ThresholdCache = serde_json::from_value(snapshot["threshold"].clone())?;
+    let view = rpc(url, "getSlot", json!({"slot": cblock * 4 + 3})).await?;
+    let net_hash = view["stateHash"].as_str().context("the net holds no state hash for that cblock")?.to_owned();
+    let block_hash = view["cblock"]["hash"].as_str().context("the net holds no hash for that cblock")?.to_owned();
+    let genesis_hash = rpc(url, "getGenesisHash", json!([])).await?.as_str().context("genesis hash")?.to_owned();
+    let counters = rpc(url, "getCounters", json!({})).await?;
+    let programs = crate::genesis::Genesis::load(std::path::Path::new(genesis))?
+        .programs
+        .into_iter()
+        .map(|(address, path)| crate::execution::GenesisProgram { address, path })
+        .collect::<Vec<_>>();
+    // Executables, which the snapshot leaves out: every loader's. The RPC reports no rent epoch,
+    // so each takes this build's own copy's where the program is the same, else 0 or u64::MAX,
+    // whichever makes the state hash.
+    let local = SvmExecutor::new(Vec::<(String, u64)>::new(), &programs)?;
+    let mut executables = vec![];
+    let mut unknown = vec![];
+    for loader in ["NativeLoader1111111111111111111111111111111", "BPFLoader1111111111111111111111111111111111", "BPFLoader2111111111111111111111111111111111", "BPFLoaderUpgradeab1e11111111111111111111111"] {
+        let listed = rpc(url, "getProgramAccounts", json!([loader, {"encoding": "base64"}])).await?;
+        for entry in listed.as_array().context("program accounts")? {
+            let account = &entry["account"];
+            if account["executable"] != true {
+                continue;
+            }
+            let key = entry["pubkey"].as_str().context("pubkey")?.to_owned();
+            let mut fetched = Account {
+                lamports: account["lamports"].as_u64().context("lamports")?,
+                data: B64.decode(account["data"][0].as_str().context("data")?)?,
+                owner: Pubkey::from_str(account["owner"].as_str().context("owner")?)?,
+                executable: true,
+                rent_epoch: 0,
+            };
+            match local.account(&key)? {
+                Some(own) if own.lamports == fetched.lamports && own.owner == fetched.owner && own.data == fetched.data => fetched.rent_epoch = own.rent_epoch,
+                _ => unknown.push(executables.len()),
+            }
+            executables.push((key, fetched));
+        }
+    }
+    ensure!(unknown.len() <= 16, "{} programs of unknown rent epoch", unknown.len());
+    let matched = (0u32..1 << unknown.len()).find_map(|mask| {
+        let mut candidate = executables.clone();
+        for (bit, i) in unknown.iter().enumerate() {
+            candidate[*i].1.rent_epoch = if mask >> bit & 1 == 1 { u64::MAX } else { 0 };
+        }
+        let all = state.accounts.iter().chain(candidate.iter());
+        let hash = lattice_hash(all.map(|(k, a)| (Pubkey::from_str(k).unwrap(), a)));
+        (hash == state.state_hash).then_some(candidate)
+    });
+    let executables = matched.with_context(|| format!("the accounts taken do not hash to cblock {cblock}'s state hash {}", state.state_hash))?;
+    ensure!(net_hash == state.state_hash, "the snapshot's state hash {} is not the net's {net_hash} for cblock {cblock}", state.state_hash);
+    println!("cblock {cblock} (slot {}): {} accounts and {} programs, state {} matches the net's", cblock * 4 + 3, state.accounts.len(), executables.len(), &net_hash[..12]);
+    let empty = state.accounts.iter().filter(|(_, a)| a.lamports == 0).count();
+    state.accounts.extend(executables);
+    let mut executor = SvmExecutor::from_state(&programs, state)?;
+    let senders = (0..24).map(|_| Keypair::new()).collect::<Vec<_>>();
+    for sender in &senders {
+        executor.fund(&sender.pubkey().to_string(), 100_000_000_000)?;
+    }
+    let checkpoint = executor.checkpoint();
+    let meta = crate::state::Meta {
+        format: crate::state::FORMAT,
+        cblock,
+        hash: block_hash,
+        executor: executor.snapshot_meta(&checkpoint),
+        threshold,
+        senders: senders.iter().map(|k| k.to_base58_string()).collect(),
+        finalized_cblocks: counters["finalizedCblocks"].as_u64().unwrap_or(0),
+        skips: counters["skips"].as_u64().unwrap_or(0),
+        genesis_hash,
+        saved_at_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as u64,
+    };
+    crate::state::StateStore::open(&path)?.write(&checkpoint, None, &meta)?;
+    println!("{empty} accounts without lamports dropped; the traffic's 24 keys funded; saved to {} at state {}", path.display(), &executor.state_hash()[..12]);
+    println!("`acrux net up --store {store}` continues the chain from cblock {}", cblock + 1);
+    Ok(())
+}

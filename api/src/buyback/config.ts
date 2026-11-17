@@ -50,7 +50,7 @@ export function readBuybackConfig(env: NodeJS.ProcessEnv = process.env): Buyback
     solFloorLamports: amount('BUYBACK_SOL_FLOOR_LAMPORTS', '20000000'),
     minSwapLamports: amount('BUYBACK_MIN_SWAP_LAMPORTS', '50000000'),
     slippageBps: integer('BUYBACK_SLIPPAGE_BPS', 300, 0, 10_000),
-    postGraduationBps: integer('BUYBACK_POST_GRADUATION_BPS', 2500, 0, 10_000),
+    postGraduationBps: integer('BUYBACK_POST_GRADUATION_BPS', 2000, 0, 10_000),
     dryRun: dryRun === 'true',
     rpcUrl,
     keypairFile: env.LAUNCH_KEYPAIR_FILE?.trim() || '/etc/acrux/launch-keypair.json',

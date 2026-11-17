@@ -165,6 +165,18 @@ enum NetCommand {
         genesis: String,
         #[arg(long, default_value = "target/runs/net")]
         store: String,
+        /// Start a new chain from genesis, setting aside the saved state instead of continuing it.
+        #[arg(long)]
+        fresh: bool,
+    },
+    /// Takes a running net's finalized state (0.3.7 or later) into `--store` as the saved state the
+    /// next `acrux net up` there continues from.
+    Import {
+        url: String,
+        #[arg(long, default_value = "target/runs/net")]
+        store: String,
+        #[arg(long, default_value = "../chain/genesis/acrux-net.json")]
+        genesis: String,
     },
 }
 fn main() -> anyhow::Result<()> {
@@ -181,7 +193,7 @@ async fn run() -> anyhow::Result<()> {
     #[cfg(windows)]
     unsafe {
         timeBeginPeriod(1);
-        // Slot timing is measured in milliseconds; keep other work from preempting the net.
+        // Slot timing is measured in milliseconds; keep desktop work from preempting the net.
         SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     }
     if std::env::args().nth(1).as_deref() == Some("schedule-fixture") {
@@ -202,6 +214,7 @@ async fn run() -> anyhow::Result<()> {
         Command::Identities { out } => return cli::identities(&out),
         Command::Send { rpc, keypair, to, lamports, n, t, priority } => return cli::send(&rpc, &keypair, &to, lamports, n, t, priority).await,
         Command::Node { command: NodeCommand::Follow { url, genesis } } => return cli::follow(&url, &genesis).await,
+        Command::Net { command: NetCommand::Import { url, store, genesis } } => return cli::import(&url, &store, &genesis).await,
         Command::Hub { command, rpc, program, identity } => {
             let action = match command {
                 HubCommand::Register { code, latitude, longitude } => cli::HubAction::Register { code, latitude, longitude },
@@ -229,8 +242,16 @@ async fn run() -> anyhow::Result<()> {
                     store,
                     program,
                     genesis,
+                    fresh,
                 },
-        } => Configuration {
+        } => {
+            let saved = std::path::Path::new(&store).join("state.redb");
+            if fresh && saved.exists() {
+                let aside = std::path::Path::new(&store).join(format!("state-{}.redb", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs()));
+                std::fs::rename(&saved, &aside)?;
+                eprintln!("the saved state is set aside as {}", aside.display());
+            }
+            Configuration {
             gateway_port,
             websocket_port: ws_port,
             base_port,
@@ -242,12 +263,14 @@ async fn run() -> anyhow::Result<()> {
             store_path: store,
             genesis_programs: program,
             genesis_path: Some(genesis),
+            persist: true,
             ..Default::default()
-        },
+        }}
         Command::Cluster { command: ClusterCommand::Up { hubs, gateway_port, ws_port, base_port, metrics_port, store, genesis } } => {
             anyhow::ensure!(hubs.split(',').map(str::trim).collect::<Vec<_>>() == ["FRA", "NYC", "TYO"], "This build's genesis has the hubs FRA, NYC and TYO");
             Configuration { gateway_port, websocket_port: ws_port, base_port, metrics_port, store_path: store, genesis_path: Some(genesis), ..Default::default() }
         }
+        Command::Net { command: NetCommand::Import { .. } } => unreachable!("handled above"),
         Command::Schedule | Command::Identities { .. } | Command::Keygen { .. } | Command::Send { .. } | Command::Node { .. } | Command::Hub { .. } => unreachable!("handled above"),
         Command::Lab { command: LabCommand::Run { scenario, seed, base_port, out, genesis } } => {
             // The faulty window is the fifth, after the net has settled; its attacker is the
@@ -292,6 +315,8 @@ async fn run() -> anyhow::Result<()> {
         .map(|v| v.parse())
         .transpose()?
         .unwrap_or(8);
+    config.keep_days = std::env::var("ACRUX_KEEP_DAYS").ok().map(|v| v.parse()).transpose()?.unwrap_or(7);
+    config.keep_max = std::env::var("ACRUX_KEEP_MAX").ok().map(|v| v.parse()).transpose()?.unwrap_or(200_000);
     config.retain_slots = std::env::var("ACRUX_RETAIN_SLOTS")
         .ok()
         .map(|v| v.parse())
@@ -311,8 +336,8 @@ async fn run() -> anyhow::Result<()> {
         return acrux_node::lab::run(config, fault, state, rx).await;
     }
     let net = Network::new(config.clone(), state.clone(), rx).await?;
-    // The gateway serves the public on threads of its own, so its viewers and callers never take
-    // a validator's time.
+    // The gateway serves the public on threads of its own, so its
+    // viewers and callers never take a validator's time.
     let serving = Box::leak(Box::new(
         tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("gateway").enable_all().build()?,
     ));

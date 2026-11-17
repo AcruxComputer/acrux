@@ -189,6 +189,16 @@ pub struct Network {
     solana: crate::solana::SolanaIndex,
     /// Solana JSON-RPC: what each `sendTransaction` was submitted with, until it executes.
     solana_sent: BTreeMap<String, Value>,
+    /// Validator 0's actor writes each finalized state through this, when the net persists.
+    state_writer: Option<std::sync::mpsc::Sender<crate::state::Pending>>,
+    counter_base: (u64, u64),
+    genesis_hash: String,
+    /// The kept transactions, and validator 0's actor's writer to them: from `keep_from` on, the
+    /// slots of the finalized chain not yet looked at; `built_in` the fee payers never kept.
+    kept: Option<Arc<crate::history::History>>,
+    kept_writer: Option<std::sync::mpsc::Sender<Vec<(String, crate::history::Kept)>>>,
+    keep_from: u64,
+    built_in: BTreeSet<String>,
 }
 #[derive(Default, Clone, Copy)]
 struct FactsCursor {
@@ -326,7 +336,28 @@ impl Network {
             stakes.iter().sum(),
             config.windows_per_epoch as u64,
         )?;
-        let senders = (0..24).map(|_| Keypair::new()).collect::<Vec<_>>();
+        // A net that persists continues from its saved state, when it has one: the last finalized
+        // cblock, its accounts, the executed ids and recent blockhashes, and the traffic's keys.
+        let state_store = if config.persist {
+            Some(crate::state::StateStore::open(&Path::new(&config.store_path).join("state.redb"))?)
+        } else {
+            None
+        };
+        let saved = match &state_store {
+            Some(store) => store.load()?,
+            None => None,
+        };
+        let resumed = match &saved {
+            Some(saved) => Some(BlockRef {
+                slot: saved.meta.cblock,
+                hash: hex::decode(&saved.meta.hash)?.try_into().map_err(|_| anyhow::anyhow!("saved cblock hash"))?,
+            }),
+            None => None,
+        };
+        let senders = match &saved {
+            Some(saved) => saved.meta.senders.iter().map(|k| Keypair::from_base58_string(k)).collect::<Vec<_>>(),
+            None => (0..24).map(|_| Keypair::new()).collect::<Vec<_>>(),
+        };
         let balances = identities
             .iter()
             .cloned()
@@ -371,18 +402,29 @@ impl Network {
         let mut nodes = vec![];
         for id in 0..12 {
             let mut votor = Votor::new(id, stakes.clone())?;
-            votor.genesis();
-            let mut executor = SvmExecutor::new(balances.clone(), &programs)?;
-            executor.set_fees(crate::execution::Fees {
-                reserve_lamports: config.reserve,
-                inclusion_lamports: config.inclusion_fee,
-                base_fee_per_signature: config.base_fee,
-                base_burn_bps: 5000,
-            })?;
-            executor.set_track_capacity(config.track_capacity_cu)?;
-            for (address, account) in genesis.iter().flat_map(|g| g.accounts.iter()) {
-                executor.set_account(address, account.clone())?;
-            }
+            let executor = match (&saved, resumed) {
+                (Some(saved), Some(block)) => {
+                    votor.resume(block);
+                    let executor = SvmExecutor::from_state(&programs, saved.state.clone())?;
+                    anyhow::ensure!(executor.state_hash() == saved.state.state_hash, "the saved state at cblock {} hashes to {}, not to its saved hash {}", block.slot, executor.state_hash(), saved.state.state_hash);
+                    executor
+                }
+                _ => {
+                    votor.genesis();
+                    let mut executor = SvmExecutor::new(balances.clone(), &programs)?;
+                    executor.set_fees(crate::execution::Fees {
+                        reserve_lamports: config.reserve,
+                        inclusion_lamports: config.inclusion_fee,
+                        base_fee_per_signature: config.base_fee,
+                        base_burn_bps: 5000,
+                    })?;
+                    executor.set_track_capacity(config.track_capacity_cu)?;
+                    for (address, account) in genesis.iter().flat_map(|g| g.accounts.iter()) {
+                        executor.set_account(address, account.clone())?;
+                    }
+                    executor
+                }
+            };
             let genesis = executor.checkpoint();
             nodes.push(Node {
                 id,
@@ -406,7 +448,42 @@ impl Network {
                 genesis,
                 pending_starts: vec![(0, None)],
             });
+            if let (Some(saved), Some(block)) = (&saved, resumed) {
+                let node = nodes.last_mut().unwrap();
+                node.checkpoints.insert(block.slot, node.genesis.clone());
+                node.threshold_checkpoints.insert(block.slot, saved.meta.threshold.clone());
+                node.threshold = saved.meta.threshold.clone();
+                node.executed_blocks.insert(block.slot, block);
+                node.last_executed = Some(block.slot * 4 + 3);
+                node.pending_starts = vec![(block.slot / 4 + 1, Some(block))];
+            }
         }
+        let genesis_hash = match &saved {
+            Some(saved) => saved.meta.genesis_hash.clone(),
+            None => nodes[0].genesis.hash(),
+        };
+        let counter_base = saved.as_ref().map_or((0, 0), |s| (s.meta.finalized_cblocks, s.meta.skips));
+        gateway.write().await.counter_base = counter_base;
+        if let Some(saved) = &saved {
+            tracing::warn!(cblock = saved.meta.cblock, slot = saved.meta.cblock * 4 + 3, state = %saved.state.state_hash, "continuing the chain from its saved state");
+        }
+        let kept = if config.persist {
+            Some(Arc::new(crate::history::History::open(&Path::new(&config.store_path).join("history.redb"), config.keep_days, config.keep_max)?))
+        } else {
+            None
+        };
+        gateway.write().await.kept = kept.clone();
+        let kept_writer = kept.clone().map(crate::history::spawn_writer).transpose()?;
+        let keep_from = resumed.map_or(0, |block| block.slot * 4 + 4);
+        let built_in = senders
+            .iter()
+            .map(|k| k.pubkey().to_string())
+            .chain(genesis.iter().map(|g| g.faucet.pubkey().to_string()))
+            .collect::<BTreeSet<_>>();
+        let state_writer = match state_store {
+            Some(store) => Some(crate::state::spawn_writer(store, saved.as_ref().map(|_| nodes[0].genesis.clone()))?),
+            None => None,
+        };
         {
             let mut g = gateway.write().await;
             g.parameters = json!({"k":3,"kappa":4,"w":16,"deltaLocalUs":10000,"deltaBlockUs":50000,"deltaGlobalUs":250000,"timeoutUs":750000,"tracks":4,"reserveLamports":config.reserve.to_string(),"trackCapacityCu":config.track_capacity_cu,"fragmentExpirySlots":config.fragment_expiry_slots,"alpha":0.5,"minimumHubMembers":4,"minimumHubStake":(stakes.iter().sum::<u64>()/100).to_string()});
@@ -491,6 +568,13 @@ impl Network {
             signature_ids: BTreeMap::new(),
             solana: Default::default(),
             solana_sent: BTreeMap::new(),
+            state_writer,
+            counter_base,
+            genesis_hash,
+            kept,
+            kept_writer,
+            keep_from,
+            built_in,
         })
     }
     fn window(&self, number: u64) -> schedule::Window {
@@ -735,6 +819,13 @@ impl Network {
                     signature_ids: BTreeMap::new(),
                     solana: Default::default(),
                     solana_sent: BTreeMap::new(),
+                    state_writer: if id == 0 { self.state_writer.take() } else { None },
+                    counter_base: self.counter_base,
+                    genesis_hash: self.genesis_hash.clone(),
+                    kept: self.kept.clone(),
+                    kept_writer: if id == 0 { self.kept_writer.take() } else { None },
+                    keep_from: self.keep_from,
+                    built_in: self.built_in.clone(),
                 }),
                 nodes,
             };
@@ -819,6 +910,8 @@ impl Network {
                     self.observed_skip.lock().unwrap().insert(slot / 4);
                 }
                 if node == 0 && event.kind == "cblock.finalized" && self.finalized.insert(slot / 4) {
+                    self.save_state(slot / 4);
+                    self.keep_finalized(slot / 4).await;
                     self.final_times.push(event.at);
                     self.observed_final.lock().unwrap().insert(slot / 4);
                 }
@@ -1020,6 +1113,37 @@ impl Network {
             let starts = std::mem::take(&mut self.nodes[id].pending_starts);
             for (number, parent) in starts {
                 self.start_window(id, number, parent).await?;
+            }
+            // Catching up: a validator that fell more than two windows behind (its threads were
+            // starved, or it restarted mid-run) executes and votes the older windows it has not
+            // finished, oldest first, eight a tick, before the two it is working on. It produces
+            // no blocks for them: their slots are long past.
+            // Only forward from where it stands: windows that end after its last executed slot
+            // and are not finished (each cblock executed or certified skipped). Windows behind
+            // that point were settled or abandoned; going back to one would roll its state back.
+            let older = self.nodes[id].windows.len().saturating_sub(2);
+            let executed_to = self.nodes[id].last_executed;
+            let behind = self.nodes[id]
+                .windows
+                .keys()
+                .take(older)
+                .copied()
+                .filter(|w| executed_to.is_some_and(|last| w * 16 + 15 > last))
+                .filter(|w| {
+                    !(w * 4..w * 4 + 4).all(|i| {
+                        self.nodes[id].executed_blocks.contains_key(&i)
+                            || self.nodes[id].seen_certificates.contains(&(i, consensus::CertificateKind::Skip, None))
+                    })
+                })
+                .take(8)
+                .collect::<Vec<_>>();
+            for w in behind {
+                self.try_execute(id, w)
+                    .await
+                    .with_context(|| format!("validator {id} catching up window {w}"))?;
+                self.try_vote(id, w)
+                    .await
+                    .with_context(|| format!("validator {id} catching up votes of window {w}"))?;
             }
             let windows = self.nodes[id]
                 .windows
@@ -2314,6 +2438,8 @@ impl Network {
             .await?;
             self.nodes[id].executor = Some(returned);
             let execution = result?;
+            let executor = self.nodes[id].executor.as_ref().unwrap();
+            let decimals = |mint: &str| executor.account(mint).ok().flatten().and_then(|m| m.data.get(44).copied());
             for result in execution.results.iter().filter(|_| id == 0) {
                 let Some(bytes) = solana_bytes.get(&result.id) else { continue };
                 let Some(signature) = bincode::deserialize::<solana_sdk::transaction::VersionedTransaction>(bytes).ok().and_then(|tx| tx.signatures.first().map(|s| s.to_string())) else { continue };
@@ -2330,6 +2456,17 @@ impl Network {
                     err: result.error.clone(),
                     logs: result.logs.clone(),
                     units: result.compute_units,
+                    pre_balances: {
+                        // The inclusion fee left the payer when its copies were admitted.
+                        let mut pre = result.before.lamports.clone();
+                        if let Some(payer) = pre.first_mut() {
+                            *payer += copies * self.config.inclusion_fee;
+                        }
+                        pre
+                    },
+                    post_balances: result.after.lamports.clone(),
+                    pre_tokens: result.before.tokens.iter().filter_map(|(i, a)| crate::solana::TokenBalance::read(*i, a, &decimals)).collect(),
+                    post_tokens: result.after.tokens.iter().filter_map(|(i, a)| crate::solana::TokenBalance::read(*i, a, &decimals)).collect(),
                 });
             }
             if id == 0 && s % 1_000 == 0 {
@@ -2974,6 +3111,74 @@ impl Network {
             }
         }
     }
+    /// Queues validator 0's state at a cblock it just finalized for the state writer.
+    fn save_state(&self, cblock: u64) {
+        let Some(writer) = &self.state_writer else {
+            return;
+        };
+        let node = &self.nodes[0];
+        let (Some(block), Some(checkpoint), Some(threshold)) = (node.executed_blocks.get(&cblock), node.checkpoints.get(&cblock), node.threshold_checkpoints.get(&cblock)) else {
+            return;
+        };
+        let meta = crate::state::Meta {
+            format: crate::state::FORMAT,
+            cblock,
+            hash: hex::encode(block.hash),
+            executor: node.executor.as_ref().unwrap().snapshot_meta(checkpoint),
+            threshold: threshold.clone(),
+            senders: self.senders.iter().map(|k| k.to_base58_string()).collect(),
+            finalized_cblocks: self.counter_base.0 + self.finalized.len() as u64,
+            skips: self.counter_base.1 + self.skipped.len() as u64,
+            genesis_hash: self.genesis_hash.clone(),
+            saved_at_ms: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
+        };
+        let _ = writer.send(crate::state::Pending { checkpoint: checkpoint.clone(), meta });
+    }
+    /// Hands the transactions people sent in the finalized chain through `cblock` to the kept
+    /// transactions: the slots of skipped cblocks are passed over.
+    async fn keep_finalized(&mut self, cblock: u64) {
+        let Some(writer) = &self.kept_writer else {
+            return;
+        };
+        let through = cblock * 4 + 3;
+        if through < self.keep_from {
+            return;
+        }
+        let mut chain = BTreeSet::new();
+        let mut at = Some(cblock);
+        while let Some(c) = at.filter(|c| c * 4 + 3 >= self.keep_from) {
+            chain.insert(c);
+            at = if c % 4 == 0 { self.nodes[0].windows.get(&(c / 4)).and_then(|w| w.parent).map(|p| p.slot) } else { Some(c - 1) };
+        }
+        let payer = |e: &crate::solana::Executed| {
+            bincode::deserialize::<solana_sdk::transaction::VersionedTransaction>(&e.bytes).ok().and_then(|tx| tx.message.static_account_keys().first().map(|k| k.to_string()))
+        };
+        let gateway = self.gateway.read().await;
+        // The record as the gateway will hold it finalized: with its cblock's finalization certificate.
+        let certificate = |c: u64| {
+            gateway.slots.get(&(c * 4)).and_then(|view| view["cblock"]["certificates"].as_array()).and_then(|certs| {
+                certs.iter().rev().find(|cert| matches!(cert["kind"].as_str(), Some("fast_finalization" | "slow_finalization"))).cloned()
+            })
+        };
+        let record = |e: &crate::solana::Executed| {
+            let mut record = gateway.transactions.get(&e.id)?.clone();
+            record["state"] = json!("finalized");
+            record["finalization"] = certificate(e.slot / 4).or_else(|| certificate(cblock)).unwrap_or(Value::Null);
+            Some(record.to_string())
+        };
+        let kept = self
+            .solana
+            .executed_between(self.keep_from, through)
+            .into_iter()
+            .filter(|(_, e)| chain.contains(&(e.slot / 4)) && payer(e).is_some_and(|p| !self.built_in.contains(&p)))
+            .map(|(signature, e)| (signature.to_owned(), crate::history::Kept { executed: e.clone(), record: record(e) }))
+            .collect::<Vec<_>>();
+        drop(gateway);
+        self.keep_from = through + 1;
+        if !kept.is_empty() {
+            let _ = writer.send(kept);
+        }
+    }
     fn latest_started(&self) -> u64 {
         let node = &self.nodes[0];
         node.windows.iter().next_back().map_or(0, |(w, run)| {
@@ -3193,7 +3398,7 @@ fn stats(values: &[u64]) -> Value {
     let n = v.len();
     json!({"count":n,"p50":v[(n-1)/2],"p99":v[(n*99).div_ceil(100)-1],"max":v[n-1]})
 }
-fn utc(ms: u64) -> String {
+pub fn utc(ms: u64) -> String {
     let seconds = ms / 1000;
     let days = seconds / 86400;
     let z = days as i64 + 719468;
@@ -3456,14 +3661,36 @@ impl Network {
                 // A transaction the gateway no longer holds in memory was finalized long ago.
                 let gateway = self.gateway.read().await;
                 let finalized = |id: &str| gateway.transactions.get(id).map_or(true, |tx| tx["state"] == "finalized");
-                json!(self.solana.signatures_for(address, limit, config["before"].as_str(), config["until"].as_str()).into_iter().map(|(signature, executed)| json!({
+                let (before, until) = (config["before"].as_str(), config["until"].as_str());
+                let entry = |signature: &str, executed: &crate::solana::Executed, finalized: bool| json!({
                     "signature": signature,
                     "slot": executed.slot,
                     "err": executed.err.as_ref().map(|_| crate::solana::FAILED.clone()),
                     "memo": null,
                     "blockTime": executed.time,
-                    "confirmationStatus": if finalized(&executed.id) { "finalized" } else { "confirmed" },
-                })).collect::<Vec<_>>())
+                    "confirmationStatus": if finalized { "finalized" } else { "processed" },
+                });
+                let held = self.solana.signatures_for(address, limit, before, until);
+                let mut out = held.iter().map(|(signature, executed)| entry(signature, executed, finalized(&executed.id))).collect::<Vec<_>>();
+                // Older than what the gateway holds: the kept transactions.
+                let until_held = until.is_some_and(|u| self.solana.get(u).is_some());
+                if let (Some(kept), true) = (&self.kept, out.len() < limit && !until_held) {
+                    let older_than = match held.last() {
+                        Some((_, executed)) => Some(executed.slot),
+                        None => match before {
+                            Some(before) => match self.solana.get(before) {
+                                Some(executed) => Some(executed.slot),
+                                None => kept.get(before)?.map(|k| k.executed.slot),
+                            },
+                            None => None,
+                        },
+                    };
+                    let seen = held.iter().map(|(s, _)| *s).collect::<BTreeSet<_>>();
+                    for (signature, k) in kept.signatures_for(address, older_than, &|s| seen.contains(s), until, limit - out.len())? {
+                        out.push(entry(&signature, &k.executed, true));
+                    }
+                }
+                json!(out)
             }
             "getVoteAccounts" => json!({"current": self.identities.iter().zip(&self.stakes).map(|(identity, stake)| json!({"nodePubkey": identity, "votePubkey": identity, "activatedStake": stake, "epochVoteAccount": true, "commission": 0, "lastVote": slot, "rootSlot": slot})).collect::<Vec<_>>(), "delinquent": []}),
             "sendTransaction" => {
@@ -3498,7 +3725,7 @@ impl Network {
                 self.solana_sent.insert(signature.clone(), params);
                 json!(signature)
             }
-            "getGenesisHash" => json!(self.nodes[0].genesis.hash()),
+            "getGenesisHash" => json!(self.genesis_hash),
             // The slot's wall-clock time: slots run every 50 ms behind the latest executed one.
             "getBlockTime" => {
                 let asked = arg(0).as_u64().context("slot")?;
@@ -3536,6 +3763,8 @@ impl Network {
                 let signature = signature.as_str();
                 let config = arg(1);
                 let encoding = config.as_str().or(config["encoding"].as_str()).unwrap_or("json");
+                // A read: `confirmed` and `processed` return it once executed, `finalized` (the default)
+                // once its cblock is.
                 let confirmed = config["commitment"] == json!("confirmed") || config["commitment"] == json!("processed");
                 match self.solana.get(signature) {
                     Some(executed) => {
@@ -3549,7 +3778,10 @@ impl Network {
                             Value::Null
                         }
                     }
-                    None => Value::Null,
+                    None => match &self.kept {
+                        Some(kept) => kept.get(signature)?.map_or(Value::Null, |k| crate::solana::transaction_json(&k.executed, encoding)),
+                        None => Value::Null,
+                    },
                 }
             }
             "getSignatureStatuses" => {
@@ -3563,13 +3795,30 @@ impl Network {
                         },
                         None => None,
                     };
+                    if record.is_none() {
+                        if let (Some(kept), Some(signature)) = (&self.kept, signature.as_str()) {
+                            if let Some(entry) = kept.get(signature)? {
+                                let failed = entry.executed.err.is_some();
+                                statuses.push(json!({
+                                    "slot": entry.executed.slot,
+                                    "confirmations": null,
+                                    "err": if failed { crate::solana::FAILED.clone() } else { Value::Null },
+                                    "status": if failed { json!({"Err": *crate::solana::FAILED}) } else { json!({"Ok": null}) },
+                                    "confirmationStatus": "finalized",
+                                }));
+                                continue;
+                            }
+                        }
+                    }
                     statuses.push(match record.as_ref().and_then(|tx| tx["state"].as_str()) {
                         Some(state @ ("executed" | "finalized" | "failed")) => json!({
                             "slot": record.as_ref().unwrap()["executedSlot"],
                             "confirmations": if state == "finalized" { Value::Null } else { json!(0) },
                             "err": if record.as_ref().unwrap()["result"] == "success" { Value::Null } else { crate::solana::FAILED.clone() },
                             "status": if record.as_ref().unwrap()["result"] == "success" { json!({"Ok": null}) } else { json!({"Err": *crate::solana::FAILED}) },
-                            "confirmationStatus": if state == "finalized" { "finalized" } else { "confirmed" },
+                            // `confirmed` on Solana means a supermajority voted and it will not roll back; an executed
+                            // transaction here can still go with a skipped cblock, so it is `processed` until finalized.
+                            "confirmationStatus": if state == "finalized" { "finalized" } else { "processed" },
                         }),
                         _ => Value::Null,
                     });
