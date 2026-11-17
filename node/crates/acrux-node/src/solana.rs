@@ -144,3 +144,85 @@ pub fn transaction_json(executed: &Executed, encoding: &str) -> Value {
         },
     })
 }
+
+pub const TOKEN: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+pub const TOKEN_2022: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+fn pubkey(bytes: &[u8]) -> String {
+    bs58::encode(bytes).into_string()
+}
+fn option_key(bytes: &[u8]) -> Value {
+    if bytes[..4] == [1, 0, 0, 0] { json!(pubkey(&bytes[4..36])) } else { Value::Null }
+}
+fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+
+/// A token amount as Solana's `jsonParsed` gives it.
+pub fn token_amount(amount: u64, decimals: u8) -> Value {
+    let ui = amount as f64 / 10f64.powi(decimals as i32);
+    let whole = amount / 10u64.pow(decimals as u32);
+    let fraction = amount % 10u64.pow(decimals as u32);
+    let ui_string = if decimals == 0 || fraction == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{:0width$}", fraction, width = decimals as usize).trim_end_matches('0').to_owned()
+    };
+    json!({"amount": amount.to_string(), "decimals": decimals, "uiAmount": ui, "uiAmountString": ui_string})
+}
+
+/// SPL Token and Token-2022 accounts and mints in Solana's `jsonParsed` shape, read from their base
+/// layout (Token-2022 extensions are not listed). `decimals` reads a mint's decimals.
+pub fn parse_token(owner: &str, data: &[u8], decimals: impl Fn(&str) -> Option<u8>) -> Option<Value> {
+    let program = match owner {
+        TOKEN => "spl-token",
+        TOKEN_2022 => "spl-token-2022",
+        _ => return None,
+    };
+    let parsed = if data.len() >= 165 && (owner == TOKEN_2022 || data.len() == 165) && data[108] != 0 {
+        let mint = pubkey(&data[0..32]);
+        let d = decimals(&mint)?;
+        let native = data[109..113] == [1, 0, 0, 0];
+        let mut info = json!({
+            "mint": mint,
+            "owner": pubkey(&data[32..64]),
+            "tokenAmount": token_amount(u64_at(data, 64), d),
+            "state": if data[108] == 2 { "frozen" } else { "initialized" },
+            "isNative": native,
+        });
+        if let Value::String(delegate) = option_key(&data[72..108]) {
+            info["delegate"] = json!(delegate);
+            info["delegatedAmount"] = token_amount(u64_at(data, 121), d);
+        }
+        if native {
+            info["rentExemptReserve"] = token_amount(u64_at(data, 113), d);
+        }
+        if let Value::String(close) = option_key(&data[129..165]) {
+            info["closeAuthority"] = json!(close);
+        }
+        json!({"type": "account", "info": info})
+    } else if data.len() >= 82 && data[45] == 1 {
+        json!({"type": "mint", "info": {
+            "mintAuthority": option_key(&data[0..36]),
+            "supply": u64_at(data, 36).to_string(),
+            "decimals": data[44],
+            "isInitialized": true,
+            "freezeAuthority": option_key(&data[46..82]),
+        }})
+    } else {
+        return None;
+    };
+    Some(json!({"program": program, "parsed": parsed, "space": data.len()}))
+}
+
+/// One account in the encoding asked for: `base64` (the default), `base58`, or `jsonParsed`, which
+/// parses token accounts and mints and gives every other account as base64, as Solana does.
+pub fn account_json(account: &solana_sdk::account::Account, encoding: &str, decimals: impl Fn(&str) -> Option<u8>) -> Value {
+    let owner = account.owner.to_string();
+    let data = match encoding {
+        "base58" => json!([bs58::encode(&account.data).into_string(), "base58"]),
+        "jsonParsed" => parse_token(&owner, &account.data, decimals).unwrap_or_else(|| json!([B64.encode(&account.data), "base64"])),
+        _ => json!([B64.encode(&account.data), "base64"]),
+    };
+    json!({"lamports": account.lamports, "owner": owner, "data": data, "executable": account.executable, "rentEpoch": u64::MAX, "space": account.data.len()})
+}

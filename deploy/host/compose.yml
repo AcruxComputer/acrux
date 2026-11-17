@@ -23,6 +23,7 @@ services:
       ACRUX_RPC_RATE: "${ACRUX_RPC_RATE:-50}"
       ACRUX_SUBMIT_RATE: "${ACRUX_SUBMIT_RATE:-50}"
       ACRUX_WS_PER_IP: "${ACRUX_WS_PER_IP:-8}"
+      ACRUX_WS_MAX: "${ACRUX_WS_MAX:-200}"
       ACRUX_TRAFFIC_RATE: "${ACRUX_TRAFFIC_RATE:-50}"
       ACRUX_IDENTITY_SEED: "${ACRUX_IDENTITY_SEED}"
     # Every start is a fresh genesis; the store keeps the current run and the one before it.

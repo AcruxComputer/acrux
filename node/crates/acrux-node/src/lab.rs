@@ -25,11 +25,12 @@ pub async fn run(
     let writer = tokio::spawn(async move {
         loop {
             match events.recv().await {
-                Ok(event) => {
+                Ok(shared) => {
+                    let event = &shared.0;
                     let kind = event["type"].as_str().unwrap_or_default();
                     let in_range = event["slot"].as_u64().is_some_and(|s| slots.contains(&s));
                     if !kind.starts_with("stream.") && (in_range || kind == "lab.evidence") {
-                        serde_json::to_writer(&mut file, &event)?;
+                        serde_json::to_writer(&mut file, event)?;
                         file.write_all(b"\n")?;
                         file.flush()?;
                     }

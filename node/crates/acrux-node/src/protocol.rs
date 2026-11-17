@@ -1119,10 +1119,13 @@ impl Network {
             let node = &mut self.nodes[id];
             if let Some((&window, run)) = node.windows.iter().next_back() {
                 let parent = run.parent.map(|p| p.slot);
+                // Everything from the last finalized cblock on: after any run of skipped windows
+                // the next window's parent is that cblock or a later one.
+                let floor = node.votor.finalized().map_or(0, |f| f.slot);
                 node.checkpoints
-                    .retain(|slot, _| *slot + 8 >= window * 4 || Some(*slot) == parent);
+                    .retain(|slot, _| *slot + 8 >= window * 4 || *slot >= floor || Some(*slot) == parent);
                 node.threshold_checkpoints
-                    .retain(|slot, _| *slot + 8 >= window * 4 || Some(*slot) == parent);
+                    .retain(|slot, _| *slot + 8 >= window * 4 || *slot >= floor || Some(*slot) == parent);
             }
             // Everything 64 consensus slots below finality is settled and already in the store.
             if let Some(finalized) = node.votor.finalized() {
@@ -3386,10 +3389,10 @@ impl Network {
         let slot = self.nodes[0].last_executed.unwrap_or(0);
         let context = json!({"slot": slot, "apiVersion": "2.2.1"});
         let executor = self.nodes[0].executor.as_ref().unwrap();
-        let account_json = |a: &solana_sdk::account::Account| json!({
-            "lamports": a.lamports, "owner": a.owner.to_string(), "data": [B64.encode(&a.data), "base64"],
-            "executable": a.executable, "rentEpoch": u64::MAX, "space": a.data.len(),
-        });
+        // A mint's decimals, for token amounts in jsonParsed.
+        let decimals = |mint: &str| executor.account(mint).ok().flatten().filter(|a| a.data.len() >= 82).map(|a| a.data[44]);
+        let encoding = |config: &Value| config["encoding"].as_str().unwrap_or("base64").to_owned();
+        let account_json = |a: &solana_sdk::account::Account, encoding: &str| crate::solana::account_json(a, encoding, decimals);
         Ok(match method {
             "getHealth" => json!("ok"),
             "getVersion" => json!({"solana-core": concat!("acrux-", env!("CARGO_PKG_VERSION")), "feature-set": 0}),
@@ -3397,13 +3400,53 @@ impl Network {
             "getEpochInfo" => json!({"absoluteSlot": slot, "blockHeight": slot, "epoch": slot / 432_000, "slotIndex": slot % 432_000, "slotsInEpoch": 432_000}),
             "getLatestBlockhash" => json!({"context": context, "value": {"blockhash": executor.latest_blockhash(), "lastValidBlockHeight": slot + crate::execution::BLOCKHASH_AGE_SLOTS - 8}}),
             "getBalance" => json!({"context": context, "value": executor.balance(arg(0).as_str().context("address")?)?}),
-            "getAccountInfo" => json!({"context": context, "value": executor.account(arg(0).as_str().context("address")?)?.filter(|a| a.lamports > 0).as_ref().map(account_json)}),
+            "getAccountInfo" => {
+                let encoding = encoding(&arg(1));
+                json!({"context": context, "value": executor.account(arg(0).as_str().context("address")?)?.filter(|a| a.lamports > 0).map(|a| account_json(&a, &encoding))})
+            }
             "getMultipleAccounts" => {
+                let encoding = encoding(&arg(1));
                 let keys = arg(0).as_array().context("addresses")?.iter().map(|k| k.as_str().context("address").map(str::to_owned)).collect::<Result<Vec<_>>>()?;
-                let values = keys.iter().map(|k| Ok(executor.account(k)?.filter(|a| a.lamports > 0).as_ref().map(account_json))).collect::<Result<Vec<_>>>()?;
+                let values = keys.iter().map(|k| Ok(executor.account(k)?.filter(|a| a.lamports > 0).map(|a| account_json(&a, &encoding)))).collect::<Result<Vec<_>>>()?;
                 json!({"context": context, "value": values})
             }
-            "getProgramAccounts" => json!(executor.accounts_owned_by(arg(0).as_str().context("program")?)?.into_iter().filter(|(_, a)| a.lamports > 0).map(|(k, a)| json!({"pubkey": k, "account": account_json(&a)})).collect::<Vec<_>>()),
+            "getProgramAccounts" => {
+                let encoding = encoding(&arg(1));
+                json!(executor.accounts_owned_by(arg(0).as_str().context("program")?)?.into_iter().filter(|(_, a)| a.lamports > 0).map(|(k, a)| json!({"pubkey": k, "account": account_json(&a, &encoding)})).collect::<Vec<_>>())
+            }
+            // A wallet's token list: the owner's accounts under SPL Token or Token-2022, by mint or program.
+            "getTokenAccountsByOwner" => {
+                let owner = <solana_sdk::pubkey::Pubkey as std::str::FromStr>::from_str(arg(0).as_str().context("owner")?)?;
+                let filter = arg(1);
+                let encoding = encoding(&arg(2));
+                let mint = filter["mint"].as_str().map(<solana_sdk::pubkey::Pubkey as std::str::FromStr>::from_str).transpose()?;
+                let programs = match filter["programId"].as_str() {
+                    Some(program) => vec![program.to_owned()],
+                    None => vec![crate::solana::TOKEN.to_owned(), crate::solana::TOKEN_2022.to_owned()],
+                };
+                let mut accounts = vec![];
+                for program in programs {
+                    for (key, account) in executor.accounts_owned_by(&program)? {
+                        let data = &account.data;
+                        if data.len() >= 165 && data[108] != 0 && data[32..64] == owner.to_bytes() && mint.is_none_or(|m| data[0..32] == m.to_bytes()) {
+                            accounts.push(json!({"pubkey": key, "account": account_json(&account, &encoding)}));
+                        }
+                    }
+                }
+                json!({"context": context, "value": accounts})
+            }
+            "getTokenAccountBalance" => {
+                let account = executor.account(arg(0).as_str().context("account")?)?.context("Invalid param: could not find account")?;
+                anyhow::ensure!(account.data.len() >= 165, "Invalid param: not a Token account");
+                let mint = bs58::encode(&account.data[0..32]).into_string();
+                let d = decimals(&mint).context("Invalid param: mint could not be read")?;
+                json!({"context": context, "value": crate::solana::token_amount(u64::from_le_bytes(account.data[64..72].try_into()?), d)})
+            }
+            "getTokenSupply" => {
+                let mint = executor.account(arg(0).as_str().context("mint")?)?.context("Invalid param: could not find mint")?;
+                anyhow::ensure!(mint.data.len() >= 82, "Invalid param: not a mint");
+                json!({"context": context, "value": crate::solana::token_amount(u64::from_le_bytes(mint.data[36..44].try_into()?), mint.data[44])})
+            }
             "getMinimumBalanceForRentExemption" => json!(executor.rent_exempt_minimum(arg(0).as_u64().context("data length")? as usize)),
             "getSignaturesForAddress" => {
                 let address = arg(0).as_str().context("address")?.to_owned();

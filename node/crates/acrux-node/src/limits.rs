@@ -44,6 +44,8 @@ pub struct Limits {
     submits: Bucket,
     sockets: Mutex<HashMap<IpAddr, usize>>,
     sockets_per_ip: usize,
+    /// Stream connections in all (`ACRUX_WS_MAX`).
+    sockets_total: usize,
     trust_proxy: bool,
 }
 
@@ -66,6 +68,7 @@ pub fn limits() -> &'static Limits {
             },
             sockets: Mutex::new(HashMap::new()),
             sockets_per_ip: env("ACRUX_WS_PER_IP", 8),
+            sockets_total: env("ACRUX_WS_MAX", 200),
             trust_proxy: env("ACRUX_TRUST_PROXY", 0u8) == 1,
         }
     })
@@ -94,6 +97,9 @@ impl Limits {
     /// Takes one of the client's event-stream connections; `None` when it holds all of them.
     pub fn open_socket(&'static self, ip: IpAddr) -> Option<SocketPermit> {
         let mut sockets = self.sockets.lock().unwrap();
+        if sockets.values().sum::<usize>() >= self.sockets_total {
+            return None;
+        }
         let open = sockets.entry(ip).or_default();
         if *open >= self.sockets_per_ip {
             return None;

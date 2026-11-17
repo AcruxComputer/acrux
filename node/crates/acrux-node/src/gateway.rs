@@ -85,7 +85,8 @@ pub struct GatewayState {
     pub stream_id: String,
     pub sequence: u64,
     pub history: VecDeque<Value>,
-    pub events: broadcast::Sender<Value>,
+    /// Each event with its JSON text, serialized once for every viewer.
+    pub events: broadcast::Sender<Arc<(Value, String)>>,
     pub commands: mpsc::Sender<GatewayCommand>,
 }
 
@@ -134,7 +135,10 @@ impl GatewayState {
         while self.history.len() > 24_000 {
             self.history.pop_front();
         }
-        let _ = self.events.send(event);
+        if self.events.receiver_count() > 0 {
+            let text = event.to_string();
+            let _ = self.events.send(Arc::new((event, text)));
+        }
     }
     fn control(&self, kind: &str, data: Value) -> Value {
         json!({"version":1,"sequence":self.sequence,"streamId":self.stream_id,"slot":null,"anchor":"stream","atUs":0,"type":kind,"data":data})
@@ -281,9 +285,14 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
     }
     let params = request.get("params").cloned().unwrap_or(json!({}));
     // Solana's methods take array params; Acrux's take an object. Solana-only methods may omit them.
-    let solana_only = matches!(method, "getHealth" | "getVersion" | "getGenesisHash" | "getFeeForMessage" | "simulateTransaction" | "getRecentPrioritizationFees" | "getBlockTime" | "getBlockHeight" | "getEpochInfo" | "getAccountInfo" | "getMultipleAccounts" | "getProgramAccounts" | "getMinimumBalanceForRentExemption" | "getSignaturesForAddress" | "getVoteAccounts" | "sendTransaction" | "getSignatureStatuses");
+    let solana_only = matches!(method, "getHealth" | "getVersion" | "getGenesisHash" | "getFeeForMessage" | "simulateTransaction" | "getRecentPrioritizationFees" | "getBlockTime" | "getTokenAccountsByOwner" | "getTokenAccountBalance" | "getTokenSupply" | "getBlockHeight" | "getEpochInfo" | "getAccountInfo" | "getMultipleAccounts" | "getProgramAccounts" | "getMinimumBalanceForRentExemption" | "getSignaturesForAddress" | "getVoteAccounts" | "sendTransaction" | "getSignatureStatuses");
     if params.is_array() || (solana_only && !params.is_object()) || (solana_only && params.as_object().is_some_and(|o| o.is_empty())) {
         let params = if params.is_array() { params } else { json!([]) };
+        // ACRUX_LOG_RPC=1: one line per Solana call, its method and encoding, to see what a wallet asks.
+        if std::env::var("ACRUX_LOG_RPC").is_ok_and(|v| v == "1") {
+            let encoding = params.as_array().into_iter().flatten().find_map(|p| p.get("encoding").and_then(Value::as_str)).unwrap_or("");
+            eprintln!("solana-rpc {method} {encoding}");
+        }
         if !bounded_strings(&params) || params.get(0).and_then(Value::as_array).is_some_and(|keys| keys.len() > 100) {
             return Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": "Invalid params: a string or list is too long."}})).into_response();
         }
@@ -806,7 +815,7 @@ async fn open_stream(
 ) -> Response {
     let limits = crate::limits::limits();
     let Some(permit) = limits.open_socket(limits.client(peer, &headers)) else {
-        return (StatusCode::TOO_MANY_REQUESTS, Json(error("RATE_LIMITED", "Too many event-stream connections from this address."))).into_response();
+        return (StatusCode::TOO_MANY_REQUESTS, Json(error("RATE_LIMITED", "Too many event-stream connections, from this address or in all."))).into_response();
     };
     if !valid_origin(&headers) {
         return (
@@ -821,6 +830,12 @@ async fn open_stream(
             stream(socket, state, acrux).await;
             drop(permit);
         })
+}
+async fn send_text(socket: &mut WebSocket, text: String) -> bool {
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), socket.send(WsMessage::Text(text.into()))).await,
+        Ok(Ok(()))
+    )
 }
 async fn send(socket: &mut WebSocket, event: Value) -> bool {
     matches!(
@@ -986,6 +1001,7 @@ async fn stream(mut socket: WebSocket, state: SharedGateway, acrux: bool) {
     let mut solana = BTreeMap::<u64, SolanaSub>::new();
     let mut next_subscription = 0u64;
     let mut solana_slot = 0u64;
+    let mut last_resync = std::time::Instant::now();
     let mut solana_executed = 0u64;
     loop {
         tokio::select! {
@@ -1017,15 +1033,16 @@ async fn stream(mut socket: WebSocket, state: SharedGateway, acrux: bool) {
                 Some(Ok(WsMessage::Close(_)))|None|Some(Err(_))=>break,
                 _=>{},
             },
-            event=events.recv()=>{match event{Ok(event)=>{
+            event=events.recv()=>{match event{Ok(shared)=>{
+                let event=&shared.0;
                 if !solana.is_empty() {
                     let mut closed = false;
-                    for message in solana_notifications(&state, &mut solana, &event, &mut solana_slot, &mut solana_executed).await {
+                    for message in solana_notifications(&state, &mut solana, event, &mut solana_slot, &mut solana_executed).await {
                         if !send(&mut socket, message).await { closed = true; break; }
                     }
                     if closed { break; }
                 }
-                let sequence=event["sequence"].as_u64().unwrap_or(0);if active&&sequence>last_sequence&&matches(&event,&filter){last_sequence=sequence;if !send(&mut socket,event).await{break;}}},Err(broadcast::error::RecvError::Lagged(_)) if !active=>{},Err(broadcast::error::RecvError::Lagged(_))=>{let event={let s=state.read().await;s.control("stream.resync",json!({"reason":"cursor_expired","snapshot":s.snapshot()}))};last_sequence=event["sequence"].as_u64().unwrap_or(last_sequence);if !send(&mut socket,event).await{break;}},Err(_)=>break}},
+                let sequence=event["sequence"].as_u64().unwrap_or(0);if active&&sequence>last_sequence&&matches(event,&filter){last_sequence=sequence;if !send_text(&mut socket,shared.1.clone()).await{break;}}},Err(broadcast::error::RecvError::Lagged(_)) if !active||last_resync.elapsed()<std::time::Duration::from_secs(10)=>{},Err(broadcast::error::RecvError::Lagged(_))=>{last_resync=std::time::Instant::now();let event={let s=state.read().await;s.control("stream.resync",json!({"reason":"cursor_expired","snapshot":s.snapshot()}))};last_sequence=event["sequence"].as_u64().unwrap_or(last_sequence);if !send(&mut socket,event).await{break;}},Err(_)=>break}},
             _=heartbeat.tick()=>{if !pong{break;}pong=false;if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),socket.send(WsMessage::Ping(vec![].into()))).await,Ok(Ok(()))){break;}if !acrux{continue;}let event={let s=state.read().await;let latest=s.slots.keys().next_back().copied().unwrap_or(0);s.control("stream.heartbeat",json!({"latestSlot":latest,"status":"live"}))};if !send(&mut socket,event).await{break;}},
         }
     }

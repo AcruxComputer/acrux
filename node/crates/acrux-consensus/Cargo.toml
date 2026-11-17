@@ -1,6 +1,6 @@
 [package]
 name = "acrux-consensus"
-version = "0.3.5"
+version = "0.3.7"
 edition = "2021"
 description = "Votor on cblocks: votes, certificates, ParentReady and finality."
 

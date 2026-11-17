@@ -311,7 +311,12 @@ async fn run() -> anyhow::Result<()> {
         return acrux_node::lab::run(config, fault, state, rx).await;
     }
     let net = Network::new(config.clone(), state.clone(), rx).await?;
-    let mut gateway = tokio::spawn(run_gateway(
+    // The gateway serves the public on threads of its own, so its viewers and callers never take
+    // a validator's time.
+    let serving = Box::leak(Box::new(
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("gateway").enable_all().build()?,
+    ));
+    let mut gateway = serving.spawn(run_gateway(
         state,
         config.gateway_port,
         config.websocket_port,
