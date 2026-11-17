@@ -16,12 +16,17 @@ if (!funded) await fetch(faucet, { method: 'POST', headers: { 'content-type': 'a
 while ((await connection.getBalance(payer.publicKey)) === 0) await sleep(300)
 console.log(`funded ${payer.publicKey.toBase58()}: ${(await connection.getBalance(payer.publicKey)) / LAMPORTS_PER_SOL}`)
 
-let slots = 0
-const slotSub = connection.onSlotChange(() => { slots++ })
+// The transfer is sent once the socket is open and subscribed (the first slot notification says so):
+// a subscription made after a change never hears of it, on Acrux as on Solana.
+let slots = 0, subscribed
+const live = new Promise(resolve => { subscribed = resolve })
+const slotSub = connection.onSlotChange(() => { slots++; subscribed() })
 const seen = new Promise(resolve => {
   const sub = connection.onAccountChange(to, account => { connection.removeAccountChangeListener(sub); resolve(account.lamports) }, { commitment: 'confirmed' })
 })
 
+await live
+await sleep(500)
 const tx = new Transaction().add(SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: to, lamports: 1_000_000 }))
 const started = performance.now()
 const signature = await sendAndConfirmTransaction(connection, tx, [payer], { commitment: 'confirmed' })
