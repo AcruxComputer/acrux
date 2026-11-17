@@ -147,6 +147,7 @@ pub struct SvmExecutor {
     executed: BTreeMap<String, u64>,
     /// The valid blockhashes, newest last: one per executed slot, derived from the state.
     recent: VecDeque<(Hash, u64)>,
+    /// The builtin and genesis programs whose accounts enter the state hash at genesis.
     allowed_programs: BTreeSet<Pubkey>,
     fees: Fees,
     track_capacity_cu: u64,
@@ -262,8 +263,13 @@ impl SvmExecutor {
     ) -> Result<Self> {
         // Transaction history is maintained by transaction ID below. Blockhash checking
         // remains enabled; sigverify is also enabled when simulating the signed bytes.
+        // Every feature on but loader v4 and the end of new loader v3 deployments, neither of
+        // them on Solana mainnet: `solana program deploy` deploys through loader v3.
+        let mut features = solana_sdk::feature_set::FeatureSet::all_enabled();
+        features.deactivate(&solana_sdk::feature_set::enable_loader_v4::id());
+        features.deactivate(&solana_sdk::feature_set::disable_new_loader_v3_deployments::id());
         let svm = LiteSVM::default()
-            .with_feature_set(solana_sdk::feature_set::FeatureSet::all_enabled())
+            .with_feature_set(features)
             .with_builtins()
             .with_sysvars()
             .with_precompiles()
@@ -557,9 +563,6 @@ impl SvmExecutor {
             let program = keys
                 .get(ix.program_id_index as usize)
                 .context("Bad program index")?;
-            if !self.allowed_programs.contains(program) {
-                bail!("Program is not loaded in the Acrux genesis: {program}");
-            }
             if *program == compute_program {
                 match ix.data.as_slice() {
                     [2, rest @ ..] if rest.len() == 4 => {
@@ -574,6 +577,8 @@ impl SvmExecutor {
                         }
                         price = Some(u64::from_le_bytes(rest.try_into().unwrap()));
                     }
+                    // RequestHeapFrame and SetLoadedAccountsDataSizeLimit: the SVM applies them.
+                    [1, rest @ ..] | [4, rest @ ..] if rest.len() == 4 => {}
                     _ => bail!("Unsupported compute budget instruction"),
                 }
             } else {
@@ -752,7 +757,11 @@ impl SvmExecutor {
                             account.lamports() >= self.fees.reserve_lamports
                         });
                     if reserve_ok {
-                        for (key, account) in info.post_accounts {
+                        // Data before programs: LiteSVM loads an upgradeable program from its
+                        // program data the moment the program account is written.
+                        let mut accounts = info.post_accounts;
+                        accounts.sort_by_key(|(_, account)| account.executable());
+                        for (key, account) in accounts {
                             self.put(key, account.into())?;
                         }
                         ExecutionResult {

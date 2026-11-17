@@ -52,14 +52,18 @@ fn env<T: std::str::FromStr>(name: &str, default: T) -> T {
 }
 
 /// The limits, from `ACRUX_RPC_RATE` (reads a second per IP, default 50, burst twice that),
-/// `ACRUX_SUBMIT_RATE` (submits a second per IP, default 5, burst 20) and `ACRUX_WS_PER_IP` (8).
+/// `ACRUX_SUBMIT_RATE` (submits a second per IP, default 50, burst ten seconds of it: a program
+/// deploy sends its few hundred buffer writes at once) and `ACRUX_WS_PER_IP` (8).
 pub fn limits() -> &'static Limits {
     static LIMITS: OnceLock<Limits> = OnceLock::new();
     LIMITS.get_or_init(|| {
         let reads = env("ACRUX_RPC_RATE", 50.0);
         Limits {
             reads: Bucket::new(reads, reads * 2.0),
-            submits: Bucket::new(env("ACRUX_SUBMIT_RATE", 5.0), 20.0),
+            submits: {
+                let rate = env("ACRUX_SUBMIT_RATE", 50.0);
+                Bucket::new(rate, rate * 10.0)
+            },
             sockets: Mutex::new(HashMap::new()),
             sockets_per_ip: env("ACRUX_WS_PER_IP", 8),
             trust_proxy: env("ACRUX_TRUST_PROXY", 0u8) == 1,

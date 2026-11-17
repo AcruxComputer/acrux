@@ -73,6 +73,8 @@ JSON-RPC on `--gateway-port`: `getSnapshot`, `getSlot`, `getRecentSlots`, `getCu
 
 **Solana's PubSub** on the event stream's socket and on the JSON-RPC port's own WebSocket upgrade, so web3.js finds it from the RPC URL alone (`wss://rpc.<domain>` for a public URL, one port up for a local node): a message carrying `jsonrpc` is Solana's, on the same connection as Acrux's stream commands. `signatureSubscribe` (one notification once the transaction reaches the commitment, `finalized` by default), `accountSubscribe` (after each executed slot in which the account changed), `slotSubscribe` (each slot as it starts), and their `…Unsubscribe`; up to 64 subscriptions a connection. `sendAndConfirmTransaction` confirms through them as it does on Solana.
 
+**Programs.** Any program deploys through the upgradeable loader with the stock CLI: `solana program deploy --use-rpc <program.so>` (`--use-rpc` sends the buffer writes through `sendTransaction`; there is no TPU port). A transaction may call any program; one that calls an account that is not a program fails at execution and pays its fees, as on Solana. The SVM runs every feature but loader v4 and the end of new loader v3 deployments, neither of them on Solana mainnet. A transaction the merge does not place in its slot (its track is full, as when a deploy's buffer writes all lock the buffer) goes back to its proposer and lands in a later slot; it is never recorded as failed.
+
 ## Fault Lab
 
 ```bash

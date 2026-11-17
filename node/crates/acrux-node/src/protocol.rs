@@ -2341,6 +2341,14 @@ impl Network {
                 "validator.merge_select_execute",
                 execute_start.elapsed(),
             );
+            for header in &execution.merged_order {
+                if !execution.schedule.selected_ids.contains(&header.id)
+                    && self.nodes[id].in_flight.get(&header.id).is_some_and(|(slot, _, _)| *slot <= s)
+                {
+                    let (_, _, tx) = self.nodes[id].in_flight.remove(&header.id).unwrap();
+                    self.nodes[id].mempool.insert(header.id.clone(), tx);
+                }
+            }
             let base =
                 self.nodes[id].windows[&w].start + std::time::Duration::from_micros(s % 16 * 50000);
             let at = offset(Instant::now(), base);
@@ -2434,6 +2442,11 @@ impl Network {
                 }
                 for (position, h) in execution.merged_order.iter().enumerate() {
                     let outcome = execution.results.iter().find(|r| r.id == h.id);
+                    // A plain transaction the merge did not place (its track was full) is not
+                    // failed: its proposer carries it again in a later slot.
+                    if outcome.is_none() && !fragment_info.contains_key(&h.id) {
+                        continue;
+                    }
                     let mut tx = json!({"header":h,"state":if outcome.map_or(false,|r|r.success){"executed"}else{"failed"},"kind":"plain","n":source[&h.id].len(),"t":1,"receivers":self.window_json(w)["proposers"],"fragments":source[&h.id].iter().map(|p|json!({"index":*p-1,"receiver":p,"slot":s,"proposer":p,"includedUs":at})).collect::<Vec<_>>(),"includedCount":source[&h.id].len(),"readableSlot":s,"executedSlot":s,"mergedPosition":position,"result":if outcome.map_or(false,|r|r.success){"success"}else{"error"},"logs":outcome.map(|r|r.logs.clone()).unwrap_or_default(),"failure":outcome.and_then(|r|r.error.clone()),"expiresAfterSlot":null,"finalization":null});
                     if let Some((n, t, inclusions)) = fragment_info.get(&h.id) {
                         tx = threshold_transaction(
