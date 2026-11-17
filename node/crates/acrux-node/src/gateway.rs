@@ -176,7 +176,7 @@ pub async fn run_gateway(
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(AllowHeaders::mirror_request());
     let http = Router::new()
-        .route("/", post(rpc))
+        .route("/", post(rpc).get(upgrade))
         .route("/rpc", post(rpc))
         .route("/health", get(health))
         .layer(DefaultBodyLimit::max(1024 * 1024))
@@ -808,6 +808,137 @@ async fn send(socket: &mut WebSocket, event: Value) -> bool {
 async fn control(state: &SharedGateway, kind: &str, data: Value) -> Value {
     state.read().await.control(kind, data)
 }
+/// A Solana subscription on a stream connection, as Solana's PubSub defines them.
+enum SolanaSub {
+    /// One-shot: notified once the transaction reaches the commitment, then dropped.
+    Signature { signature: String, finalized: bool },
+    /// Notified after each executed slot in which the account changed.
+    Account { address: String, encoding: String, last: Value },
+    Slot,
+}
+/// Subscriptions one connection may hold.
+const MAX_SOLANA_SUBS: usize = 64;
+
+fn solana_reply(id: &Value, result: std::result::Result<Value, (i64, &str)>) -> Value {
+    match result {
+        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        Err((code, message)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}),
+    }
+}
+fn notification(method: &str, subscription: u64, slot: u64, value: Value) -> Value {
+    json!({"jsonrpc": "2.0", "method": method, "params": {"result": {"context": {"slot": slot}, "value": value}, "subscription": subscription}})
+}
+async fn solana_account(state: &SharedGateway, address: &str, encoding: &str) -> Value {
+    command(state, |reply| GatewayCommand::Solana { method: "getAccountInfo".into(), params: json!([address, {"encoding": encoding}]), reply })
+        .await
+        .map(|answer| answer["value"].clone())
+        .unwrap_or(Value::Null)
+}
+/// The signature's notification if its transaction has reached the commitment: read from `update`
+/// when it is that transaction's newest record, else from the gateway's.
+async fn signature_reached(state: &SharedGateway, signature: &str, finalized: bool, update: Option<&Value>) -> Option<(u64, Value)> {
+    let gateway = state.read().await;
+    let id = gateway.signatures.get(signature)?;
+    let tx = match update.filter(|tx| tx["header"]["id"].as_str() == Some(id.as_str())) {
+        Some(tx) => tx,
+        None => gateway.transactions.get(id)?,
+    };
+    let reached = match tx["state"].as_str()? {
+        "finalized" => true,
+        "executed" | "failed" => !finalized,
+        _ => false,
+    };
+    reached.then(|| (
+        tx["executedSlot"].as_u64().unwrap_or(0),
+        json!({"err": if tx["result"] == "success" { Value::Null } else { crate::solana::FAILED.clone() }}),
+    ))
+}
+/// One Solana PubSub request: the reply, and a notification to send at once when one is due.
+async fn solana_request(state: &SharedGateway, subs: &mut BTreeMap<u64, SolanaSub>, next: &mut u64, request: &Value) -> Vec<Value> {
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let params = request.get("params").cloned().unwrap_or(json!([]));
+    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+    let finalized = |config: &Value| !matches!(config["commitment"].as_str(), Some("confirmed" | "processed"));
+    if method.ends_with("Unsubscribe") {
+        let removed = params.get(0).and_then(Value::as_u64).is_some_and(|sub| subs.remove(&sub).is_some());
+        return vec![solana_reply(&id, Ok(json!(removed)))];
+    }
+    if subs.len() >= MAX_SOLANA_SUBS {
+        return vec![solana_reply(&id, Err((-32005, "Too many subscriptions on this connection.")))];
+    }
+    let sub = match method {
+        "signatureSubscribe" => match params.get(0).and_then(Value::as_str).filter(|s| s.len() <= MAX_SIGNATURE_CHARS) {
+            Some(signature) => SolanaSub::Signature { signature: signature.to_owned(), finalized: finalized(&params[1]) },
+            None => return vec![solana_reply(&id, Err((-32602, "Invalid params: a signature")))],
+        },
+        "accountSubscribe" => match params.get(0).and_then(Value::as_str).filter(|a| valid_address(a)) {
+            Some(address) => {
+                let encoding = params[1]["encoding"].as_str().unwrap_or("base64").to_owned();
+                let last = solana_account(state, address, &encoding).await;
+                SolanaSub::Account { address: address.to_owned(), encoding, last }
+            }
+            None => return vec![solana_reply(&id, Err((-32602, "Invalid params: an address")))],
+        },
+        "slotSubscribe" => SolanaSub::Slot,
+        _ => return vec![solana_reply(&id, Err((-32601, "Method not found")))],
+    };
+    *next += 1;
+    let subscription = *next;
+    let mut out = vec![solana_reply(&id, Ok(json!(subscription)))];
+    if let SolanaSub::Signature { signature, finalized } = &sub {
+        if let Some((slot, value)) = signature_reached(state, signature, *finalized, None).await {
+            out.push(notification("signatureNotification", subscription, slot, value));
+            return out;
+        }
+    }
+    subs.insert(subscription, sub);
+    out
+}
+/// The notifications an event brings to a connection's Solana subscriptions.
+async fn solana_notifications(state: &SharedGateway, subs: &mut BTreeMap<u64, SolanaSub>, event: &Value, last_slot: &mut u64, last_executed: &mut u64) -> Vec<Value> {
+    let kind = event["type"].as_str().unwrap_or("");
+    let slot = event["slot"].as_u64().unwrap_or(0);
+    let mut out = vec![];
+    match kind {
+        "transaction.updated" => {
+            let mut done = vec![];
+            for (subscription, sub) in subs.iter() {
+                if let SolanaSub::Signature { signature, finalized } = sub {
+                    if let Some((slot, value)) = signature_reached(state, signature, *finalized, Some(&event["data"])).await {
+                        out.push(notification("signatureNotification", *subscription, slot, value));
+                        done.push(*subscription);
+                    }
+                }
+            }
+            for subscription in done {
+                subs.remove(&subscription);
+            }
+        }
+        // Every validator reports each slot; a connection hears of it once.
+        "slot.started" if slot > *last_slot => {
+            *last_slot = slot;
+            for (subscription, sub) in subs.iter() {
+                if matches!(sub, SolanaSub::Slot) {
+                    out.push(json!({"jsonrpc": "2.0", "method": "slotNotification", "params": {"result": {"parent": slot.saturating_sub(1), "root": slot.saturating_sub(16), "slot": slot}, "subscription": subscription}}));
+                }
+            }
+        }
+        "slot.executed" if slot > *last_executed => {
+            *last_executed = slot;
+            for (subscription, sub) in subs.iter_mut() {
+                if let SolanaSub::Account { address, encoding, last } = sub {
+                    let now = solana_account(state, address, encoding).await;
+                    if now != *last {
+                        *last = now.clone();
+                        out.push(notification("accountNotification", *subscription, slot, now));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
 async fn stream(mut socket: WebSocket, state: SharedGateway) {
     let mut events = state.read().await.events.subscribe();
     let initial = {
@@ -822,11 +953,24 @@ async fn stream(mut socket: WebSocket, state: SharedGateway) {
     let mut last_sequence = 0;
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
     let mut pong = true;
+    // Solana PubSub on the same connection: a message carrying `jsonrpc` is Solana's.
+    let mut solana = BTreeMap::<u64, SolanaSub>::new();
+    let mut next_subscription = 0u64;
+    let mut solana_slot = 0u64;
+    let mut solana_executed = 0u64;
     loop {
         tokio::select! {
             incoming=socket.next()=>match incoming{
                 Some(Ok(WsMessage::Text(text)))=>{
                     let parsed:Value=match serde_json::from_str(&text){Ok(v)=>v,Err(_)=>{let event=control(&state,"stream.error",error("INVALID_INPUT","Expected a stream command.")).await;if !send(&mut socket,event).await{break;}continue;}};
+                    if parsed.get("jsonrpc").is_some() {
+                        let mut closed = false;
+                        for message in solana_request(&state, &mut solana, &mut next_subscription, &parsed).await {
+                            if !send(&mut socket, message).await { closed = true; break; }
+                        }
+                        if closed { break; }
+                        continue;
+                    }
                     if parsed.get("version").and_then(Value::as_u64)!=Some(1){let event=control(&state,"stream.error",error("INVALID_INPUT","Unknown stream version.")).await;if !send(&mut socket,event).await{break;}continue;}
                     if parsed.get("type").and_then(Value::as_str)==Some("unsubscribe"){active=false;continue;}
                     if parsed.get("type").and_then(Value::as_str)!=Some("subscribe"){continue;}
@@ -843,7 +987,15 @@ async fn stream(mut socket: WebSocket, state: SharedGateway) {
                 Some(Ok(WsMessage::Close(_)))|None|Some(Err(_))=>break,
                 _=>{},
             },
-            event=events.recv()=>{match event{Ok(event)=>{let sequence=event["sequence"].as_u64().unwrap_or(0);if active&&sequence>last_sequence&&matches(&event,&filter){last_sequence=sequence;if !send(&mut socket,event).await{break;}}},Err(broadcast::error::RecvError::Lagged(_))=>{let event={let s=state.read().await;s.control("stream.resync",json!({"reason":"cursor_expired","snapshot":s.snapshot()}))};last_sequence=event["sequence"].as_u64().unwrap_or(last_sequence);if !send(&mut socket,event).await{break;}},Err(_)=>break}},
+            event=events.recv()=>{match event{Ok(event)=>{
+                if !solana.is_empty() {
+                    let mut closed = false;
+                    for message in solana_notifications(&state, &mut solana, &event, &mut solana_slot, &mut solana_executed).await {
+                        if !send(&mut socket, message).await { closed = true; break; }
+                    }
+                    if closed { break; }
+                }
+                let sequence=event["sequence"].as_u64().unwrap_or(0);if active&&sequence>last_sequence&&matches(&event,&filter){last_sequence=sequence;if !send(&mut socket,event).await{break;}}},Err(broadcast::error::RecvError::Lagged(_))=>{let event={let s=state.read().await;s.control("stream.resync",json!({"reason":"cursor_expired","snapshot":s.snapshot()}))};last_sequence=event["sequence"].as_u64().unwrap_or(last_sequence);if !send(&mut socket,event).await{break;}},Err(_)=>break}},
             _=heartbeat.tick()=>{if !pong{break;}pong=false;if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),socket.send(WsMessage::Ping(vec![].into()))).await,Ok(Ok(()))){break;}let event={let s=state.read().await;let latest=s.slots.keys().next_back().copied().unwrap_or(0);s.control("stream.heartbeat",json!({"latestSlot":latest,"status":"live"}))};if !send(&mut socket,event).await{break;}},
         }
     }
