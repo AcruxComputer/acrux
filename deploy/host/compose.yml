@@ -19,7 +19,7 @@ services:
     environment:
       ACRUX_BIND: 0.0.0.0
       ACRUX_TRUST_PROXY: "1"
-      ACRUX_CORS_ORIGINS: "${SITE_ORIGINS}"
+      ACRUX_CORS_ORIGINS: "${RPC_ORIGINS:-*}"
       ACRUX_RPC_RATE: "${ACRUX_RPC_RATE:-50}"
       ACRUX_SUBMIT_RATE: "${ACRUX_SUBMIT_RATE:-50}"
       ACRUX_WS_PER_IP: "${ACRUX_WS_PER_IP:-8}"

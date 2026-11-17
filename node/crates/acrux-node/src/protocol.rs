@@ -2321,6 +2321,7 @@ impl Network {
                 self.solana.record(signature, crate::solana::Executed {
                     id: result.id.clone(),
                     slot: s,
+                    time: crate::solana::now(),
                     bytes: bytes.clone(),
                     fee: result.base_fee + result.priority_fee + copies * self.config.inclusion_fee,
                     err: result.error.clone(),
@@ -3417,7 +3418,7 @@ impl Network {
                     "slot": executed.slot,
                     "err": executed.err.as_ref().map(|_| crate::solana::FAILED.clone()),
                     "memo": null,
-                    "blockTime": crate::solana::block_time(executed.slot),
+                    "blockTime": executed.time,
                     "confirmationStatus": if finalized(&executed.id) { "finalized" } else { "confirmed" },
                 })).collect::<Vec<_>>())
             }
@@ -3455,6 +3456,12 @@ impl Network {
                 json!(signature)
             }
             "getGenesisHash" => json!(self.nodes[0].genesis.hash()),
+            // The slot's wall-clock time: slots run every 50 ms behind the latest executed one.
+            "getBlockTime" => {
+                let asked = arg(0).as_u64().context("slot")?;
+                anyhow::ensure!(asked <= slot, "Slot {asked} has not executed yet");
+                json!(crate::solana::now() - ((slot - asked) / 20) as i64)
+            }
             "isBlockhashValid" => json!({"context": context, "value": executor.blockhash_known(arg(0).as_str().unwrap_or(""))}),
             // Every slot's merge orders by priority fee, but none is required to land: the floor is 0.
             "getRecentPrioritizationFees" => json!([{"slot": slot, "prioritizationFee": 0}]),

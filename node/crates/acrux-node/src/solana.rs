@@ -16,6 +16,8 @@ const PER_ADDRESS: usize = 1_000;
 pub struct Executed {
     pub id: String,
     pub slot: u64,
+    /// Unix seconds when validator 0 executed the slot: Solana's `blockTime`.
+    pub time: i64,
     pub bytes: Vec<u8>,
     pub fee: u64,
     pub err: Option<String>,
@@ -30,9 +32,9 @@ pub struct SolanaIndex {
     by_address: BTreeMap<String, VecDeque<(u64, String)>>,
 }
 
-/// Seconds the chain's clock gives a slot (`set_slot_clock` in acrux-execution).
-pub fn block_time(slot: u64) -> i64 {
-    1_794_787_200 + (slot / 20) as i64
+/// Unix seconds now.
+pub fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
 impl SolanaIndex {
@@ -123,7 +125,7 @@ pub fn transaction_json(executed: &Executed, encoding: &str) -> Value {
     };
     json!({
         "slot": executed.slot,
-        "blockTime": block_time(executed.slot),
+        "blockTime": executed.time,
         "version": version,
         "transaction": transaction,
         "meta": {

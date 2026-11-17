@@ -144,17 +144,25 @@ impl GatewayState {
 /// Browser origins allowed to call the gateway: `ACRUX_CORS_ORIGINS` (comma separated), by default
 /// the site's local ports.
 fn origins() -> Vec<HeaderValue> {
+    if any_origin() {
+        return vec![];
+    }
     std::env::var("ACRUX_CORS_ORIGINS")
         .unwrap_or_else(|_| "http://127.0.0.1:4910,http://localhost:4910,http://127.0.0.1:4911,http://localhost:4911".into())
         .split(',')
         .map(|s| HeaderValue::from_str(s.trim()).expect("ACRUX_CORS_ORIGINS holds origins"))
         .collect()
 }
+/// `ACRUX_CORS_ORIGINS=*`: every origin, as Solana's public RPCs serve wallets and dapps.
+fn any_origin() -> bool {
+    std::env::var("ACRUX_CORS_ORIGINS").is_ok_and(|v| v.trim() == "*")
+}
 fn valid_origin(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::ORIGIN)
-        .map(|origin| origins().contains(origin))
-        .unwrap_or(true)
+    any_origin()
+        || headers
+            .get(header::ORIGIN)
+            .map(|origin| origins().contains(origin))
+            .unwrap_or(true)
 }
 fn error(code: &str, message: &str) -> Value {
     json!({"error":{"code":code,"message":message,"retryable":(["NET_UNAVAILABLE","NET_STALLED","PROGRAM_UNAVAILABLE"].contains(&code)),"stage":"read"}})
@@ -172,11 +180,11 @@ pub async fn run_gateway(
     metrics_port: u16,
 ) -> Result<()> {
     let cors = CorsLayer::new()
-        .allow_origin(origins())
+        .allow_origin(if any_origin() { tower_http::cors::AllowOrigin::any() } else { tower_http::cors::AllowOrigin::list(origins()) })
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(AllowHeaders::mirror_request());
     let http = Router::new()
-        .route("/", post(rpc).get(upgrade))
+        .route("/", post(rpc).get(upgrade_solana))
         .route("/rpc", post(rpc))
         .route("/health", get(health))
         .layer(DefaultBodyLimit::max(1024 * 1024))
@@ -273,7 +281,7 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
     }
     let params = request.get("params").cloned().unwrap_or(json!({}));
     // Solana's methods take array params; Acrux's take an object. Solana-only methods may omit them.
-    let solana_only = matches!(method, "getHealth" | "getVersion" | "getGenesisHash" | "getFeeForMessage" | "simulateTransaction" | "getRecentPrioritizationFees" | "getBlockHeight" | "getEpochInfo" | "getAccountInfo" | "getMultipleAccounts" | "getProgramAccounts" | "getMinimumBalanceForRentExemption" | "getSignaturesForAddress" | "getVoteAccounts" | "sendTransaction" | "getSignatureStatuses");
+    let solana_only = matches!(method, "getHealth" | "getVersion" | "getGenesisHash" | "getFeeForMessage" | "simulateTransaction" | "getRecentPrioritizationFees" | "getBlockTime" | "getBlockHeight" | "getEpochInfo" | "getAccountInfo" | "getMultipleAccounts" | "getProgramAccounts" | "getMinimumBalanceForRentExemption" | "getSignaturesForAddress" | "getVoteAccounts" | "sendTransaction" | "getSignatureStatuses");
     if params.is_array() || (solana_only && !params.is_object()) || (solana_only && params.as_object().is_some_and(|o| o.is_empty())) {
         let params = if params.is_array() { params } else { json!([]) };
         if !bounded_strings(&params) || params.get(0).and_then(Value::as_array).is_some_and(|keys| keys.len() > 100) {
@@ -771,11 +779,30 @@ fn matches(event: &Value, filter: &Filter) -> bool {
         }
     }
 }
+/// The JSON-RPC port's own socket, where web3.js and wallets look for it (`wss://rpc.<domain>`):
+/// Solana's PubSub alone, with no Acrux snapshot ahead of its replies.
+async fn upgrade_solana(
+    state: State<SharedGateway>,
+    peer: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    open_stream(state, peer, headers, upgrade, false).await
+}
 async fn upgrade(
+    state: State<SharedGateway>,
+    peer: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    open_stream(state, peer, headers, upgrade, true).await
+}
+async fn open_stream(
     State(state): State<SharedGateway>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
+    acrux: bool,
 ) -> Response {
     let limits = crate::limits::limits();
     let Some(permit) = limits.open_socket(limits.client(peer, &headers)) else {
@@ -791,7 +818,7 @@ async fn upgrade(
     upgrade
         .max_message_size(8192)
         .on_upgrade(move |socket| async move {
-            stream(socket, state).await;
+            stream(socket, state, acrux).await;
             drop(permit);
         })
 }
@@ -939,14 +966,16 @@ async fn solana_notifications(state: &SharedGateway, subs: &mut BTreeMap<u64, So
     }
     out
 }
-async fn stream(mut socket: WebSocket, state: SharedGateway) {
+async fn stream(mut socket: WebSocket, state: SharedGateway, acrux: bool) {
     let mut events = state.read().await.events.subscribe();
-    let initial = {
-        let s = state.read().await;
-        s.control("stream.snapshot", s.snapshot())
-    };
-    if !send(&mut socket, initial).await {
-        return;
+    if acrux {
+        let initial = {
+            let s = state.read().await;
+            s.control("stream.snapshot", s.snapshot())
+        };
+        if !send(&mut socket, initial).await {
+            return;
+        }
     }
     let mut filter = Filter::All;
     let mut active = false;
@@ -971,6 +1000,7 @@ async fn stream(mut socket: WebSocket, state: SharedGateway) {
                         if closed { break; }
                         continue;
                     }
+                    if !acrux { continue; }
                     if parsed.get("version").and_then(Value::as_u64)!=Some(1){let event=control(&state,"stream.error",error("INVALID_INPUT","Unknown stream version.")).await;if !send(&mut socket,event).await{break;}continue;}
                     if parsed.get("type").and_then(Value::as_str)==Some("unsubscribe"){active=false;continue;}
                     if parsed.get("type").and_then(Value::as_str)!=Some("subscribe"){continue;}
@@ -995,8 +1025,8 @@ async fn stream(mut socket: WebSocket, state: SharedGateway) {
                     }
                     if closed { break; }
                 }
-                let sequence=event["sequence"].as_u64().unwrap_or(0);if active&&sequence>last_sequence&&matches(&event,&filter){last_sequence=sequence;if !send(&mut socket,event).await{break;}}},Err(broadcast::error::RecvError::Lagged(_))=>{let event={let s=state.read().await;s.control("stream.resync",json!({"reason":"cursor_expired","snapshot":s.snapshot()}))};last_sequence=event["sequence"].as_u64().unwrap_or(last_sequence);if !send(&mut socket,event).await{break;}},Err(_)=>break}},
-            _=heartbeat.tick()=>{if !pong{break;}pong=false;if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),socket.send(WsMessage::Ping(vec![].into()))).await,Ok(Ok(()))){break;}let event={let s=state.read().await;let latest=s.slots.keys().next_back().copied().unwrap_or(0);s.control("stream.heartbeat",json!({"latestSlot":latest,"status":"live"}))};if !send(&mut socket,event).await{break;}},
+                let sequence=event["sequence"].as_u64().unwrap_or(0);if active&&sequence>last_sequence&&matches(&event,&filter){last_sequence=sequence;if !send(&mut socket,event).await{break;}}},Err(broadcast::error::RecvError::Lagged(_)) if !active=>{},Err(broadcast::error::RecvError::Lagged(_))=>{let event={let s=state.read().await;s.control("stream.resync",json!({"reason":"cursor_expired","snapshot":s.snapshot()}))};last_sequence=event["sequence"].as_u64().unwrap_or(last_sequence);if !send(&mut socket,event).await{break;}},Err(_)=>break}},
+            _=heartbeat.tick()=>{if !pong{break;}pong=false;if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),socket.send(WsMessage::Ping(vec![].into()))).await,Ok(Ok(()))){break;}if !acrux{continue;}let event={let s=state.read().await;let latest=s.slots.keys().next_back().copied().unwrap_or(0);s.control("stream.heartbeat",json!({"latestSlot":latest,"status":"live"}))};if !send(&mut socket,event).await{break;}},
         }
     }
 }
