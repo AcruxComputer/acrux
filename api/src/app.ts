@@ -19,6 +19,8 @@ import { readJson, readParam, readQuery } from './engines/server/input.js'
 import { clientIp } from './engines/server/limits.js'
 import { env, faucetSettings, registrySettings, unresolved } from './config.js'
 import { FixtureLab } from './lab.js'
+import { connectDatabase } from './db.js'
+import { emptyBuyback, readBuyback } from './buyback/read.js'
 
 type Scenario = typeof SCENARIOS[number]
 const epochQuery = z.strictObject({ epoch: z.coerce.number().int().nonnegative().optional() })
@@ -26,6 +28,7 @@ const runId = z.string().min(1).max(128)
 
 export function createFixtureApi() {
   const lab = new FixtureLab()
+  const database = env.DATABASE_URL ? connectDatabase(env.DATABASE_URL) : null
   const grants: { address: string; ip: string; at: number }[] = []
   const gateway = createGatewayClient({ rpcUrl: env.GATEWAY_RPC_URL, wsUrl: 'ws://127.0.0.1:4931' })
   const app = createApi<{ scenario: Scenario | null }>({ origins: env.CORS_ORIGINS, contractVersion: CONTRACT_VERSION })
@@ -45,6 +48,12 @@ export function createFixtureApi() {
       missingConfiguration: [...unresolved(registrySettings), ...unresolved(faucetSettings)] })
   })
   app.get('/openapi.json', c => c.json(JSON.parse(readFileSync(fileURLToPath(import.meta.resolve('@acrux/contract/openapi.json')), 'utf8'))))
+  app.get('/v1/buyback', async c => {
+    const settings = { mint: env.ACRUX_MINT, wallet: env.LAUNCH_WALLET }
+    if (!settings.mint) return c.json(emptyBuyback(settings))
+    if (!database) fail('CONFIGURATION_REQUIRED', 'Configure DATABASE_URL before reading buyback history.', { stage: 'read' })
+    return c.json(await readBuyback(database.db, settings))
+  })
   app.get('/v1/hubs', c => {
     const scenario = c.get('scenario')
     const rows = scenario === 'empty' || scenario === 'waiting' ? [] : scenario === 'pending_only' ? hubs.filter(h => h.status === 'pending') : hubs
@@ -174,5 +183,5 @@ export function createFixtureApi() {
       } finally { record.listeners.delete(listener) }
     })
   })
-  return { app, close: () => lab.close() }
+  return { app, close: async () => { lab.close(); await database?.close() } }
 }

@@ -13,19 +13,23 @@ export const env = parseEnv(z.object({
   HOST: z.enum(['127.0.0.1', '0.0.0.0']).default('127.0.0.1'),
   PORT: port(4920),
   DATABASE_URL: z.string().optional(),
+  ACRUX_MINT: z.union([Address, z.literal('')]).default(''),
+  LAUNCH_WALLET: Address.default('G9Hx9dH8tNCKdL1FogM2Qsy493Hp6SrG6re1hxkq5aD6'),
   CORS_ORIGINS: origins.prefault('http://127.0.0.1:4910,http://localhost:4910,http://127.0.0.1:4911,http://localhost:4911'),
   GATEWAY_RPC_URL: httpUrl.default('http://127.0.0.1:4930'),
   /** The node's private port (metrics and the faucet's grant route); never public. */
   GATEWAY_INTERNAL_URL: httpUrl.default('http://127.0.0.1:4989'),
   /** The Solana cluster the Hub Registry lives on (the local validator in development). */
   SOLANA_RPC_URL: httpUrl.default('http://127.0.0.1:4990'),
+  /** Requests a second the site's Solana relay may spend on SOLANA_RPC_URL (its share of the shared key). */
+  SOLANA_RELAY_RPS: z.coerce.number().positive().default(10),
   /** The node binary: Algorithm 3 for the schedule preview and the Fault Lab runner. */
-  ACRUX_BIN: z.string().default(fileURLToPath(new URL('../../node/target/release/acrux', import.meta.url))),
+  ACRUX_BIN: z.string().default(fileURLToPath(new URL('../../node/target/live/acrux.exe', import.meta.url))),
   ACRUX_NODE_DIR: z.string().default(fileURLToPath(new URL('../../node', import.meta.url))),
   ACRUX_GENESIS: z.string().default('../chain/genesis/acrux-net.json'),
   LAB_DIR: z.string().default(fileURLToPath(new URL('../../node/target/lab-runs', import.meta.url))),
   /** Registry poll interval: 2 s against the local validator; 30 s on mainnet keeps the waiting
-   * registry under four calls a minute. */
+   * registry under four calls a minute on the shared Helius key. */
   REGISTRY_POLL_SECONDS: z.coerce.number().positive().default(2),
   /** The cluster of the Solana Hub Registry: the local validator here, mainnet-beta on the host. */
   REGISTRY_CLUSTER: z.enum(['localnet', 'mainnet-beta']).default('localnet'),

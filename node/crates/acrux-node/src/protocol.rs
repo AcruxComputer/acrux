@@ -65,6 +65,8 @@ struct Node {
     executor: Option<SvmExecutor>,
     votor: Votor,
     mempool: BTreeMap<String, ValidatedTx>,
+    /// Transactions this node carried, by id: the slot, its role and the copy, until they execute.
+    in_flight: BTreeMap<String, (u64, usize, ValidatedTx)>,
     fragment_mempool: BTreeMap<(String, u8), crate::threshold::VerifiedFragment>,
     early: BTreeMap<u64, EarlyBlock>,
     threshold: crate::threshold::ThresholdCache,
@@ -162,6 +164,8 @@ pub struct Network {
     handover_samples: Vec<u64>,
     active: Vec<usize>,
     admissions: BTreeMap<String, [u8; 32]>,
+    /// Admission keys by target slot, dropped once their blockhash can no longer be valid.
+    admission_slots: BTreeMap<u64, Vec<String>>,
     progress: Arc<std::sync::Mutex<Progress>>,
     observed_final: Arc<std::sync::Mutex<BTreeSet<u64>>>,
     observed_skip: Arc<std::sync::Mutex<BTreeSet<u64>>>,
@@ -188,6 +192,60 @@ struct FactsCursor {
     spread_index: usize,
     final_index: usize,
     updated: Option<Instant>,
+}
+/// What proposer `q` carries in slot `s`: the transactions and fragments due by `s` whose blockhash
+/// the chain still holds and whose payer can pay this copy's inclusion fee; the rest are dropped,
+/// so no honest block carries what validators would not charge. Each carried transaction stays in
+/// flight until it executes, so one lost with a skipped slot goes out again.
+fn pack(
+    node: &mut Node,
+    s: u64,
+    q: usize,
+    censored: Option<&String>,
+) -> (Vec<ValidatedTx>, Vec<crate::threshold::VerifiedFragment>) {
+    let executor = node.executor.as_ref().unwrap();
+    let due = node
+        .mempool
+        .iter()
+        .filter(|(id, tx)| tx.header.target_slot <= s && Some(*id) != censored)
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    let txs = due
+        .into_iter()
+        .filter_map(|id| node.mempool.remove(&id))
+        .filter(|tx| !executor.is_executed(&tx.header.id) && executor.blockhash_valid(&tx.bytes))
+        .collect::<Vec<_>>();
+    let due = node
+        .fragment_mempool
+        .iter()
+        .filter(|(_, f)| f.header.target_slot <= s)
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    let fragments = due
+        .into_iter()
+        .filter_map(|key| node.fragment_mempool.remove(&key))
+        .collect::<Vec<_>>();
+    let items = txs
+        .iter()
+        .map(|tx| (tx.header.fee_payer.clone(), q as u8, 1u64))
+        .chain(fragments.iter().map(|f| (f.header.fee_payer.clone(), q as u8, 1u64)))
+        .collect::<Vec<_>>();
+    let mut admitted = executor
+        .admit_inclusions(&items, s / 16)
+        .unwrap_or_else(|_| vec![false; items.len()])
+        .into_iter();
+    let txs = txs
+        .into_iter()
+        .filter(|_| admitted.next().unwrap())
+        .collect::<Vec<_>>();
+    let fragments = fragments
+        .into_iter()
+        .filter(|_| admitted.next().unwrap())
+        .collect();
+    for tx in &txs {
+        node.in_flight.insert(tx.header.id.clone(), (s, q, tx.clone()));
+    }
+    (txs, fragments)
 }
 fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>> {
     Ok(bincode::serialize(v)?)
@@ -328,6 +386,7 @@ impl Network {
                 executor: Some(executor),
                 votor,
                 mempool: BTreeMap::new(),
+                in_flight: BTreeMap::new(),
                 fragment_mempool: BTreeMap::new(),
                 early: BTreeMap::new(),
                 threshold: crate::threshold::ThresholdCache::new(config.fragment_expiry_slots)?,
@@ -411,6 +470,7 @@ impl Network {
             handover_samples: vec![],
             active: (0..12).collect(),
             admissions: BTreeMap::new(),
+            admission_slots: BTreeMap::new(),
             progress: Arc::new(std::sync::Mutex::new(Progress::default())),
             observed_final: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             observed_skip: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
@@ -652,6 +712,7 @@ impl Network {
                     handover_samples: vec![],
                     active: vec![id],
                     admissions: BTreeMap::new(),
+            admission_slots: BTreeMap::new(),
                     progress: self.progress.clone(),
                     observed_final: self.observed_final.clone(),
                     observed_skip: self.observed_skip.clone(),
@@ -1029,13 +1090,15 @@ impl Network {
             }
         }
         for id in self.active.clone() {
+            // Validator 0 serves followers through the gateway, so it holds blocks for 256 slots.
+            let held = if id == 0 { 256 } else { 64 };
             let node = &mut self.nodes[id];
             if let Some(last) = node.last_executed {
                 for (slot, local) in node
                     .slots
-                    .range_mut(last.saturating_sub(96)..last.saturating_sub(64))
+                    .range_mut(last.saturating_sub(held + 32)..last.saturating_sub(held))
                 {
-                    if *slot + 64 < last {
+                    if *slot + held < last {
                         local.shreds.clear();
                         local.cipher.clear();
                         local.meta.clear();
@@ -1120,6 +1183,24 @@ impl Network {
         );
         let w = self.window_json(number);
         let mut step = Step::new();
+        // A transaction this node carried two windows ago that has still not executed went down
+        // with a skipped slot: it goes to this window's proposer in the role that carried it.
+        let first = number * 16;
+        let stale = self.nodes[id]
+            .in_flight
+            .iter()
+            .filter(|(_, (slot, _, _))| slot + 32 <= first)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in stale {
+            let (_, role, tx) = self.nodes[id].in_flight.remove(&key).unwrap();
+            let executor = self.nodes[id].executor.as_ref().unwrap();
+            if executor.is_executed(&key) || !executor.blockhash_valid(&tx.bytes) {
+                continue;
+            }
+            let to = vec![self.proposer_ids(number)[role - 1]];
+            step.out.push(Outbox { from: id, to, body: Wire::Submit(tx) });
+        }
         // A proposer of the window before hands on what it did not get to include (its window was
         // skipped, or the transaction arrived late) to the proposer in its role of this window.
         if number > 0 {
@@ -1185,26 +1266,7 @@ impl Network {
             .filter(|f| f.scenario == "censorship" && f.window == s / 16 && f.attacker != q)
             .and_then(|_| self.lab_marked.lock().unwrap().clone());
         let node = &mut self.nodes[id];
-        let ids = node
-            .mempool
-            .iter()
-            .filter(|(tx_id, tx)| tx.header.target_slot <= s && Some(*tx_id) != censored.as_ref())
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        let txs = ids
-            .into_iter()
-            .filter_map(|id| node.mempool.remove(&id))
-            .collect::<Vec<_>>();
-        let fragment_ids = node
-            .fragment_mempool
-            .iter()
-            .filter(|(_, f)| f.header.target_slot <= s)
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        let fragments = fragment_ids
-            .into_iter()
-            .filter_map(|key| node.fragment_mempool.remove(&key))
-            .collect();
+        let (txs, fragments) = pack(node, s, q, censored.as_ref());
         let payload = encode(&BlockPayload {
             transactions: txs,
             fragments,
@@ -1344,26 +1406,7 @@ impl Network {
         let slot = window * 16;
         let key = crypto::fresh_key();
         let node = &mut self.nodes[id];
-        let selected = node
-            .mempool
-            .iter()
-            .filter(|(_, tx)| tx.header.target_slot <= slot)
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        let transactions = selected
-            .into_iter()
-            .filter_map(|id| node.mempool.remove(&id))
-            .collect();
-        let selected = node
-            .fragment_mempool
-            .iter()
-            .filter(|(_, f)| f.header.target_slot <= slot)
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        let fragments = selected
-            .into_iter()
-            .filter_map(|id| node.fragment_mempool.remove(&id))
-            .collect();
+        let (transactions, fragments) = pack(node, slot, q, None);
         let payload = encode(&BlockPayload {
             transactions,
             fragments,
@@ -1537,6 +1580,13 @@ impl Network {
                 ensure!(
                     valid.header == tx.header,
                     "Transaction header differs from signed message"
+                );
+                let target = tx.header.target_slot / 16;
+                let window = self.nodes[id].windows.keys().next_back().copied().unwrap_or(0).max(target);
+                let role = self.proposer_ids(window).iter().position(|x| *x == id).map_or(1, |q| q + 1);
+                ensure!(
+                    self.nodes[id].executor.as_ref().unwrap().can_pay_inclusion(&tx.header.fee_payer, role as u8, window, 1),
+                    "Fee payer cannot pay the inclusion fee"
                 );
                 self.nodes[id].mempool.insert(tx.header.id.clone(), tx);
             }
@@ -2017,7 +2067,7 @@ impl Network {
                             .executor
                             .as_ref()
                             .unwrap()
-                            .validate_transaction(&t.bytes, t.header.target_slot)?;
+                            .check_transaction(&t.bytes, t.header.target_slot)?;
                         ensure!(
                             valid.header == t.header && valid.header.target_slot <= s,
                             "Signed header or target mismatch"
@@ -2107,19 +2157,20 @@ impl Network {
                     .iter()
                     .map(|(q, f)| (f.header.fee_payer.clone(), *q, 1)),
             );
-            if let Err(error) = self.nodes[id]
+            // A copy whose payer can't pay its inclusion fee is dropped by every validator alike.
+            let mut admitted = self.nodes[id]
                 .executor
                 .as_ref()
                 .unwrap()
-                .validate_inclusions(&validation, w)
-            {
-                self.nodes[id].slots.get_mut(&s).unwrap().invalid_reason = Some(error.to_string());
-                break;
-            }
+                .admit_inclusions(&validation, w)?
+                .into_iter();
             let mut items = vec![];
             let mut source: BTreeMap<String, Vec<u8>> = BTreeMap::new();
             for (q, txs) in payloads {
                 for tx in txs {
+                    if !admitted.next().unwrap() {
+                        continue;
+                    }
                     self.nodes[id].executor.as_mut().unwrap().charge_inclusion(
                         &tx.header.fee_payer,
                         q as u8,
@@ -2140,6 +2191,9 @@ impl Network {
             let mut pending_updates = vec![];
             let expired_ids = self.nodes[id].threshold.expire(s);
             for (q, fragment) in fragment_payloads {
+                if !admitted.next().unwrap() {
+                    continue;
+                }
                 self.nodes[id].executor.as_mut().unwrap().charge_inclusion(
                     &fragment.header.fee_payer,
                     q,
@@ -2853,6 +2907,17 @@ impl Network {
             json!({"transactionId":transaction_id,"signature":signature,"balance":{"address":address,"lamports":balance.to_string(),"reserveLamports":self.config.reserve.to_string(),"spendableLamports":balance.saturating_sub(self.config.reserve).to_string(),"slot":self.nodes[0].last_executed.unwrap_or(0)}}),
         )
     }
+    fn prune_admissions(&mut self) {
+        let horizon = self.latest_started().saturating_sub(crate::execution::BLOCKHASH_AGE_SLOTS);
+        while let Some(entry) = self.admission_slots.first_entry() {
+            if *entry.key() >= horizon {
+                break;
+            }
+            for key in entry.remove() {
+                self.admissions.remove(&key);
+            }
+        }
+    }
     fn latest_started(&self) -> u64 {
         let node = &self.nodes[0];
         node.windows.iter().next_back().map_or(0, |(w, run)| {
@@ -2898,18 +2963,24 @@ impl Network {
         let q = fragment.receiver;
         let id = fragment.header.id.clone();
         let key = format!("{id}:{}", fragment.index);
+        self.prune_admissions();
         if self.admissions.contains_key(&key) {
             crate::submission::remember(&mut self.admissions, &key, &raw)?;
             return Ok(json!({"id":id,"accepted":true,"targetSlot":s}));
         }
-        crate::submission::validate_target(self.latest_started(), s)?;
+        let window = crate::submission::validate_target(self.latest_started(), s)?;
+        ensure!(
+            self.nodes[0].executor.as_ref().unwrap().can_pay_inclusion(&fragment.header.fee_payer, q, window, 1),
+            "The fee payer cannot pay the inclusion fee: fund it first"
+        );
         crate::submission::remember(&mut self.admissions, &key, &raw)?;
+        self.admission_slots.entry(s).or_default().push(key);
         self.record_sent(&fragment.header, "fragments", fragment.n, fragment.t)
             .await?;
         let mut step = Step::new();
         step.out.push(Outbox {
             from: 0,
-            to: vec![self.proposer_ids(s / 16)[q as usize - 1]],
+            to: vec![self.proposer_ids(window)[q as usize - 1]],
             body: Wire::SubmitFragment(fragment),
         });
         self.dispatch(0, step).await?;
@@ -2930,27 +3001,43 @@ impl Network {
             .unwrap()
             .validate_transaction(&bytes, s)?;
         let key = valid.header.id.clone();
-        if self.admissions.contains_key(&key) {
-            crate::submission::remember(&mut self.admissions, &key, &params)?;
-            return Ok(json!({"id":key,"accepted":true,"targetSlot":s}));
-        }
-        crate::submission::validate_target(self.latest_started(), s)?;
-        ensure!(
-            serde_json::to_value(&valid.header)? == params["header"],
-            "INVALID_INPUT"
-        );
-        let ids = self.proposer_ids(s / 16);
-        let mut targets = vec![];
+        self.prune_admissions();
+        let mut roles = vec![];
         for q in params["receivers"]
             .as_array()
             .context("Missing receivers")?
         {
             let q = q.as_u64().context("Invalid receiver")? as usize;
             ensure!((1..=3).contains(&q), "Invalid receiver");
-            targets.push(ids[q - 1]);
+            roles.push(q);
         }
+        if self.admissions.contains_key(&key) {
+            crate::submission::remember(&mut self.admissions, &key, &params)?;
+            // An identical retry of a transaction that has not executed goes out again, to the
+            // proposers now due: its first copies may have gone down with a skipped slot.
+            if !self.nodes[0].executor.as_ref().unwrap().is_executed(&key) {
+                let ids = self.proposer_ids((self.latest_started() + 1) / 16);
+                let mut step = Step::new();
+                step.out.push(Outbox { from: 0, to: roles.iter().map(|q| ids[q - 1]).collect(), body: Wire::Submit(valid) });
+                self.dispatch(0, step).await?;
+            }
+            return Ok(json!({"id":key,"accepted":true,"targetSlot":s}));
+        }
+        let window = crate::submission::validate_target(self.latest_started(), s)?;
+        ensure!(
+            serde_json::to_value(&valid.header)? == params["header"],
+            "INVALID_INPUT"
+        );
+        let inclusions = roles.iter().map(|q| (valid.header.fee_payer.clone(), *q as u8, 1u64)).collect::<Vec<_>>();
+        ensure!(
+            self.nodes[0].executor.as_ref().unwrap().admit_inclusions(&inclusions, window)?.iter().all(|ok| *ok),
+            "The fee payer cannot pay the inclusion fee: fund it first"
+        );
+        let ids = self.proposer_ids(window);
+        let targets = roles.iter().map(|q| ids[q - 1]).collect::<Vec<_>>();
         let id = valid.header.id.clone();
         crate::submission::remember(&mut self.admissions, &id, &params)?;
+        self.admission_slots.entry(s).or_default().push(id.clone());
         self.record_sent(&valid.header, "plain", targets.len() as u8, 1)
             .await?;
         let mut step = Step::new();
@@ -3269,6 +3356,7 @@ impl Network {
             "getVoteAccounts" => json!({"current": self.identities.iter().zip(&self.stakes).map(|(identity, stake)| json!({"nodePubkey": identity, "votePubkey": identity, "activatedStake": stake, "epochVoteAccount": true, "commission": 0, "lastVote": slot, "rootSlot": slot})).collect::<Vec<_>>(), "delinquent": []}),
             "sendTransaction" => {
                 let encoded = arg(0).as_str().context("transaction")?.to_owned();
+                anyhow::ensure!(encoded.len() <= 1_684, "Transaction exceeds Solana packet size");
                 let bytes = match arg(1)["encoding"].as_str() {
                     Some("base64") => B64.decode(&encoded)?,
                     _ => bs58::decode(&encoded).into_vec()?,

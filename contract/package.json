@@ -1,6 +1,6 @@
 {
   "name": "@acrux/contract",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "private": true,
   "type": "module",
   "sideEffects": false,
@@ -23,7 +23,8 @@
     "./openapi.json": "./openapi.json"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && node dist/write-openapi.js"
+    "build": "tsc -p tsconfig.json && node dist/write-openapi.js",
+    "pack:local": "node scripts/pack.mjs"
   },
   "dependencies": {
     "zod": "4.6.7"

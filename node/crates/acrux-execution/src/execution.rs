@@ -414,43 +414,62 @@ impl SvmExecutor {
         Ok(())
     }
 
-    pub fn validate_inclusions(&self, items: &[(String, u8, u64)], window: u64) -> Result<()> {
+    /// Which of a slot's included copies are charged, in block order: a copy whose fee payer can't
+    /// pay its inclusion fee, or is past its per-window rate, is dropped, never a reason to reject
+    /// the block. Every validator sees the same state and order, so every one drops the same copies.
+    pub fn admit_inclusions(&self, items: &[(String, u8, u64)], window: u64) -> Result<Vec<bool>> {
         let mut rates = BTreeMap::<(Pubkey, u8), u64>::new();
-        let mut debits = BTreeMap::<Pubkey, u64>::new();
+        let mut balances = BTreeMap::<Pubkey, u64>::new();
+        let mut admitted = Vec::with_capacity(items.len());
         for (payer, proposer, copies) in items {
             let payer = Pubkey::from_str(payer)?;
             if !self.proposers.contains_key(proposer) {
                 bail!("Missing proposer fee recipient");
             }
-            let amount = copies
-                .checked_mul(self.fees.inclusion_lamports)
-                .context("Inclusion fee overflow")?;
+            let amount = copies.saturating_mul(self.fees.inclusion_lamports);
             let rate = rates.entry((payer, *proposer)).or_insert(
-                self.inclusion_used
-                    .get(&(window, payer, *proposer))
-                    .copied()
-                    .unwrap_or(0),
+                self.inclusion_used.get(&(window, payer, *proposer)).copied().unwrap_or(0),
             );
-            *rate = rate
-                .checked_add(amount)
-                .context("Inclusion rate overflow")?;
-            if *rate > self.fees.reserve_lamports / 6 {
-                bail!("Fee-payer inclusion rate exceeds reserve/(2k)");
+            let balance = balances
+                .entry(payer)
+                .or_insert_with(|| self.svm.get_balance(&payer).unwrap_or(0));
+            let ok = rate.saturating_add(amount) <= self.fees.reserve_lamports / 6 && *balance >= amount;
+            if ok {
+                *rate += amount;
+                *balance -= amount;
             }
-            let debit = debits.entry(payer).or_default();
-            *debit = debit
-                .checked_add(amount)
-                .context("Inclusion debit overflow")?;
+            admitted.push(ok);
         }
-        for (payer, debit) in debits {
-            if self.svm.get_balance(&payer).unwrap_or(0) < debit {
-                bail!("Insufficient balance for inclusion fees");
-            }
-        }
-        Ok(())
+        Ok(admitted)
     }
 
+    /// Whether a payer could pay `copies` inclusion fees to `proposer` in `window` now; the
+    /// admission and packing check, the same rule `admit_inclusions` applies.
+    pub fn can_pay_inclusion(&self, payer: &str, proposer: u8, window: u64, copies: u64) -> bool {
+        self.admit_inclusions(&[(payer.to_owned(), proposer, copies)], window)
+            .map_or(false, |admitted| admitted[0])
+    }
+
+    pub fn blockhash_valid(&self, bytes: &[u8]) -> bool {
+        recent_blockhash(bytes).is_some_and(|hash| self.blockhash_slot(&hash).is_some())
+    }
+
+    pub fn is_executed(&self, id: &str) -> bool {
+        self.executed.contains_key(id)
+    }
+
+    /// Admission: the structural check plus a blockhash this chain still holds.
     pub fn validate_transaction(&self, bytes: &[u8], target_slot: u64) -> Result<ValidatedTx> {
+        let valid = self.check_transaction(bytes, target_slot)?;
+        if !self.blockhash_valid(bytes) {
+            bail!("Blockhash not found: fetch a recent one with getLatestBlockhash");
+        }
+        Ok(valid)
+    }
+
+    /// What a block carries must pass: size, signatures, programs and compute budget. Whether the
+    /// blockhash is still valid depends on when the slot executes, so execution decides it.
+    pub fn check_transaction(&self, bytes: &[u8], target_slot: u64) -> Result<ValidatedTx> {
         if bytes.len() > 1232 {
             bail!("Transaction exceeds Solana packet size");
         }
@@ -462,9 +481,6 @@ impl SvmExecutor {
             .deserialize(bytes)
             .context("Invalid Solana transaction bytes")?;
         tx.sanitize().context("Malformed Solana transaction")?;
-        if self.blockhash_slot(tx.message.recent_blockhash()).is_none() {
-            bail!("Blockhash not found: fetch a recent one with getLatestBlockhash");
-        }
         tx.verify_and_hash_message()
             .context("Invalid transaction signature")?;
         if !tx
@@ -538,7 +554,7 @@ impl SvmExecutor {
         for item in items {
             // Recheck signed bytes at the execution boundary; a public header cannot
             // redirect fees or writable-account locks away from the signed message.
-            let checked = self.validate_transaction(
+            let checked = self.check_transaction(
                 &item.transaction.bytes,
                 item.transaction.header.target_slot,
             )?;
@@ -583,8 +599,16 @@ impl SvmExecutor {
             })
             .collect();
         selection::sort_transactions(&mut ordered);
+        let expired: BTreeSet<String> = merged
+            .values()
+            .filter(|item| !self.blockhash_valid(&item.transaction.bytes))
+            .map(|item| item.transaction.header.id.clone())
+            .collect();
         let mut charged_priority = BTreeMap::new();
         let schedule = selection::select_with_fees(&ordered, self.track_capacity_cu, |candidate| {
+            if expired.contains(&candidate.id) {
+                return false;
+            }
             let item = &merged[&candidate.id];
             let amount = priority_fee(candidate.priority_fee_per_cu, candidate.compute_limit);
             let Ok(amount) = amount else {
@@ -601,7 +625,18 @@ impl SvmExecutor {
             charged_priority.insert(candidate.id.clone(), amount);
             true
         });
-        let mut results = Vec::new();
+        let mut results: Vec<ExecutionResult> = expired
+            .iter()
+            .map(|id| ExecutionResult {
+                id: id.clone(),
+                success: false,
+                logs: vec![],
+                compute_units: 0,
+                error: Some("Blockhash expired before the transaction executed".into()),
+                base_fee: 0,
+                priority_fee: 0,
+            })
+            .collect();
         for candidate in &ordered {
             if !schedule.selected_ids.contains(&candidate.id) {
                 continue;
@@ -634,8 +669,8 @@ impl SvmExecutor {
                 .svm
                 .get_account(&payer)
                 .context("Fee payer disappeared")?;
-            // LiteSVM applies Solana's native fees. Reimburse exactly those fees in
-            // the simulation input; NewCon fees above are then charged only once.
+            // LiteSVM charges Solana's per-signature fee and no prioritization fee. Reimburse
+            // exactly that in the simulation input; NewCon fees above are then charged only once.
             let mut simulation_account = real_account.clone();
             let svm_base_fee = item
                 .transaction
@@ -645,7 +680,6 @@ impl SvmExecutor {
             simulation_account.lamports = simulation_account
                 .lamports
                 .checked_add(svm_base_fee)
-                .and_then(|value| value.checked_add(priority_fee))
                 .context("Simulation balance overflow")?;
             self.svm.set_account(payer, simulation_account)?;
             let tx: VersionedTransaction = bincode::deserialize(&item.transaction.bytes)?;
@@ -920,6 +954,88 @@ mod tests {
             .is_err());
         assert_eq!(priority_fee(1, 1).unwrap(), 1);
         assert!(executor.debit(payer, 1_000_000, true).is_err());
+    }
+
+    #[test]
+    fn the_priority_fee_leaves_the_payer_once_and_reaches_the_proposer() {
+        let payer = Keypair::new();
+        let receiver = Pubkey::new_unique();
+        let proposer = Pubkey::new_unique();
+        let mut executor = SvmExecutor::new([(payer.pubkey().to_string(), 10_000_000)], &[]).unwrap();
+        executor.set_proposers(&[(1, proposer.to_string())]).unwrap();
+        // 1,000,000 micro-lamports per CU on 20,000 CU: 20,000 lamports of priority fee.
+        let tx = Transaction::new_signed_with_payer(
+            &[
+                solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(20_000),
+                solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(1_000_000),
+                system_instruction::transfer(&payer.pubkey(), &receiver, 1_000_000),
+            ],
+            Some(&payer.pubkey()),
+            &[&payer],
+            Hash::from_str(&executor.latest_blockhash()).unwrap(),
+        );
+        let validated = executor.validate_transaction(&bincode::serialize(&tx).unwrap(), 0).unwrap();
+        executor.charge_inclusion(&payer.pubkey().to_string(), 1, 0, 1).unwrap();
+        let result = executor
+            .execute_slot(0, vec![ExecutionItem { transaction: validated, source_proposers: vec![1] }])
+            .unwrap();
+        assert!(result.results[0].success, "{:?}", result.results[0]);
+        assert_eq!(result.results[0].priority_fee, 20_000);
+        // 1,000,000 sent, 1,000 inclusion, 5,000 base, 20,000 priority.
+        assert_eq!(executor.balance(&payer.pubkey().to_string()).unwrap(), 10_000_000 - 1_026_000);
+        // The proposer: inclusion 1,000, half the base fee 2,500, the priority fee 20,000.
+        assert_eq!(executor.balance(&proposer.to_string()).unwrap(), 23_500);
+    }
+
+    #[test]
+    fn an_unpayable_copy_is_dropped_and_the_block_stands() {
+        let funded = Pubkey::new_unique();
+        let unfunded = Pubkey::new_unique();
+        let proposer = Pubkey::new_unique();
+        let mut executor = SvmExecutor::new([(funded.to_string(), 2_000_000)], &[]).unwrap();
+        executor.set_proposers(&[(1, proposer.to_string())]).unwrap();
+        let items = [
+            (funded.to_string(), 1, 1),
+            (unfunded.to_string(), 1, 1),
+            (funded.to_string(), 1, 1),
+        ];
+        assert_eq!(executor.admit_inclusions(&items, 0).unwrap(), vec![true, false, true]);
+        assert!(!executor.can_pay_inclusion(&unfunded.to_string(), 1, 0, 1));
+        // Past the per-window rate (reserve/6 = 166 copies) a copy is dropped, not refused.
+        let burst = vec![(funded.to_string(), 1u8, 1u64); 167];
+        let admitted = executor.admit_inclusions(&burst, 0).unwrap();
+        assert_eq!(admitted.iter().filter(|ok| **ok).count(), 166);
+        assert!(!admitted[166]);
+    }
+
+    #[test]
+    fn a_transaction_whose_blockhash_ages_out_fails_without_stopping_the_slot() {
+        let payer = Keypair::new();
+        let proposer = Pubkey::new_unique();
+        let mut executor = SvmExecutor::new([(payer.pubkey().to_string(), 10_000_000)], &[]).unwrap();
+        executor.set_proposers(&[(1, proposer.to_string())]).unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(&payer.pubkey(), &Pubkey::new_unique(), 1_000_000)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            Hash::from_str(&executor.latest_blockhash()).unwrap(),
+        );
+        let bytes = bincode::serialize(&tx).unwrap();
+        let validated = executor.validate_transaction(&bytes, 0).unwrap();
+        for slot in 0..BLOCKHASH_AGE_SLOTS + 2 {
+            executor.execute_slot(slot, vec![]).unwrap();
+        }
+        assert!(executor.validate_transaction(&bytes, 0).is_err());
+        assert!(executor.check_transaction(&bytes, 0).is_ok());
+        let result = executor
+            .execute_slot(
+                BLOCKHASH_AGE_SLOTS + 2,
+                vec![ExecutionItem { transaction: validated, source_proposers: vec![1] }],
+            )
+            .unwrap();
+        assert!(!result.results[0].success);
+        assert_eq!(result.results[0].base_fee + result.results[0].priority_fee, 0);
+        assert_eq!(executor.balance(&payer.pubkey().to_string()).unwrap(), 10_000_000);
     }
 
     #[test]

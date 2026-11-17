@@ -5,11 +5,17 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-/// A new submission targets one of the next 64 slots, never a started slot.
-pub fn validate_target(latest_started: u64, target: u64) -> Result<()> {
-    ensure!(target > latest_started, "TRANSACTION_EXPIRED");
-    ensure!(target - latest_started <= 64, "INVALID_INPUT");
-    Ok(())
+/// How long after its target slot has started a send is still admitted: as long as a fragment can
+/// be handed on to a later window (64 windows).
+pub const LATE_SLOTS: u64 = 1_024;
+
+/// A submission targets a slot up to 64 ahead. One whose target has already started (a client far
+/// from the gateway, a wallet that took its time to sign) is still admitted, and goes to the
+/// proposers now due in the same roles. Returns the window whose proposers receive it.
+pub fn validate_target(latest_started: u64, target: u64) -> Result<u64> {
+    ensure!(target + LATE_SLOTS > latest_started, "TRANSACTION_EXPIRED");
+    ensure!(target <= latest_started + 64, "INVALID_INPUT");
+    Ok(target.max(latest_started + 1) / 16)
 }
 
 /// Returns true on first admission, false for an identical retry.
@@ -57,10 +63,13 @@ mod tests {
 
     #[test]
     fn target_bounds_are_relative_to_the_latest_started_slot() {
-        assert!(validate_target(100, 101).is_ok());
-        assert!(validate_target(100, 164).is_ok());
+        assert_eq!(validate_target(100, 101).unwrap(), 6);
+        assert_eq!(validate_target(100, 164).unwrap(), 10);
+        // A target that started 300 ms before the send arrived goes to the window now due.
+        assert_eq!(validate_target(100, 94).unwrap(), 6);
+        assert_eq!(validate_target(2_000, 977).unwrap(), 125);
         assert_eq!(
-            validate_target(100, 100).unwrap_err().to_string(),
+            validate_target(2_000, 976).unwrap_err().to_string(),
             "TRANSACTION_EXPIRED"
         );
         assert_eq!(

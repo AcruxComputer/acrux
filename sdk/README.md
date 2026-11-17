@@ -5,20 +5,20 @@ Send a transaction into a leaderless Acrux slot from TypeScript. Runs in the bro
 ## Install
 
 ```bash
-npm install https://acrux.computer/downloads/acrux-sdk-0.1.1.tgz
+npm install https://acrux.computer/downloads/acrux-sdk-0.1.2.tgz
 ```
 
-The SDK's contract, `@acrux/contract` 0.1.8, installs with it from https://acrux.computer/downloads/acrux-contract-0.1.8.tgz.
+The SDK's contract, `@acrux/contract` 0.1.10, installs with it from https://acrux.computer/downloads/acrux-contract-0.1.10.tgz.
 
 ## Connect
 
 ```ts
 import { connect } from '@acrux/sdk'
 
-const acrux = connect('http://127.0.0.1:4930')
+const acrux = connect('https://rpc.acrux.computer')
 ```
 
-`connect` takes the gateway's JSON-RPC URL. The event stream is read one port above it; pass `{ wsUrl }` to name another.
+`connect` takes the gateway's JSON-RPC URL. The event stream is read from `events.<domain>` when the URL is `rpc.<domain>` (`wss://events.acrux.computer` for Acrux Net), and one port above it for a node of your own (`http://127.0.0.1:4930` reads `ws://127.0.0.1:4931`); pass `{ wsUrl }` to name another.
 
 ## Send
 
@@ -31,7 +31,7 @@ const { blockhash } = await acrux.latestBlockhash()
 const { id } = await acrux.send(tx)
 ```
 
-`send` targets a slot four slots ahead of the latest started one and returns `{ id, targetSlot }`.
+`send` targets a slot four slots ahead of the latest started one and returns `{ id, targetSlot }`. It reads the net in one round trip before it submits. A send that reaches the gateway after its target slot has started, from far away or after a wallet's approval, is admitted for up to 1,024 slots more and goes to the proposers then due, in the same roles.
 
 ## Threshold sends
 
@@ -49,6 +49,8 @@ const { id } = await acrux.send(tx, { n: 3, t: 2, signer: payer })
 | `send(tx, { n: 3, t: 3, signer })` | three encrypted fragments, readable only from all three |
 
 With `t` of 2 or 3 the fee payer signs the transaction's public header, so `send` takes the fee payer as `signer`: a `Keypair`, or a function `(message: Uint8Array) => Uint8Array | Promise<Uint8Array>` such as a wallet's `signMessage`.
+
+Each fragment is submitted on its own, and one the gateway refuses is submitted once more. `send` returns as soon as `t` fragments are admitted, which is what the transaction needs to execute; follow its `id` from there. It throws only when fewer than `t` were admitted, and then the transaction never executes.
 
 ## Follow a transaction
 
@@ -80,7 +82,8 @@ try {
   await acrux.send(tx, { n: 3, t: 2, signer: payer })
 } catch (error) {
   if (error instanceof AcruxError && error.code === 'TRANSACTION_EXPIRED') {
-    // the target slot started before the gateway admitted the send: sign and send again
+    // the blockhash or the target slot is over a minute old: build the transaction over a new
+    // blockhash, sign it and send it
   }
 }
 ```

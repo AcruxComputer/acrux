@@ -19,10 +19,16 @@ import { connectDatabase } from './db.js'
 import { NodeLab } from './node-lab.js'
 import { RegistryIndexer, acruxStake, hubView, memberView, regionOf, solanaStake, type Chain } from './registry.js'
 import { schedulePreview } from './schedule.js'
+import { readBuyback } from './buyback/read.js'
+import { createRpc } from './engines/rpc/client.js'
+import { rpcRelay } from './engines/rpc/relay.js'
 
 const chainQuery = z.strictObject({ chain: z.enum(['acrux', 'solana']).optional() })
 const epochQuery = z.strictObject({ epoch: z.coerce.number().int().nonnegative().optional(), chain: z.enum(['acrux', 'solana']).optional() })
 const runId = z.string().uuid()
+// What /hubs/register calls on Solana: read the registry and the hub, build, send, and settle by polling.
+const SOLANA_RELAY_METHODS = ['getAccountInfo', 'getMultipleAccounts', 'getBalance', 'getEpochInfo', 'getLatestBlockhash', 'getBlockHeight', 'isBlockhashValid',
+  'getSignatureStatuses', 'getMinimumBalanceForRentExemption', 'getFeeForMessage', 'simulateTransaction', 'sendTransaction'] as const
 const specPath = fileURLToPath(new URL('../../spec/map.json', import.meta.url))
 
 export function createNodeApi() {
@@ -64,6 +70,11 @@ export function createNodeApi() {
     return c.json({ status, contractVersion: CONTRACT_VERSION, missingConfiguration: (['acrux', 'solana'] as const).filter(chain => !registries[chain].state.readAt).map(chain => `Hub Registry on ${chain}`) })
   })
   app.get('/openapi.json', c => c.json(JSON.parse(readFileSync(fileURLToPath(import.meta.resolve('@acrux/contract/openapi.json')), 'utf8'))))
+  // The site's Solana RPC for the mainnet Hub Registry: the keyed URL stays here, and the public
+  // endpoints refuse a browser origin.
+  const solanaRelay = createRpc({ url: env.SOLANA_RPC_URL, service: 'solana-relay', rps: env.SOLANA_RELAY_RPS, scanIntervalMs: 60_000 })
+  app.route('/v1/solana-rpc', rpcRelay({ rpc: solanaRelay, methods: SOLANA_RELAY_METHODS, readsPerMinute: 300, writesPerMinute: 20 }))
+  app.get('/v1/buyback', async c => c.json(await readBuyback(db, { mint: env.ACRUX_MINT, wallet: env.LAUNCH_WALLET })))
 
   // Hubs of both chains, each carrying its chain; `?chain=` narrows to one.
   app.get('/v1/hubs', async c => {

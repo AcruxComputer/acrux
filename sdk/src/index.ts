@@ -8,6 +8,7 @@ export { AcruxError, type ErrorCode } from './errors.js'
 export { seal, open } from './threshold.js'
 export { deriveHeader, headerBytes, type SignedTransaction } from './transaction.js'
 export type { FragmentSubmission, Slot, Transaction, TxHeader } from '@acrux/contract'
+import type { FragmentSubmission } from '@acrux/contract'
 
 /** The fee payer's signer: a `Keypair`, or a function such as a wallet's `signMessage`. */
 export type Signer = { secretKey: Uint8Array } | ((message: Uint8Array) => Uint8Array | Promise<Uint8Array>)
@@ -24,20 +25,28 @@ export type TxUpdate = {
   transaction: Transaction
 }
 
-/** Slots between the latest started slot and the one a send targets. */
+/** Slots between the latest started slot and the one a send targets. A send that arrives after its
+ * target has started (a client far from the gateway, a wallet that took its time to sign) is still
+ * admitted and goes to the proposers then due. */
 const TARGET_LEAD = 4
 const STATES = { sent: 0, partly_included: 1, executed: 2, finalized: 3, failed: 3, expired: 3 } as const
 
 export function connect(rpcUrl: string, options: { wsUrl?: string } = {}) {
   const gateway = createGatewayClient({ rpcUrl, wsUrl: options.wsUrl ?? streamUrl(rpcUrl) })
 
-  async function receivers(targetSlot: number, n: number): Promise<number[]> {
-    const holds = (window: Window) => window.firstSlot <= targetSlot && targetSlot <= window.lastSlot
-    const current = await gateway.call('getCurrentWindow', {})
-    const window = holds(current) ? current : (await gateway.call('getSchedule', { limit: 8 })).find(holds)
+  function receivers(windows: Window[], targetSlot: number, n: number): number[] {
+    const window = windows.find(w => w.firstSlot <= targetSlot && targetSlot <= w.lastSlot)
     if (!window) return [1, 2, 3].slice(0, n)
     const online = window.proposers.filter(p => p.status === 'online')
     return [...online, ...window.proposers.filter(p => !online.includes(p))].slice(0, n).map(p => p.index)
+  }
+
+  /** Every fragment is submitted, a refused one retried once (an identical retry is idempotent). */
+  async function submitFragments(fragments: FragmentSubmission[]) {
+    const submit = (fragment: FragmentSubmission) => gateway.call('submitFragment', fragment).then(() => null, (error: unknown) => error)
+    let failures = await Promise.all(fragments.map(submit))
+    failures = await Promise.all(failures.map((error, i) => (error ? submit(fragments[i]!) : null)))
+    return failures.filter(error => error !== null)
   }
 
   return {
@@ -51,16 +60,23 @@ export function connect(rpcUrl: string, options: { wsUrl?: string } = {}) {
       if (![1, 2, 3].includes(n) || ![1, 2, 3].includes(t) || t > n) throw invalid('Require 1 <= t <= n <= 3.')
       if (t > 1 && !signer) throw invalid('A threshold send needs the fee payer as `signer`.')
       const bytes = transactionBytes(transaction)
-      const latest = (await gateway.call('getRecentSlots', { limit: 1 })).at(-1)
-      const header = deriveHeader(bytes, (latest?.slot ?? 0) + TARGET_LEAD)
-      const to = await receivers(header.targetSlot, n)
+      // Where the net is and who proposes next, in one round trip.
+      const [slots, current, schedule] = await Promise.all([
+        gateway.call('getRecentSlots', { limit: 1 }),
+        gateway.call('getCurrentWindow', {}),
+        gateway.call('getSchedule', { limit: 8 }),
+      ])
+      const header = deriveHeader(bytes, (slots.at(-1)?.slot ?? 0) + TARGET_LEAD)
+      const to = receivers([current, ...schedule], header.targetSlot, n)
 
       if (t === 1) await gateway.call('submitTransaction', { header, transaction: toBase64(bytes), receivers: to })
       else {
         const message = headerBytes(header)
         const signature = typeof signer === 'function' ? await signer(message) : ed25519.sign(message, signer!.secretKey.subarray(0, 32))
         if (!ed25519.verify(signature, message, fromBase58(header.feePayer))) throw invalid('`signer` is not the transaction\'s fee payer.')
-        await Promise.all(seal(bytes, header, signature, t, to).map(fragment => gateway.call('submitFragment', fragment)))
+        const failures = await submitFragments(seal(bytes, header, signature, t, to))
+        // t admitted fragments are enough for the transaction to execute; with fewer it never does.
+        if (n - failures.length < t) throw failures[0]
       }
       return { id: header.id, targetSlot: header.targetSlot }
     },
@@ -121,11 +137,12 @@ export function connect(rpcUrl: string, options: { wsUrl?: string } = {}) {
 
 export type Acrux = ReturnType<typeof connect>
 
-/** The event stream listens one port above JSON-RPC. */
-function streamUrl(rpcUrl: string): string {
+/** The event stream: `events.<domain>` beside `rpc.<domain>` on a public host, one port above JSON-RPC on a node. */
+export function streamUrl(rpcUrl: string): string {
   const url = new URL(rpcUrl)
   const secure = url.protocol === 'https:'
-  url.port = String(Number(url.port || (secure ? 443 : 80)) + 1)
   url.protocol = secure ? 'wss:' : 'ws:'
+  if (url.hostname.startsWith('rpc.')) url.hostname = `events.${url.hostname.slice(4)}`
+  else url.port = String(Number(url.port || (secure ? 443 : 80)) + 1)
   return url.href
 }

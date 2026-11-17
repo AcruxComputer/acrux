@@ -99,6 +99,20 @@ export const LabRun = z.strictObject({ id: z.string(), scenario: LabScenario, se
 export type LabRun = z.infer<typeof LabRun>
 export const LabRuns = page(LabRun)
 export const SpecMap = z.strictObject({ paper: z.string(), parameters: Parameters, entries: z.array(z.strictObject({ reference: z.string(), lines: z.string().nullable(), file: z.string(), function: z.string(), scenario: ScenarioId.nullable(), status: z.enum(['fixture', 'planned', 'implemented']) })), decisions: z.array(z.strictObject({ topic: z.string(), decision: z.string(), status: z.enum(['decided', 'configuration_required', 'fixture_only']) })) })
+/** Buyback amounts are base units. Totals may exceed one transaction's u64 range. */
+export const BuybackAction = z.enum(['claim', 'swap', 'burn'])
+export const BuybackRow = z.strictObject({
+  id: z.string(), cycleId: z.string(), action: BuybackAction, signature: Signature,
+  lamports: U64, tokenAmount: U64, createdAt: Timestamp,
+})
+export const Buyback = z.strictObject({
+  status: z.enum(['waiting', 'live']), mint: Address.nullable(), wallet: Address,
+  totals: z.strictObject({ claimedLamports: BaseUnits, swappedLamports: BaseUnits, acruxBought: BaseUnits, acruxBurned: BaseUnits }),
+  rows: z.array(BuybackRow).max(50),
+})
+export type BuybackAction = z.infer<typeof BuybackAction>
+export type BuybackRow = z.infer<typeof BuybackRow>
+export type Buyback = z.infer<typeof Buyback>
 export const Health = z.strictObject({ status: z.enum(['fixture', 'waiting', 'ready']), contractVersion: z.string(), missingConfiguration: z.array(z.string()) })
 export const SCENARIOS = ['normal', 'empty', 'waiting', 'pending', 'executed', 'finalized', 'skipped', 'sent', 'partly_included', 'failed', 'expired', 'unknown', 'active', 'inactive', 'pending_only', 'queued', 'running', 'done', 'failed_to_start', 'limit_reached', 'unfunded', 'stalled', 'unavailable', 'code_taken', 'crash', 'disagreeing_vectors', 'missing_attestation', 'equivocation', 'majority_lost'] as const
 // Inferred wire types: schema and type share a name without separate interfaces.

@@ -1,6 +1,6 @@
 {
   "name": "@acrux/sdk",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "sideEffects": false,
@@ -25,7 +25,7 @@
     "@noble/ciphers": "2.4.0",
     "@noble/curves": "2.4.0",
     "@noble/hashes": "2.4.0",
-    "@acrux/contract": "https://acrux.computer/downloads/acrux-contract-0.1.8.tgz"
+    "@acrux/contract": "https://acrux.computer/downloads/acrux-contract-0.1.10.tgz"
   },
   "devDependencies": {
     "@solana/web3.js": "1.99.0",

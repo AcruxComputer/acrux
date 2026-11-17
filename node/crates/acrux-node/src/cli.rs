@@ -132,20 +132,31 @@ pub async fn follow(url: &str, genesis: &str) -> Result<()> {
     let mut checked = 0u64;
     loop {
         let slots = rpc(url, "getRecentSlots", json!({"limit": 64})).await?;
-        let mut finalized = slots.as_array().context("slots")?.iter()
+        let top = slots.as_array().context("slots")?.iter()
             .filter(|s| s["slot"].as_u64().is_some_and(|n| n % 4 == 3) && s["cblock"]["status"] == "finalized")
             .filter_map(|s| s["cblock"]["consensusSlot"].as_u64())
             .filter(|c| *c > last)
-            .collect::<Vec<_>>();
-        finalized.sort_unstable();
-        for top in finalized {
-            if top <= last {
-                continue;
+            .max();
+        if let Some(top) = top {
+            // Every slot since the last cblock run, its view and blocks, in pages of 64: a follower
+            // far from the gateway pays a round trip per page, not two per slot.
+            let mut fetched = std::collections::BTreeMap::new();
+            let mut from = last * 4 + 4;
+            while from < top * 4 + 4 {
+                let count = (top * 4 + 4 - from).min(64);
+                let page = rpc(url, "getSlotRange", json!({"from": from, "count": count})).await?;
+                let page = page.as_array().context("slot range")?;
+                ensure!(!page.is_empty(), "slot {from} is not held by the gateway");
+                for entry in page {
+                    fetched.insert(entry["slot"].as_u64().context("slot")?, entry.clone());
+                }
+                from += page.len() as u64;
             }
             // A finalized cblock finalizes its ancestors: execute the chain back to the last one run.
             let mut chain = vec![top];
             loop {
-                let cblock = &rpc(url, "getSlot", json!({"slot": chain.last().unwrap() * 4})).await?["cblock"];
+                let first = chain.last().unwrap() * 4;
+                let cblock = &fetched.get(&first).with_context(|| format!("slot {first} was not fetched"))?["view"]["cblock"];
                 let parent = cblock["parent"]["consensusSlot"].as_u64().context("cblock without a parent")?;
                 if parent == last {
                     break;
@@ -155,20 +166,23 @@ pub async fn follow(url: &str, genesis: &str) -> Result<()> {
             }
             for c in chain.into_iter().rev() {
                 for s in c * 4..c * 4 + 4 {
-                    let view = rpc(url, "getSlot", json!({"slot": s})).await?;
-                    check_slot(&view).with_context(|| format!("slot {s}"))?;
-                    let blocks = rpc(url, "getSlotBlocks", json!({"slot": s})).await?;
+                    let entry = fetched.get(&s).with_context(|| format!("slot {s} was not fetched"))?;
+                    let view = &entry["view"];
+                    check_slot(view).with_context(|| format!("slot {s}"))?;
+                    let blocks = &entry["blocks"];
+                    ensure!(!blocks.is_null(), "slot {s}: the gateway no longer holds its blocks");
                     let recipients = view["window"]["proposers"].as_array().context("proposers")?.iter()
                         .map(|p| (p["index"].as_u64().unwrap() as u8, p["identity"].as_str().unwrap().to_owned())).collect::<Vec<_>>();
-                    let state = replay.apply(s, &recipients, &blocks).with_context(|| format!("re-executing slot {s}"))?;
+                    let state = replay.apply(s, &recipients, blocks).with_context(|| format!("re-executing slot {s}"))?;
                     ensure!(view["stateHash"].as_str() == Some(state.as_str()), "slot {s}: re-executed state {} differs from the net's {}", &state[..12], view["stateHash"]);
                     checked += 1;
                     println!("slot {s} re-executed  agreed {}  state {} matches  checked {checked}", view["agreedSet"], &state[..12]);
                 }
                 last = c;
             }
+        } else {
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -218,7 +232,7 @@ impl Replay {
             let payload: crate::types::BlockPayload = bincode::DefaultOptions::new().with_fixint_encoding().with_limit(1024 * 1024).reject_trailing_bytes().deserialize(&plaintext)?;
             let mut txs = vec![];
             for t in payload.transactions {
-                let valid = self.executor.validate_transaction(&t.bytes, t.header.target_slot)?;
+                let valid = self.executor.check_transaction(&t.bytes, t.header.target_slot)?;
                 ensure!(valid.header == t.header && valid.header.target_slot <= s, "signed header or target mismatch");
                 txs.push(valid);
             }
@@ -231,16 +245,22 @@ impl Replay {
         }
         let mut inclusions = payloads.iter().flat_map(|(q, txs)| txs.iter().map(move |t| (t.header.fee_payer.clone(), *q, 1u64))).collect::<Vec<_>>();
         inclusions.extend(fragments.iter().map(|(q, f)| (f.header.fee_payer.clone(), *q, 1)));
-        self.executor.validate_inclusions(&inclusions, w)?;
+        let mut admitted = self.executor.admit_inclusions(&inclusions, w)?.into_iter();
         let mut items = vec![];
         for (q, txs) in payloads {
             for tx in txs {
+                if !admitted.next().unwrap() {
+                    continue;
+                }
                 self.executor.charge_inclusion(&tx.header.fee_payer, q, w, 1)?;
                 items.push(ExecutionItem { transaction: tx, source_proposers: vec![q] });
             }
         }
         self.threshold.expire(s);
         for (q, fragment) in fragments {
+            if !admitted.next().unwrap() {
+                continue;
+            }
             self.executor.charge_inclusion(&fragment.header.fee_payer, q, w, 1)?;
             let id = fragment.header.id.clone();
             match self.threshold.accept_at(s, 0, q, fragment) {

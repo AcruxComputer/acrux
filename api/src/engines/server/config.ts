@@ -23,8 +23,11 @@ export function parseEnv<S extends z.ZodType>(schema: S, input: Record<string, s
 
 export const port = (fallback: number) => z.coerce.number().int().min(1).max(65535).default(fallback)
 
-/** Loopback by default, since a dev machine may sit on a public address; a container sets its own. */
-export const host = () => z.string().default('127.0.0.1')
+/**
+ * '::' on Railway: dual-stack, so the public edge and the IPv6-only private network both reach the
+ * service. Loopback anywhere else, since a dev machine may sit on a public address.
+ */
+export const host = () => z.string().default(process.env.RAILWAY_ENVIRONMENT_ID ? '::' : '127.0.0.1')
 
 /** A comma list of origins, normalized: a trailing slash would otherwise never match a browser's Origin. */
 export const origins = z.string().transform((value, ctx) => {

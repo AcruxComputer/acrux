@@ -253,6 +253,9 @@ async fn rpc(State(state): State<SharedGateway>, ConnectInfo(peer): ConnectInfo<
     let solana_only = matches!(method, "getHealth" | "getVersion" | "getBlockHeight" | "getEpochInfo" | "getAccountInfo" | "getMultipleAccounts" | "getProgramAccounts" | "getMinimumBalanceForRentExemption" | "getSignaturesForAddress" | "getVoteAccounts" | "sendTransaction" | "getSignatureStatuses");
     if params.is_array() || (solana_only && !params.is_object()) || (solana_only && params.as_object().is_some_and(|o| o.is_empty())) {
         let params = if params.is_array() { params } else { json!([]) };
+        if !bounded_strings(&params) || params.get(0).and_then(Value::as_array).is_some_and(|keys| keys.len() > 100) {
+            return Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": "Invalid params: a string or list is too long."}})).into_response();
+        }
         return match command(&state, |reply| GatewayCommand::Solana { method: method.to_owned(), params, reply }).await {
             Ok(result) => Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response(),
             Err(message) => {
@@ -408,9 +411,28 @@ async fn rpc(State(state): State<SharedGateway>, ConnectInfo(peer): ConnectInfo<
                 }
             }
         }
+        // For followers: up to 64 consecutive slots in one call, each with its view and, once
+        // agreed, its blocks and attestations (null for a skipped slot), so a follower far from
+        // the gateway pays one round trip for many slots.
+        "getSlotRange" => match (params.get("from").and_then(safe_integer), params.get("count").and_then(safe_integer)) {
+            (Some(from), Some(count @ 1..=64)) => {
+                let mut range = vec![];
+                for slot in from..from + count {
+                    let view = {
+                        let gateway = state.read().await;
+                        stored_read(&gateway.slots.get(&slot).cloned(), gateway.store.as_ref(), &format!("slot/{slot}"), "Slot not found.")
+                    };
+                    let Ok(view) = view else { break };
+                    let blocks = command(&state, |reply| GatewayCommand::SlotBlocks { slot, reply }).await.ok();
+                    range.push(json!({"slot": slot, "view": view, "blocks": blocks}));
+                }
+                Ok(json!(range))
+            }
+            _ => Err(("INVALID_INPUT", "from must be a slot and count 1 to 64.")),
+        },
         "getExecutionSnapshot" => command(&state, |reply| GatewayCommand::ExecutionSnapshot { reply }).await.map_err(|_| ("NET_UNAVAILABLE", "No finalized cblock to start from yet.")),
         "getSlotBlocks" => match params.get("slot").and_then(safe_integer) {
-            Some(slot) => command(&state, |reply| GatewayCommand::SlotBlocks { slot, reply }).await.map_err(|_| ("NOT_FOUND", "This slot's blocks are no longer held (the last 64 slots are).")),
+            Some(slot) => command(&state, |reply| GatewayCommand::SlotBlocks { slot, reply }).await.map_err(|_| ("NOT_FOUND", "This slot's blocks are no longer held (the last 256 slots are).")),
             None => Err(("INVALID_INPUT", "slot must be a non-negative safe integer.")),
         },
         "getDemoPool" => command(&state, |reply| GatewayCommand::DemoPool { reply }).await.map_err(|_| ("PROGRAM_UNAVAILABLE", "The demo pool is not in this net's genesis.")),
@@ -480,8 +502,22 @@ fn stored_read(
         None => Err(("NOT_FOUND", missing)),
     }
 }
+/// Base58 decoding is quadratic in its input, so every length is bounded before a decode: an address
+/// is at most 44 characters, a signature 88, a 1,232-byte transaction 1,684.
+const MAX_ADDRESS_CHARS: usize = 44;
+const MAX_SIGNATURE_CHARS: usize = 88;
+const MAX_TRANSACTION_CHARS: usize = 1_684;
+fn bounded_strings(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.len() <= MAX_TRANSACTION_CHARS,
+        Value::Array(values) => values.iter().all(bounded_strings),
+        Value::Object(map) => map.values().all(bounded_strings),
+        _ => true,
+    }
+}
 fn valid_address(address: &str) -> bool {
-    bs58::decode(address)
+    address.len() <= MAX_ADDRESS_CHARS
+        && bs58::decode(address)
         .into_vec()
         .map(|bytes| bytes.len() == 32)
         .unwrap_or(false)
@@ -580,6 +616,7 @@ fn valid_fragment(params: &Value) -> bool {
     params
         .get("headerSignature")
         .and_then(Value::as_str)
+        .filter(|signature| signature.len() <= MAX_SIGNATURE_CHARS)
         .and_then(|signature| bs58::decode(signature).into_vec().ok())
         .is_some_and(|signature| signature.len() == 64)
 }
@@ -810,4 +847,19 @@ async fn metrics(State(state): State<SharedGateway>) -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         output,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_base58_is_refused_before_decoding() {
+        let started = std::time::Instant::now();
+        assert!(!valid_address(&"2".repeat(1024 * 1024)));
+        assert!(!bounded_strings(&json!(["2".repeat(40_000)])));
+        assert!(started.elapsed() < std::time::Duration::from_millis(50), "{:?}", started.elapsed());
+        assert!(valid_address("11111111111111111111111111111111"));
+        assert!(bounded_strings(&json!(["x".repeat(MAX_TRANSACTION_CHARS), {"encoding": "base64"}])));
+    }
 }

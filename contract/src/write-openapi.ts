@@ -5,6 +5,7 @@ import { ProtocolEvent, LabReplay, StreamCommand } from './events.js'
 import { rpcMethods, RpcRequest, RpcFailure } from './rpc.js'
 import { openApiDocument, type Operation } from './openapi.js'
 const operations: Operation[] = [
+  { method:'get', path:'/v1/buyback', operationId:'buyback',summary:'Creator fee buyback totals and recent confirmed actions', response:'Buyback' },
   { method:'get', path:'/health', operationId:'health',summary:'Service and configuration status', response:'Health' },
   { method:'get', path:'/v1/hubs', operationId:'hubs',summary:'Registry hubs',response:'Hubs',query:s.PageQuery },
   { method:'get', path:'/v1/hubs/{code}', operationId:'hub',summary:'Hub and members',response:'Hub',params:{code:'HubCode'} },

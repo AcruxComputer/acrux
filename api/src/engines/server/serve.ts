@@ -7,7 +7,7 @@ import type { Hono } from 'hono'
 import { createShutdown, onShutdownSignals } from './lifecycle.js'
 
 export type ServeOptions = {
-  /** from the PORT variable; never a constant in the start script */
+  /** from the PORT variable Railway injects; never a constant in the start script */
   port: number
   host: string
   /** closes what the runtime opened: loops, leases, the database */

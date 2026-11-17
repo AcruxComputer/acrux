@@ -6,7 +6,7 @@ import { getConnInfo } from '@hono/node-server/conninfo'
 import type { Context, MiddlewareHandler } from 'hono'
 import { fail } from './errors.js'
 
-// A peer on a private or loopback address is a proxy (Caddy in front of the API); its
+// A peer on a private or loopback address is a proxy (Railway's edge, a local Caddy); its
 // X-Forwarded-For is believed. A peer anywhere else is the client itself.
 const PROXIES = new BlockList()
 PROXIES.addSubnet('127.0.0.0', 8)
@@ -23,7 +23,7 @@ export function clientIp(c: Context): string {
   try {
     peer = getConnInfo(c).remote.address
   } catch {
-    // app.request() in tests has no socket
+    // app.request() in tests and rehearsals has no socket
   }
   if (peer?.startsWith('::ffff:')) peer = peer.slice(7)
   if (peer && !PROXIES.check(peer, isIPv6(peer) ? 'ipv6' : 'ipv4')) return peer

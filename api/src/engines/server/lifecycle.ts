@@ -1,5 +1,5 @@
 // Process lifecycle. Building a runtime (database, chain service, indexer) never starts its loops or
-// binds a port, so scripts and tests construct it freely; start() does that. One idempotent
+// binds a port, so scripts and rehearsals construct it freely; start() does that. One idempotent
 // shutdown, shared by signals and in-process tests, aborts the loops and closes what was opened:
 // a worker holding a lease releases it on SIGTERM, so the next deployment takes over at once.
 

@@ -120,7 +120,7 @@ impl FragmentSubmission {
             std::iter::once(&self.header.fee_payer).chain(self.header.writable_accounts.iter())
         {
             ensure!(
-                bs58::decode(address).into_vec()?.len() == 32,
+                address.len() <= 44 && bs58::decode(address).into_vec()?.len() == 32,
                 "Invalid public key"
             );
         }
@@ -128,6 +128,7 @@ impl FragmentSubmission {
             .into_vec()?
             .try_into()
             .map_err(|_| anyhow::anyhow!("Invalid fee payer"))?;
+        ensure!(self.header_signature.len() <= 88, "Invalid header signature");
         let signature = bs58::decode(&self.header_signature).into_vec()?;
         crypto::verify_bytes(
             &VerifyingKey::from_bytes(&payer)?,

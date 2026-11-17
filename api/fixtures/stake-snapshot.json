@@ -1,5 +1,5 @@
 {
-  "description": "Mainnet-shaped stake for the local registry: total active stake near mainnet, the Acrux Net validators at the stakes of large and mid-size mainnet validators. Identities not listed draw a deterministic stake from the same range. Replaced at deploy by an epoch snapshot read from a mainnet RPC.",
+  "description": "Mainnet-shaped stake for the local registry: total active stake near mainnet, the Acrux Net validators at the stakes of large and mid-size mainnet validators. Identities not listed draw a deterministic stake from the same range. Replaced at deploy by an epoch snapshot read through the shared Helius key.",
   "epoch": 0,
   "totalStakeLamports": "400000000000000000",
   "validators": {
