@@ -3,7 +3,7 @@
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "info": {
     "title": "Acrux API",
-    "version": "0.1.10",
+    "version": "0.1.11",
     "description": "Round 1 fixture contract. Amounts are decimal integer strings. Times are relative microseconds with UTC slot wallTime."
   },
   "servers": [
@@ -34277,17 +34277,35 @@
       "getTransaction": {
         "params": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
-          "type": "object",
-          "properties": {
-            "id": {
-              "type": "string",
-              "pattern": "^[a-f0-9]{64}$"
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "signature": {
+                  "type": "string",
+                  "minLength": 64,
+                  "maxLength": 88
+                }
+              },
+              "required": [
+                "signature"
+              ],
+              "additionalProperties": false
             }
-          },
-          "required": [
-            "id"
-          ],
-          "additionalProperties": false
+          ]
         },
         "result": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",

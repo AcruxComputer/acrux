@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { ApiError, Balance, Count, Counters, DemoPool, Facts, FragmentSubmission, NetSnapshot, PlainSubmission, Quote, QuoteRequest, Slot, Submission, Transaction, TxId, Window, Address } from './schemas.js'
 import { LabReplay } from './events.js'
+import { Signature } from './primitives.js'
 const empty = z.strictObject({})
 export const rpcMethods = {
   getSnapshot: { params: empty, result: NetSnapshot },
@@ -9,7 +10,8 @@ export const rpcMethods = {
   getCurrentWindow: { params: empty, result: Window },
   getSchedule: { params: z.strictObject({ limit: Count.min(1).max(64).default(8) }), result: z.array(Window) },
   getCounters: { params: empty, result: Counters },
-  getTransaction: { params: z.strictObject({ id: TxId }), result: Transaction },
+  /** By the transaction's id, or by its Solana signature (the first signature of the signed bytes). */
+  getTransaction: { params: z.union([z.strictObject({ id: TxId }), z.strictObject({ signature: Signature })]), result: Transaction },
   /** Implemented by the Rust node; the unchanged Round 1 fixture gateway has no real blockhash. */
   getLatestBlockhash: { params: empty, result: z.strictObject({ blockhash: Address, slot: Count, startedSlot: Count }) },
   /** Rolling measurements of the live net (the last 10 minutes). */

@@ -73,6 +73,8 @@ pub struct GatewayState {
     /// Same run store as Network; serves records evicted from the recent-memory cache.
     pub store: Option<Store>,
     pub transactions: BTreeMap<String, Value>,
+    /// Solana signatures of executed transactions, to their ids, while the store keeps them.
+    pub signatures: BTreeMap<String, String>,
     pub transactions_by_cblock: BTreeMap<u64, Vec<String>>,
     pub current_window: Value,
     pub upcoming_windows: Vec<Value>,
@@ -94,6 +96,7 @@ impl GatewayState {
             slots: BTreeMap::new(),
             store: None,
             transactions: BTreeMap::new(),
+            signatures: BTreeMap::new(),
             transactions_by_cblock: BTreeMap::new(),
             current_window: Value::Null,
             upcoming_windows: vec![],
@@ -208,10 +211,13 @@ pub async fn run_gateway(
     Ok(())
 }
 
+/// The `@acrux/contract` version whose shapes the gateway answers in.
+pub const CONTRACT_VERSION: &str = "0.1.11";
+
 async fn health(State(state): State<SharedGateway>) -> Json<Value> {
     let state = state.read().await;
     Json(
-        json!({"status":if state.current_window.is_null(){"waiting"}else{"ready"},"contractVersion":"0.1.8","missingConfiguration":[]}),
+        json!({"status":if state.current_window.is_null(){"waiting"}else{"ready"},"contractVersion":CONTRACT_VERSION,"missingConfiguration":[]}),
     )
 }
 async fn rpc(State(state): State<SharedGateway>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: String) -> Response {
@@ -230,6 +236,23 @@ async fn rpc(State(state): State<SharedGateway>, ConnectInfo(peer): ConnectInfo<
                 .into_response()
         }
     };
+    // A batch, as web3.js sends for some calls: each request answered in order, each counted
+    // against the client's limits on its own.
+    if let Some(batch) = request.as_array() {
+        if batch.is_empty() || batch.len() > 100 {
+            return rpc_error(Value::Null, -32600, "INVALID_INPUT", "A batch holds 1 to 100 requests.").into_response();
+        }
+        let mut answers = Vec::with_capacity(batch.len());
+        for one in batch.clone() {
+            let response = Box::pin(rpc_one(state.clone(), client, one)).await;
+            let bytes = axum::body::to_bytes(response.into_body(), 8 << 20).await.unwrap_or_default();
+            answers.push(serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null));
+        }
+        return Json(Value::Array(answers)).into_response();
+    }
+    rpc_one(state, client, request).await
+}
+async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value) -> Response {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
         || !(id.is_string() || safe_integer(&id).is_some())
@@ -250,7 +273,7 @@ async fn rpc(State(state): State<SharedGateway>, ConnectInfo(peer): ConnectInfo<
     }
     let params = request.get("params").cloned().unwrap_or(json!({}));
     // Solana's methods take array params; Acrux's take an object. Solana-only methods may omit them.
-    let solana_only = matches!(method, "getHealth" | "getVersion" | "getBlockHeight" | "getEpochInfo" | "getAccountInfo" | "getMultipleAccounts" | "getProgramAccounts" | "getMinimumBalanceForRentExemption" | "getSignaturesForAddress" | "getVoteAccounts" | "sendTransaction" | "getSignatureStatuses");
+    let solana_only = matches!(method, "getHealth" | "getVersion" | "getGenesisHash" | "getFeeForMessage" | "simulateTransaction" | "getRecentPrioritizationFees" | "getBlockHeight" | "getEpochInfo" | "getAccountInfo" | "getMultipleAccounts" | "getProgramAccounts" | "getMinimumBalanceForRentExemption" | "getSignaturesForAddress" | "getVoteAccounts" | "sendTransaction" | "getSignatureStatuses");
     if params.is_array() || (solana_only && !params.is_object()) || (solana_only && params.as_object().is_some_and(|o| o.is_empty())) {
         let params = if params.is_array() { params } else { json!([]) };
         if !bounded_strings(&params) || params.get(0).and_then(Value::as_array).is_some_and(|keys| keys.len() > 100) {
@@ -311,12 +334,12 @@ async fn rpc(State(state): State<SharedGateway>, ConnectInfo(peer): ConnectInfo<
             }
             None => Err(("INVALID_INPUT", "slot must be a nonnegative safe integer.")),
         },
-        "getTransaction" => match params
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|id| valid_hash(id))
-        {
+        "getTransaction" => match match params.get("signature").and_then(Value::as_str) {
+            Some(signature) if signature.len() <= MAX_SIGNATURE_CHARS => state.read().await.signatures.get(signature).cloned(),
+            _ => params.get("id").and_then(Value::as_str).filter(|id| valid_hash(id)).map(str::to_owned),
+        } {
             Some(tx) => {
+                let tx = tx.as_str();
                 let gateway = state.read().await;
                 stored_read(
                     &gateway.transactions.get(tx).cloned(),
@@ -327,7 +350,7 @@ async fn rpc(State(state): State<SharedGateway>, ConnectInfo(peer): ConnectInfo<
             }
             None => Err((
                 "INVALID_INPUT",
-                "id must be a lowercase 32-byte hexadecimal hash.",
+                "Give id, a lowercase 32-byte hexadecimal hash, or signature, a Solana signature of an executed transaction.",
             )),
         },
         "getLatestBlockhash" => {

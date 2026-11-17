@@ -111,6 +111,13 @@ pub struct ExecutorCheckpoint {
     fees: Fees,
 }
 
+impl ExecutorCheckpoint {
+    /// The state's lattice hash in base58: for the genesis checkpoint, the chain's genesis hash.
+    pub fn hash(&self) -> String {
+        bs58::encode(self.accumulator).into_string()
+    }
+}
+
 /// An executor's state at a cblock, as a follower loads it: every non-executable account, the
 /// replay window and the fee accounting. Program accounts come from the follower's own genesis.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -349,6 +356,52 @@ impl SvmExecutor {
     }
     /// The blockhash clients sign with: eight slots back, so every validator already holds it
     /// however far its execution trails this one's.
+    /// What a message costs on Acrux sent to `copies` proposers: the base fee per signature, the
+    /// priority fee its compute budget sets, and an inclusion fee per copy. None when its blockhash
+    /// is no longer held, as Solana's `getFeeForMessage` answers.
+    pub fn fee_for_message(&self, message: &solana_sdk::message::VersionedMessage, copies: u64) -> Result<Option<u64>> {
+        if self.blockhash_slot(message.recent_blockhash()).is_none() {
+            return Ok(None);
+        }
+        let (limit, price) = compute_budget(message)?;
+        let base = u64::from(message.header().num_required_signatures) * self.fees.base_fee_per_signature;
+        Ok(Some(base + priority_fee(price, limit)? + copies * self.fees.inclusion_lamports))
+    }
+
+    /// Runs a transaction against the current state without keeping anything, the way Solana's
+    /// `simulateTransaction` does: with or without its signatures checked, and with its blockhash
+    /// replaced by the latest one when asked. Returns the error, logs, compute units and the
+    /// blockhash it ran with when replaced.
+    pub fn simulate(&mut self, bytes: &[u8], sig_verify: bool, replace_blockhash: bool) -> Result<Simulation> {
+        use bincode::Options;
+        let mut tx: VersionedTransaction = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(1232)
+            .reject_trailing_bytes()
+            .deserialize(bytes)
+            .context("Invalid Solana transaction bytes")?;
+        let mut replaced = None;
+        if replace_blockhash {
+            let hash = Hash::from_str(&self.latest_blockhash())?;
+            tx.message.set_recent_blockhash(hash);
+            replaced = Some(hash.to_string());
+        } else if self.blockhash_slot(tx.message.recent_blockhash()).is_none() {
+            return Ok(Simulation { err: Some(solana_sdk::transaction::TransactionError::BlockhashNotFound), logs: vec![], units: 0, replaced });
+        }
+        let checked = !sig_verify || replace_blockhash;
+        if checked {
+            self.svm = std::mem::take(&mut self.svm).with_sigverify(false);
+        }
+        let outcome = self.svm.simulate_transaction(tx);
+        if checked {
+            self.svm = std::mem::take(&mut self.svm).with_sigverify(true);
+        }
+        Ok(match outcome {
+            Ok(info) => Simulation { err: None, logs: info.meta.logs, units: info.meta.compute_units_consumed, replaced },
+            Err(failed) => Simulation { err: Some(failed.err), logs: failed.meta.logs, units: failed.meta.compute_units_consumed, replaced },
+        })
+    }
+
     pub fn latest_blockhash(&self) -> String {
         let index = self.recent.len().saturating_sub(9);
         self.recent[index].0.to_string()
@@ -448,6 +501,10 @@ impl SvmExecutor {
     pub fn can_pay_inclusion(&self, payer: &str, proposer: u8, window: u64, copies: u64) -> bool {
         self.admit_inclusions(&[(payer.to_owned(), proposer, copies)], window)
             .map_or(false, |admitted| admitted[0])
+    }
+
+    pub fn blockhash_known(&self, hash: &str) -> bool {
+        Hash::from_str(hash).is_ok_and(|hash| self.blockhash_slot(&hash).is_some())
     }
 
     pub fn blockhash_valid(&self, bytes: &[u8]) -> bool {
@@ -849,6 +906,33 @@ impl Executor for SvmExecutor {
 fn recent_blockhash(bytes: &[u8]) -> Option<Hash> {
     let tx: VersionedTransaction = bincode::deserialize(bytes).ok()?;
     Some(*tx.message.recent_blockhash())
+}
+
+pub struct Simulation {
+    pub err: Option<solana_sdk::transaction::TransactionError>,
+    pub logs: Vec<String>,
+    pub units: u64,
+    pub replaced: Option<String>,
+}
+
+/// A message's compute limit and price per CU, read from its ComputeBudget instructions the way
+/// admission reads them.
+fn compute_budget(message: &solana_sdk::message::VersionedMessage) -> Result<(u64, u64)> {
+    let compute_program = Pubkey::from_str("ComputeBudget111111111111111111111111111111")?;
+    let keys = message.static_account_keys();
+    let (mut limit, mut price, mut normal) = (None, 0u64, 0u64);
+    for ix in message.instructions() {
+        if keys.get(ix.program_id_index as usize) == Some(&compute_program) {
+            match ix.data.as_slice() {
+                [2, rest @ ..] if rest.len() == 4 => limit = Some(u32::from_le_bytes(rest.try_into().unwrap()) as u64),
+                [3, rest @ ..] if rest.len() == 8 => price = u64::from_le_bytes(rest.try_into().unwrap()),
+                _ => {}
+            }
+        } else {
+            normal += 1;
+        }
+    }
+    Ok((limit.unwrap_or((normal * 200_000).min(1_400_000)), price))
 }
 
 pub fn priority_fee(micro_lamports_per_cu: u64, compute_limit: u64) -> Result<u64> {

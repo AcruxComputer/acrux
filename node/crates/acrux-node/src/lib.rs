@@ -30,6 +30,7 @@ pub fn raise_thread_priority() {
 }
 pub mod projection;
 pub mod protocol;
+pub mod solana;
 pub mod storage;
 pub mod types;
 pub mod view;

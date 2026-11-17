@@ -185,6 +185,10 @@ pub struct Network {
     lab_injected: bool,
     /// Solana JSON-RPC: transaction signatures sent through `sendTransaction`, to their ids.
     signature_ids: BTreeMap<String, String>,
+    /// Solana JSON-RPC: every executed transaction by signature, and the signatures by address.
+    solana: crate::solana::SolanaIndex,
+    /// Solana JSON-RPC: what each `sendTransaction` was submitted with, until it executes.
+    solana_sent: BTreeMap<String, Value>,
 }
 #[derive(Default, Clone, Copy)]
 struct FactsCursor {
@@ -485,6 +489,8 @@ impl Network {
             lab_marked: Arc::new(std::sync::Mutex::new(None)),
             lab_injected: false,
             signature_ids: BTreeMap::new(),
+            solana: Default::default(),
+            solana_sent: BTreeMap::new(),
         })
     }
     fn window(&self, number: u64) -> schedule::Window {
@@ -727,6 +733,8 @@ impl Network {
                     lab_marked: self.lab_marked.clone(),
                     lab_injected: false,
                     signature_ids: BTreeMap::new(),
+                    solana: Default::default(),
+                    solana_sent: BTreeMap::new(),
                 }),
                 nodes,
             };
@@ -2288,6 +2296,12 @@ impl Network {
                     crate::threshold::AcceptOutcome::AlreadyDecoded => {}
                 }
             }
+            // Validator 0 keeps each transaction's signed bytes for Solana's view of it.
+            let solana_bytes = if id == 0 {
+                items.iter().map(|item| (item.transaction.header.id.clone(), item.transaction.bytes.clone())).collect::<BTreeMap<_, _>>()
+            } else {
+                BTreeMap::new()
+            };
             let execute_start = Instant::now();
             let mut executor = self.nodes[id].executor.take().unwrap();
             let (returned, result) = tokio::task::spawn_blocking(move || {
@@ -2297,6 +2311,31 @@ impl Network {
             .await?;
             self.nodes[id].executor = Some(returned);
             let execution = result?;
+            for result in execution.results.iter().filter(|_| id == 0) {
+                let Some(bytes) = solana_bytes.get(&result.id) else { continue };
+                let Some(signature) = bincode::deserialize::<solana_sdk::transaction::VersionedTransaction>(bytes).ok().and_then(|tx| tx.signatures.first().map(|s| s.to_string())) else { continue };
+                let copies = source.get(&result.id).map_or(1, |s| s.len() as u64);
+                self.signature_ids.insert(signature.clone(), result.id.clone());
+                self.gateway.write().await.signatures.insert(signature.clone(), result.id.clone());
+                self.solana_sent.remove(&signature);
+                self.solana.record(signature, crate::solana::Executed {
+                    id: result.id.clone(),
+                    slot: s,
+                    bytes: bytes.clone(),
+                    fee: result.base_fee + result.priority_fee + copies * self.config.inclusion_fee,
+                    err: result.error.clone(),
+                    logs: result.logs.clone(),
+                    units: result.compute_units,
+                });
+            }
+            if id == 0 && s % 1_000 == 0 {
+                self.solana.prune(s.saturating_sub(self.config.retain_slots));
+                // A signature still in flight drops out here and comes back when it executes.
+                let solana = &self.solana;
+                self.signature_ids.retain(|signature, _| solana.get(signature).is_some());
+                self.solana_sent.retain(|signature, _| solana.get(signature).is_none());
+                self.gateway.write().await.signatures.retain(|signature, _| solana.get(signature).is_some());
+            }
             self.profile.record(
                 Some(id),
                 "validator.merge_select_execute",
@@ -3352,7 +3391,23 @@ impl Network {
             }
             "getProgramAccounts" => json!(executor.accounts_owned_by(arg(0).as_str().context("program")?)?.into_iter().filter(|(_, a)| a.lamports > 0).map(|(k, a)| json!({"pubkey": k, "account": account_json(&a)})).collect::<Vec<_>>()),
             "getMinimumBalanceForRentExemption" => json!(executor.rent_exempt_minimum(arg(0).as_u64().context("data length")? as usize)),
-            "getSignaturesForAddress" => json!([]),
+            "getSignaturesForAddress" => {
+                let address = arg(0).as_str().context("address")?.to_owned();
+                let address = address.as_str();
+                let config = arg(1);
+                let limit = config["limit"].as_u64().unwrap_or(1_000).min(1_000) as usize;
+                // A transaction the gateway no longer holds in memory was finalized long ago.
+                let gateway = self.gateway.read().await;
+                let finalized = |id: &str| gateway.transactions.get(id).map_or(true, |tx| tx["state"] == "finalized");
+                json!(self.solana.signatures_for(address, limit, config["before"].as_str(), config["until"].as_str()).into_iter().map(|(signature, executed)| json!({
+                    "signature": signature,
+                    "slot": executed.slot,
+                    "err": executed.err.as_ref().map(|_| crate::solana::FAILED.clone()),
+                    "memo": null,
+                    "blockTime": crate::solana::block_time(executed.slot),
+                    "confirmationStatus": if finalized(&executed.id) { "finalized" } else { "confirmed" },
+                })).collect::<Vec<_>>())
+            }
             "getVoteAccounts" => json!({"current": self.identities.iter().zip(&self.stakes).map(|(identity, stake)| json!({"nodePubkey": identity, "votePubkey": identity, "activatedStake": stake, "epochVoteAccount": true, "commission": 0, "lastVote": slot, "rootSlot": slot})).collect::<Vec<_>>(), "delinquent": []}),
             "sendTransaction" => {
                 let encoded = arg(0).as_str().context("transaction")?.to_owned();
@@ -3363,15 +3418,76 @@ impl Network {
                 };
                 let tx: solana_sdk::transaction::VersionedTransaction = bincode::deserialize(&bytes)?;
                 let signature = tx.signatures.first().context("unsigned transaction")?.to_string();
+                // A resend answers the signature, as Solana does; one that has not executed yet goes
+                // out again exactly as it was first submitted.
+                if self.solana.get(&signature).is_some() {
+                    return Ok(json!(signature));
+                }
+                if let Some(params) = self.solana_sent.get(&signature).cloned() {
+                    self.submit(params).await?;
+                    return Ok(json!(signature));
+                }
                 let target = self.latest_started() + 3;
                 let valid = executor.validate_transaction(&bytes, target).map_err(|e| anyhow::anyhow!("Transaction simulation failed: {e}"))?;
-                self.submit(json!({"header": valid.header, "transaction": B64.encode(&bytes), "receivers": [1, 2, 3]})).await?;
-                self.signature_ids.insert(signature.clone(), valid.header.id.clone());
-                if self.signature_ids.len() > 100_000 {
-                    let first = self.signature_ids.keys().next().cloned().unwrap();
-                    self.signature_ids.remove(&first);
+                if arg(1)["skipPreflight"] != json!(true) {
+                    let simulated = self.nodes[0].executor.as_mut().unwrap().simulate(&bytes, true, false)?;
+                    if let Some(err) = simulated.err {
+                        anyhow::bail!("Transaction simulation failed: {err}. {}", simulated.logs.join(" "));
+                    }
                 }
+                let params = json!({"header": valid.header, "transaction": B64.encode(&bytes), "receivers": [1, 2, 3]});
+                self.submit(params.clone()).await?;
+                self.signature_ids.insert(signature.clone(), valid.header.id.clone());
+                self.solana_sent.insert(signature.clone(), params);
                 json!(signature)
+            }
+            "getGenesisHash" => json!(self.nodes[0].genesis.hash()),
+            "isBlockhashValid" => json!({"context": context, "value": executor.blockhash_known(arg(0).as_str().unwrap_or(""))}),
+            // Every slot's merge orders by priority fee, but none is required to land: the floor is 0.
+            "getRecentPrioritizationFees" => json!([{"slot": slot, "prioritizationFee": 0}]),
+            "getFeeForMessage" => {
+                let encoded = arg(0).as_str().context("message")?.to_owned();
+                anyhow::ensure!(encoded.len() <= 1_684, "Message exceeds Solana packet size");
+                let message: solana_sdk::message::VersionedMessage = bincode::deserialize(&B64.decode(encoded)?).context("Invalid message")?;
+                // sendTransaction sends to all three of the target slot's proposers.
+                json!({"context": context, "value": executor.fee_for_message(&message, 3)?})
+            }
+            "simulateTransaction" => {
+                let encoded = arg(0).as_str().context("transaction")?.to_owned();
+                anyhow::ensure!(encoded.len() <= 1_684, "Transaction exceeds Solana packet size");
+                let config = arg(1);
+                let bytes = match config["encoding"].as_str() {
+                    Some("base64") => B64.decode(&encoded)?,
+                    _ => bs58::decode(&encoded).into_vec()?,
+                };
+                let replace = config["replaceRecentBlockhash"] == json!(true);
+                let sim = self.nodes[0].executor.as_mut().unwrap().simulate(&bytes, config["sigVerify"] == json!(true), replace)?;
+                json!({"context": context, "value": {
+                    "err": sim.err.map(|e| serde_json::to_value(e).unwrap()), "logs": sim.logs, "accounts": null, "unitsConsumed": sim.units, "returnData": null,
+                    "innerInstructions": null,
+                    "replacementBlockhash": sim.replaced.map(|hash| json!({"blockhash": hash, "lastValidBlockHeight": slot + crate::execution::BLOCKHASH_AGE_SLOTS - 8})),
+                }})
+            }
+            "getTransaction" => {
+                let signature = arg(0).as_str().context("signature")?.to_owned();
+                let signature = signature.as_str();
+                let config = arg(1);
+                let encoding = config.as_str().or(config["encoding"].as_str()).unwrap_or("json");
+                let confirmed = config["commitment"] == json!("confirmed") || config["commitment"] == json!("processed");
+                match self.solana.get(signature) {
+                    Some(executed) => {
+                        let state = match self.gateway.read().await.transactions.get(&executed.id) {
+                            Some(tx) => tx["state"].as_str().map(str::to_owned),
+                            None => self.store.get(&format!("transaction/{}", executed.id))?.and_then(|tx: Value| tx["state"].as_str().map(str::to_owned)),
+                        };
+                        if confirmed || state.as_deref() == Some("finalized") {
+                            crate::solana::transaction_json(executed, encoding)
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    None => Value::Null,
+                }
             }
             "getSignatureStatuses" => {
                 let mut statuses = vec![];
@@ -3388,7 +3504,8 @@ impl Network {
                         Some(state @ ("executed" | "finalized" | "failed")) => json!({
                             "slot": record.as_ref().unwrap()["executedSlot"],
                             "confirmations": if state == "finalized" { Value::Null } else { json!(0) },
-                            "err": if record.as_ref().unwrap()["result"] == "success" { Value::Null } else { json!({"InstructionError": [0, {"Custom": 0}], "message": record.as_ref().unwrap()["failure"]}) },
+                            "err": if record.as_ref().unwrap()["result"] == "success" { Value::Null } else { crate::solana::FAILED.clone() },
+                            "status": if record.as_ref().unwrap()["result"] == "success" { json!({"Ok": null}) } else { json!({"Err": *crate::solana::FAILED}) },
                             "confirmationStatus": if state == "finalized" { "finalized" } else { "confirmed" },
                         }),
                         _ => Value::Null,
