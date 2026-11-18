@@ -368,4 +368,4 @@ mod tests {
         let expect = &anchor_lang::solana_program::hash::hash(b"global:deposit").to_bytes()[..8];
         assert_eq!(d, expect);
     }
-      }
+}
