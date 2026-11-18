@@ -60,10 +60,45 @@ pub struct Envelope {
     pub body: Wire,
     pub signature: Vec<u8>,
 }
+/// What a proposer's block carries. From the bridge's first slot it also carries bridge credits;
+/// blocks before it were encoded without them (`LegacyBlockPayload`), and `BlockPayload::decode`
+/// reads both.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockPayload {
     pub transactions: Vec<ValidatedTx>,
     pub fragments: Vec<crate::threshold::VerifiedFragment>,
+    pub credits: Vec<crate::execution::BridgeCredit>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LegacyBlockPayload {
+    pub transactions: Vec<ValidatedTx>,
+    pub fragments: Vec<crate::threshold::VerifiedFragment>,
+}
+
+impl BlockPayload {
+    fn options() -> impl bincode::Options {
+        use bincode::Options;
+        bincode::DefaultOptions::new().with_fixint_encoding().with_limit(1024 * 1024).reject_trailing_bytes()
+    }
+    /// Encodes the payload, without the credits field before the bridge's first slot.
+    pub fn encode(&self, with_credits: bool) -> anyhow::Result<Vec<u8>> {
+        use bincode::Options;
+        Ok(if with_credits {
+            Self::options().serialize(self)?
+        } else {
+            Self::options().serialize(&LegacyBlockPayload { transactions: self.transactions.clone(), fragments: self.fragments.clone() })?
+        })
+    }
+    pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        use bincode::Options;
+        match Self::options().deserialize::<Self>(bytes) {
+            Ok(payload) => Ok(payload),
+            Err(_) => {
+                let legacy: LegacyBlockPayload = Self::options().deserialize(bytes)?;
+                Ok(Self { transactions: legacy.transactions, fragments: legacy.fragments, credits: vec![] })
+            }
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockCommitment {

@@ -170,6 +170,8 @@ pub struct Network {
     observed_final: Arc<std::sync::Mutex<BTreeSet<u64>>>,
     /// Finalization events waiting for their cblock's state to reach the disk (`state::durable`).
     held_finals: Vec<Telemetry>,
+    /// Finalized Solana bridge deposits by sequence, as the deposit reader found them.
+    bridge_deposits: Arc<std::sync::Mutex<BTreeMap<u64, crate::execution::BridgeCredit>>>,
     /// Solana's `getRecentPerformanceSamples`: one sample a minute of the slots and transactions
     /// validator 0 executed, newest last, at most 720 (twelve hours).
     performance: VecDeque<Value>,
@@ -465,6 +467,9 @@ impl Network {
                     votor.resume(block);
                     let mut executor = SvmExecutor::from_state(&programs, saved.state.clone())?;
                     executor.set_placements(genesis.iter().flat_map(|g| g.placements.clone()).collect());
+                    if let Some(bridge) = genesis.as_ref().and_then(|g| g.bridge.as_ref()) {
+                        executor.set_bridge(bridge.program);
+                    }
                     anyhow::ensure!(executor.state_hash() == saved.state.state_hash, "the saved state at cblock {} hashes to {}, not to its saved hash {}", block.slot, executor.state_hash(), saved.state.state_hash);
                     executor
                 }
@@ -472,6 +477,9 @@ impl Network {
                     votor.genesis();
                     let mut executor = SvmExecutor::new(balances.clone(), &programs)?;
                     executor.set_placements(genesis.iter().flat_map(|g| g.placements.clone()).collect());
+                    if let Some(bridge) = genesis.as_ref().and_then(|g| g.bridge.as_ref()) {
+                        executor.set_bridge(bridge.program);
+                    }
                     executor.set_fees(crate::execution::Fees {
                         reserve_lamports: config.reserve,
                         inclusion_lamports: config.inclusion_fee,
@@ -579,6 +587,10 @@ impl Network {
         let observer = crate::observer::Observer::start(
             gateway.clone(), persistence.clone(), identities.clone(), exchange.clone(), profile.clone(),
         );
+        let bridge_deposits = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        if let (Some(bridge), Ok(url)) = (genesis.as_ref().and_then(|g| g.bridge.clone()), std::env::var("ACRUX_BRIDGE_RPC")) {
+            tokio::spawn(crate::bridge::read_deposits(url, bridge.program, bridge_deposits.clone()));
+        }
         Ok(Self {
             config,
             profile,
@@ -615,6 +627,7 @@ impl Network {
             progress: Arc::new(std::sync::Mutex::new(Progress::default())),
             observed_final: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             held_finals: Vec::new(),
+            bridge_deposits: bridge_deposits.clone(),
             performance: VecDeque::new(),
             performance_mark: (Instant::now(), 0, 0),
             executed_count: (0, 0),
@@ -652,6 +665,18 @@ impl Network {
             .iter()
             .map(|a| self.identities.iter().position(|x| x == a).unwrap())
             .collect()
+    }
+    /// Whether slot `s`'s blocks may carry bridge credits.
+    fn bridge_open(&self, s: u64) -> bool {
+        self.genesis.as_ref().and_then(|g| g.bridge.as_ref()).is_some_and(|b| s >= b.from_slot)
+    }
+    /// The finalized deposits validator `id` has not credited yet, in sequence, a few a block.
+    fn credits_due(&self, id: usize, s: u64) -> Vec<crate::execution::BridgeCredit> {
+        if !self.bridge_open(s) {
+            return vec![];
+        }
+        let next = self.nodes[id].executor.as_ref().unwrap().next_credit();
+        self.bridge_deposits.lock().unwrap().range(next..).take(16).map(|(_, c)| c.clone()).collect()
     }
     fn window_json(&self, number: u64) -> Value {
         view::window_json(
@@ -870,6 +895,7 @@ impl Network {
                     progress: self.progress.clone(),
                     observed_final: self.observed_final.clone(),
                     held_finals: Vec::new(),
+                    bridge_deposits: self.bridge_deposits.clone(),
                     performance: VecDeque::new(),
                     performance_mark: (Instant::now(), 0, 0),
                     executed_count: (0, 0),
@@ -1507,10 +1533,9 @@ impl Network {
             .and_then(|_| self.lab_marked.lock().unwrap().clone());
         let node = &mut self.nodes[id];
         let (txs, fragments) = pack(node, s, q, censored.as_ref());
-        let payload = encode(&BlockPayload {
-            transactions: txs,
-            fragments,
-        })?;
+        let credits = self.credits_due(id, s);
+        let payload = BlockPayload { transactions: txs, fragments, credits }.encode(self.bridge_open(s))?;
+        let node = &mut self.nodes[id];
         ensure!(
             payload.len() <= 1024 * 1024,
             "Proposer block exceeds local size limit"
@@ -1647,10 +1672,8 @@ impl Network {
         let key = crypto::fresh_key();
         let node = &mut self.nodes[id];
         let (transactions, fragments) = pack(node, slot, q, None);
-        let payload = encode(&BlockPayload {
-            transactions,
-            fragments,
-        })?;
+        let credits = self.credits_due(id, slot);
+        let payload = BlockPayload { transactions, fragments, credits }.encode(self.bridge_open(slot))?;
         ensure!(
             payload.len() <= 1024 * 1024,
             "Proposer block exceeds local size limit"
@@ -2237,6 +2260,9 @@ impl Network {
             }
             let mut payloads = vec![];
             let mut fragment_payloads = vec![];
+            let mut slot_credits: Vec<crate::execution::BridgeCredit> = vec![];
+            let bridge_open = self.bridge_open(s);
+            let deposits = self.bridge_deposits.lock().unwrap().clone();
             let mut parents = vec![];
             let mut complete = true;
             let mut invalid_reason = None;
@@ -2301,7 +2327,12 @@ impl Network {
                     break;
                 }
                 let checked = (|| -> Result<_> {
-                    let mut block: BlockPayload = decode(&plaintext)?;
+                    let mut block = BlockPayload::decode(&plaintext)?;
+                    // Every credit is a finalized deposit, from the bridge's first slot on.
+                    ensure!(block.credits.is_empty() || bridge_open, "Bridge credit before the bridge's first slot");
+                    for credit in &block.credits {
+                        ensure!(deposits.get(&credit.sequence) == Some(credit), "Bridge credit with no finalized deposit");
+                    }
                     for t in &mut block.transactions {
                         let valid = self.nodes[id]
                             .executor
@@ -2322,10 +2353,13 @@ impl Network {
                         );
                         fragment_payloads.push((*q as u8, fragment));
                     }
-                    Ok(block.transactions)
+                    Ok((block.transactions, block.credits))
                 })();
                 match checked {
-                    Ok(transactions) => payloads.push((*q, transactions)),
+                    Ok((transactions, credits)) => {
+                        payloads.push((*q, transactions));
+                        slot_credits.extend(credits);
+                    }
                     Err(error) => {
                         invalid_reason = Some(error.to_string());
                         complete = false;
@@ -2536,6 +2570,9 @@ impl Network {
             };
             let execute_start = Instant::now();
             let mut executor = self.nodes[id].executor.take().unwrap();
+            slot_credits.sort_by_key(|c| c.sequence);
+            slot_credits.dedup_by_key(|c| c.sequence);
+            executor.set_credits(slot_credits);
             let (returned, result) = tokio::task::spawn_blocking(move || {
                 let result = executor.execute_slot(s, items);
                 (executor, result)

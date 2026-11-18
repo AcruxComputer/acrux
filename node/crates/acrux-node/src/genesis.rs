@@ -74,6 +74,8 @@ pub struct Genesis {
     faucet_token_accounts: Vec<String>,
     /// Programs placed at their mainnet addresses from a named slot (`chain/placements/`).
     pub placements: Vec<crate::execution::Placement>,
+    /// The bridge from Solana, when the chain credits its deposits (`chain/bridge.json`).
+    pub bridge: Option<BridgeConfig>,
 }
 
 #[derive(Deserialize)]
@@ -89,6 +91,29 @@ struct ManifestEntry {
 struct PlacementFile {
     name: String,
     accounts: Vec<AccountEntry>,
+}
+
+/// The bridge's rule: the Solana program whose deposits Acrux credits, and the first Acrux slot
+/// whose blocks may carry credits.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeConfig {
+    #[serde(deserialize_with = "pubkey")]
+    pub program: Pubkey,
+    pub from_slot: u64,
+}
+fn pubkey<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Pubkey, D::Error> {
+    let s = String::deserialize(d)?;
+    Pubkey::from_str(&s).map_err(serde::de::Error::custom)
+}
+
+/// `chain/bridge.json` beside the genesis, or the file `ACRUX_BRIDGE` names; none without one.
+fn bridge(chain: &Path) -> Result<Option<BridgeConfig>> {
+    let path = std::env::var("ACRUX_BRIDGE").map(PathBuf::from).unwrap_or_else(|_| chain.join("bridge.json"));
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("Read {}", path.display()))?)?))
 }
 
 /// The placements the chain applies: `chain/placements/placements.json` beside the genesis, or the
@@ -137,6 +162,7 @@ impl Genesis {
             faucet,
             faucet_token_accounts: file.faucet.token_accounts,
             placements: placements(chain)?,
+            bridge: bridge(chain)?,
         })
     }
 

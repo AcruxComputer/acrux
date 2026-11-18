@@ -127,6 +127,9 @@ pub async fn follow(url: &str, genesis: &str) -> Result<()> {
         .collect::<Vec<_>>();
     let mut executor = crate::execution::SvmExecutor::new(Vec::<(String, u64)>::new(), &programs)?;
     executor.set_placements(genesis.placements.clone());
+    if let Some(bridge) = &genesis.bridge {
+        executor.set_bridge(bridge.program);
+    }
     let state: crate::execution::ExecutorSnapshot = serde_json::from_value(snapshot["executor"].clone())?;
     let start_hash = state.state_hash.clone();
     executor.load(state)?;
@@ -203,7 +206,6 @@ impl Replay {
     fn apply(&mut self, s: u64, recipients: &[(u8, String)], blocks: &Value) -> Result<String> {
         use crate::execution::ExecutionItem;
         use crate::threshold::AcceptOutcome;
-        use bincode::Options;
         let w = s / 16;
         if self.window != Some(w) {
             self.executor.set_proposers(recipients)?;
@@ -215,6 +217,7 @@ impl Replay {
             .collect::<Result<Vec<_>>>()?;
         let mut payloads = vec![];
         let mut fragments = vec![];
+        let mut credits: Vec<crate::execution::BridgeCredit> = vec![];
         for block in blocks["blocks"].as_array().context("blocks")? {
             let q = block["proposer"].as_u64().context("proposer")? as usize;
             let key: [u8; 32] = B64.decode(attestations.iter().find(|a| a["proposer"] == q).context("no attestation from an agreed proposer")?["key"].as_str().context("key")?)?
@@ -235,7 +238,9 @@ impl Replay {
             let parent = last.0.parent.map(|(slot, hash)| crate::consensus::BlockRef { slot, hash });
             let commitment = crypto::hash(&bincode::serialize(&crate::types::BlockCommitment { slot: s, proposer: q, key_hash: last.0.key_hash, parent, roots })?);
             ensure!(pi.get(q - 1).copied().flatten() == Some(commitment), "block {q} does not match its attested commitment");
-            let payload: crate::types::BlockPayload = bincode::DefaultOptions::new().with_fixint_encoding().with_limit(1024 * 1024).reject_trailing_bytes().deserialize(&plaintext)?;
+            let payload = crate::types::BlockPayload::decode(&plaintext)?;
+            // Bridge credits ride in certified blocks; the follower applies them as the net did.
+            credits.extend(payload.credits);
             let mut txs = vec![];
             for t in payload.transactions {
                 let valid = self.executor.check_transaction(&t.bytes, t.header.target_slot)?;
@@ -283,6 +288,9 @@ impl Replay {
                 Ok(_) => {}
             }
         }
+        credits.sort_by_key(|c| c.sequence);
+        credits.dedup_by_key(|c| c.sequence);
+        self.executor.set_credits(credits);
         Ok(self.executor.execute_slot(s, items)?.state_hash)
     }
 }

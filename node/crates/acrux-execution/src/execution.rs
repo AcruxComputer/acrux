@@ -107,6 +107,32 @@ pub struct GenesisProgram {
     pub path: PathBuf,
 }
 
+/// A deposit on the Solana bridge, credited on Acrux: the bridge's sequence number, the Solana mint
+/// and its decimals, the Acrux recipient and the amount the vault received. Carried in a proposer's
+/// block once the deposit is finalized on Solana; every validator checks it against the deposit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeCredit {
+    pub sequence: u64,
+    pub solana_mint: String,
+    pub decimals: u8,
+    pub recipient: String,
+    pub amount: u64,
+}
+
+/// Where the bridge's tokens live on Acrux, all derived from the Solana bridge program's address:
+/// a mint per Solana mint at `["mint", solana mint]`, minted by `["authority"]`, and the next
+/// sequence to credit in the account at `["credited"]`, so it is part of the state.
+pub fn bridge_mint(bridge: &Pubkey, solana_mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"mint", solana_mint.as_ref()], bridge).0
+}
+fn bridge_authority(bridge: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"authority"], bridge).0
+}
+fn bridge_counter(bridge: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"credited"], bridge).0
+}
+
 /// A program Solana runs at a fixed address, placed at the same address on Acrux from a named slot,
 /// the way Solana adds programs at fixed addresses: its accounts (program data first, the program
 /// last) are written into the state before the first slot executed at or after `slot`.
@@ -195,6 +221,10 @@ pub struct SvmExecutor {
     track_capacity_cu: u64,
     /// The placements, each with the digest its program account has once placed.
     placements: Vec<(Placement, [u8; 32])>,
+    /// The Solana bridge program's address, when the chain credits its deposits.
+    bridge: Option<Pubkey>,
+    /// The credits the next executed slot applies, before its transactions.
+    credits: Vec<BridgeCredit>,
 }
 
 impl SvmExecutor {
@@ -381,6 +411,8 @@ impl SvmExecutor {
             fees: Fees::default(),
             track_capacity_cu: selection::TRACK_CAPACITY_CU,
             placements: vec![],
+            bridge: None,
+            credits: vec![],
         };
         for program in [
             "ComputeBudget111111111111111111111111111111",
@@ -728,9 +760,72 @@ impl SvmExecutor {
         Ok(())
     }
 
+    pub fn set_bridge(&mut self, bridge: Pubkey) {
+        self.bridge = Some(bridge);
+    }
+
+    /// The next bridge sequence to credit: what the counter account holds, 0 before the first.
+    pub fn next_credit(&self) -> u64 {
+        self.bridge
+            .and_then(|b| self.svm.get_account(&bridge_counter(&b)))
+            .and_then(|a| a.data.get(..8).map(|d| u64::from_le_bytes(d.try_into().unwrap())))
+            .unwrap_or(0)
+    }
+
+    /// The credits the next executed slot applies.
+    pub fn set_credits(&mut self, credits: Vec<BridgeCredit>) {
+        self.credits = credits;
+    }
+
+    /// Applies the queued credits in sequence: each mints its amount of the bridged token to the
+    /// recipient's associated token account (both created on the first credit that needs them).
+    /// A sequence already credited is passed over; one past a gap waits for the gap.
+    fn apply_credits(&mut self) -> Result<()> {
+        let mut credits = std::mem::take(&mut self.credits);
+        credits.sort_by_key(|c| c.sequence);
+        let Some(bridge) = self.bridge else { return Ok(()) };
+        let token = spl_token_id();
+        for credit in credits {
+            let next = self.next_credit();
+            if credit.sequence != next {
+                continue;
+            }
+            let mint = bridge_mint(&bridge, &Pubkey::from_str(&credit.solana_mint)?);
+            let recipient = Pubkey::from_str(&credit.recipient)?;
+            // The mint: SPL Token layout, the bridge's authority minting, no freeze authority.
+            let mut mint_account = self.svm.get_account(&mint).unwrap_or_else(|| {
+                let mut data = vec![0u8; 82];
+                data[..4].copy_from_slice(&1u32.to_le_bytes());
+                data[4..36].copy_from_slice(bridge_authority(&bridge).as_ref());
+                data[44] = credit.decimals;
+                data[45] = 1;
+                Account { lamports: self.rent_exempt_minimum(82), data, owner: token, executable: false, rent_epoch: 0 }
+            });
+            let supply = u64::from_le_bytes(mint_account.data[36..44].try_into().unwrap()).checked_add(credit.amount).context("Bridged supply overflow")?;
+            mint_account.data[36..44].copy_from_slice(&supply.to_le_bytes());
+            self.put(mint, mint_account)?;
+            // The recipient's associated token account for it: SPL Token account layout, initialized.
+            let ata = Pubkey::find_program_address(&[recipient.as_ref(), token.as_ref(), mint.as_ref()], &Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")?).0;
+            let mut holder = self.svm.get_account(&ata).unwrap_or_else(|| {
+                let mut data = vec![0u8; 165];
+                data[..32].copy_from_slice(mint.as_ref());
+                data[32..64].copy_from_slice(recipient.as_ref());
+                data[108] = 1;
+                Account { lamports: self.rent_exempt_minimum(165), data, owner: token, executable: false, rent_epoch: 0 }
+            });
+            let amount = u64::from_le_bytes(holder.data[64..72].try_into().unwrap()).checked_add(credit.amount).context("Bridged balance overflow")?;
+            holder.data[64..72].copy_from_slice(&amount.to_le_bytes());
+            self.put(ata, holder)?;
+            let counter = Account { lamports: self.rent_exempt_minimum(8), data: (next + 1).to_le_bytes().to_vec(), owner: bridge, executable: false, rent_epoch: 0 };
+            self.put(bridge_counter(&bridge), counter)?;
+        }
+        Ok(())
+    }
+
     pub fn execute_slot(&mut self, slot: u64, items: Vec<ExecutionItem>) -> Result<SlotExecution> {
         self.set_slot_clock(slot)?;
         self.apply_placements(slot)?;
+        self.apply_credits()?;
         let mut merged = BTreeMap::<String, ExecutionItem>::new();
         for item in items {
             // Recheck signed bytes at the execution boundary; a public header cannot

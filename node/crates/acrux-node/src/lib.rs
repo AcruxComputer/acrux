@@ -1,3 +1,4 @@
+pub mod bridge;
 pub mod facts;
 pub mod cli;
 pub mod gateway;
