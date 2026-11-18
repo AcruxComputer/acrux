@@ -51,6 +51,8 @@ pub enum GatewayCommand {
     Solana {
         method: String,
         params: Value,
+        /// The caller's address, charged for simulations; `None` for the gateway's own reads.
+        client: Option<std::net::IpAddr>,
         reply: CommandReply,
     },
     /// For `acrux node follow`: the executed state at the latest finalized cblock.
@@ -235,7 +237,9 @@ pub const CONTRACT_VERSION: &str = "0.1.11";
 async fn health(State(state): State<SharedGateway>) -> Json<Value> {
     let state = state.read().await;
     Json(
-        json!({"status":if state.current_window.is_null(){"waiting"}else{"ready"},"contractVersion":CONTRACT_VERSION,"missingConfiguration":[]}),
+        // A chain state that cannot be written holds every finalization back, so the node is not ready.
+        json!({"status":if state.current_window.is_null() || crate::state::failing(){"waiting"}else{"ready"},"contractVersion":CONTRACT_VERSION,"missingConfiguration":[],
+            "chainState":{"durableCblock":match crate::state::durable(){u64::MAX=>Value::Null,cblock=>json!(cblock)},"writeFailing":crate::state::failing()}}),
     )
 }
 async fn rpc(State(state): State<SharedGateway>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: String) -> Response {
@@ -291,7 +295,7 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
     }
     let params = request.get("params").cloned().unwrap_or(json!({}));
     // Solana's methods take array params; Acrux's take an object. Solana-only methods may omit them.
-    let solana_only = matches!(method, "getHealth" | "getVersion" | "getGenesisHash" | "getFeeForMessage" | "simulateTransaction" | "getRecentPrioritizationFees" | "getBlockTime" | "getTokenAccountsByOwner" | "getTokenAccountBalance" | "getTokenSupply" | "getBlockHeight" | "getEpochInfo" | "getAccountInfo" | "getMultipleAccounts" | "getProgramAccounts" | "getMinimumBalanceForRentExemption" | "getSignaturesForAddress" | "getVoteAccounts" | "sendTransaction" | "getSignatureStatuses");
+    let solana_only = matches!(method, "getHealth" | "getVersion" | "getGenesisHash" | "getFeeForMessage" | "simulateTransaction" | "getRecentPrioritizationFees" | "getBlockTime" | "getTokenAccountsByOwner" | "getTokenAccountBalance" | "getTokenSupply" | "getBlockHeight" | "getEpochInfo" | "getAccountInfo" | "getMultipleAccounts" | "getProgramAccounts" | "getMinimumBalanceForRentExemption" | "getSignaturesForAddress" | "getVoteAccounts" | "sendTransaction" | "getSignatureStatuses" | "getRecentPerformanceSamples");
     if params.is_array() || (solana_only && !params.is_object()) || (solana_only && params.as_object().is_some_and(|o| o.is_empty())) {
         let params = if params.is_array() { params } else { json!([]) };
         // ACRUX_LOG_RPC=1: one line per Solana call, its method and encoding, to see what a wallet asks.
@@ -304,7 +308,7 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
         if !bounded_strings(&params) || params.get(0).and_then(Value::as_array).is_some_and(|keys| keys.len() > list_cap) {
             return Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": "Invalid params: a string or list is too long."}})).into_response();
         }
-        return match command(&state, |reply| GatewayCommand::Solana { method: method.to_owned(), params, reply }).await {
+        return match command(&state, |reply| GatewayCommand::Solana { method: method.to_owned(), params, client: Some(client), reply }).await {
             Ok(result) => Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response(),
             Err(message) => {
                 let code = if message.starts_with("Method not found") { -32601 } else { -32002 };
@@ -915,7 +919,7 @@ fn notification(method: &str, subscription: u64, slot: u64, value: Value) -> Val
     json!({"jsonrpc": "2.0", "method": method, "params": {"result": {"context": {"slot": slot}, "value": value}, "subscription": subscription}})
 }
 async fn solana_account(state: &SharedGateway, address: &str, encoding: &str) -> Value {
-    command(state, |reply| GatewayCommand::Solana { method: "getAccountInfo".into(), params: json!([address, {"encoding": encoding}]), reply })
+    command(state, |reply| GatewayCommand::Solana { method: "getAccountInfo".into(), params: json!([address, {"encoding": encoding}]), client: None, reply })
         .await
         .map(|answer| answer["value"].clone())
         .unwrap_or(Value::Null)

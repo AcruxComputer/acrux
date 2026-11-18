@@ -198,9 +198,17 @@ impl SvmExecutor {
         }
     }
 
+    /// The state a follower starts from. Executables come from the follower's own build (builtins,
+    /// the SPL programs, the genesis programs), except the program accounts of programs deployed on
+    /// the chain through the upgradeable loader, which are carried as any account is.
     pub fn snapshot(&self, checkpoint: &ExecutorCheckpoint) -> ExecutorSnapshot {
         ExecutorSnapshot {
-            accounts: checkpoint.accounts.iter().filter(|(_, a)| !a.executable).map(|(k, a)| (k.to_string(), a.as_ref().clone())).collect(),
+            accounts: checkpoint
+                .accounts
+                .iter()
+                .filter(|(_, a)| !a.executable || a.owner == solana_sdk::bpf_loader_upgradeable::id())
+                .map(|(k, a)| (k.to_string(), a.as_ref().clone()))
+                .collect(),
             executed: checkpoint.executed.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             recent: checkpoint.recent.iter().map(|(h, s)| (h.to_string(), *s)).collect(),
             inclusion_used: checkpoint.inclusion_used.iter().map(|((w, p, q), v)| (*w, p.to_string(), *q, *v)).collect(),
@@ -253,7 +261,9 @@ impl SvmExecutor {
         for key in self.accounts.iter().filter(|(k, a)| !a.executable && !keep.contains(k)).map(|(k, _)| *k).collect::<Vec<_>>() {
             self.put(key, Account { lamports: 0, data: vec![], owner: system_program::id(), executable: false, rent_epoch: 0 })?;
         }
-        for (key, account) in snapshot.accounts {
+        // A deployed program's account is loaded after its program data account, which it names.
+        let (programs, accounts): (Vec<_>, Vec<_>) = snapshot.accounts.into_iter().partition(|(_, a)| a.executable);
+        for (key, account) in accounts.into_iter().chain(programs) {
             self.put(Pubkey::from_str(&key)?, account)?;
         }
         self.executed = snapshot.executed.into_iter().collect();

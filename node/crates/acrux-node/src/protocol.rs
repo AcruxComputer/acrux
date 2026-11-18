@@ -23,7 +23,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::Path,
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -168,6 +168,13 @@ pub struct Network {
     admission_slots: BTreeMap<u64, Vec<String>>,
     progress: Arc<std::sync::Mutex<Progress>>,
     observed_final: Arc<std::sync::Mutex<BTreeSet<u64>>>,
+    /// Finalization events waiting for their cblock's state to reach the disk (`state::durable`).
+    held_finals: Vec<Telemetry>,
+    /// Solana's `getRecentPerformanceSamples`: one sample a minute of the slots and transactions
+    /// validator 0 executed, newest last, at most 720 (twelve hours).
+    performance: VecDeque<Value>,
+    performance_mark: (Instant, u64, u64),
+    executed_count: (u64, u64),
     observed_skip: Arc<std::sync::Mutex<BTreeSet<u64>>>,
     /// Per window: when each node voted for the previous window's last cblock and emitted ParentReady.
     handover_trace: Arc<std::sync::Mutex<BTreeMap<u64, Vec<(usize, &'static str, Instant)>>>>,
@@ -211,6 +218,49 @@ struct FactsCursor {
 /// the chain still holds and whose payer can pay this copy's inclusion fee; the rest are dropped,
 /// so no honest block carries what validators would not charge. Each carried transaction stays in
 /// flight until it executes, so one lost with a skipped slot goes out again.
+/// How far ahead of the latest started slot a send made at the gateway (`sendTransaction`, the
+/// faucet) is aimed. The gateway sits beside the proposers, so the next slot is in reach; a copy
+/// that misses its slot's block is carried by the next, as any due transaction is.
+const SEND_LEAD_SLOTS: u64 = 1;
+
+/// A block carries at most this many bytes of transactions and fragments; what is due beyond it
+/// stays in the mempool for the next slots. Kept well under the 1 MiB block and network message
+/// limits, with room for the window handover that carries four slots of shreds.
+pub const BLOCK_BYTES: u64 = 64 * 1024;
+
+/// The due items that fit `budget`, highest priority fee per CU first, then by key.
+fn within_budget<K: Ord + Clone>(mut due: Vec<(K, u128, u64)>, budget: u64) -> Vec<K> {
+    due.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut used = 0;
+    due.into_iter()
+        .filter(|(_, _, size)| {
+            let fits = used + size <= budget;
+            if fits {
+                used += size;
+            }
+            fits
+        })
+        .map(|(key, _, _)| key)
+        .collect()
+}
+
+/// Splits a handover's shreds into parts of at most `HANDOVER_PART_BYTES` each; always at least one.
+const HANDOVER_PART_BYTES: u64 = 768 * 1024;
+fn handover_parts(shreds: Vec<Shred>) -> Vec<Vec<Shred>> {
+    let mut parts = vec![vec![]];
+    let mut used = 0;
+    for shred in shreds {
+        let size = bincode::serialized_size(&shred).unwrap_or(0);
+        if used + size > HANDOVER_PART_BYTES && !parts.last().unwrap().is_empty() {
+            parts.push(vec![]);
+            used = 0;
+        }
+        used += size;
+        parts.last_mut().unwrap().push(shred);
+    }
+    parts
+}
+
 fn pack(
     node: &mut Node,
     s: u64,
@@ -218,24 +268,32 @@ fn pack(
     censored: Option<&String>,
 ) -> (Vec<ValidatedTx>, Vec<crate::threshold::VerifiedFragment>) {
     let executor = node.executor.as_ref().unwrap();
+    let priority = |h: &crate::execution::TxHeader| h.priority_fee_per_cu.parse::<u128>().unwrap_or(0);
     let due = node
         .mempool
         .iter()
         .filter(|(id, tx)| tx.header.target_slot <= s && Some(*id) != censored)
-        .map(|(id, _)| id.clone())
+        .map(|(id, tx)| (id.clone(), priority(&tx.header), bincode::serialized_size(tx).unwrap_or(u64::MAX)))
         .collect::<Vec<_>>();
-    let txs = due
+    let due_fragments = node
+        .fragment_mempool
+        .iter()
+        .filter(|(_, f)| f.header.target_slot <= s)
+        .map(|(key, f)| (key.clone(), priority(&f.header), bincode::serialized_size(f).unwrap_or(u64::MAX)))
+        .collect::<Vec<_>>();
+    // Fragments first: a threshold transaction needs t of them together, so they take the budget's
+    // first half and plain transactions the rest of it.
+    let fragment_keys = within_budget(due_fragments, BLOCK_BYTES / 2);
+    let used = fragment_keys
+        .iter()
+        .map(|key| bincode::serialized_size(&node.fragment_mempool[key]).unwrap_or(0))
+        .sum::<u64>();
+    let txs = within_budget(due, BLOCK_BYTES - used)
         .into_iter()
         .filter_map(|id| node.mempool.remove(&id))
         .filter(|tx| !executor.is_executed(&tx.header.id) && executor.blockhash_valid(&tx.bytes))
         .collect::<Vec<_>>();
-    let due = node
-        .fragment_mempool
-        .iter()
-        .filter(|(_, f)| f.header.target_slot <= s)
-        .map(|(key, _)| key.clone())
-        .collect::<Vec<_>>();
-    let fragments = due
+    let fragments = fragment_keys
         .into_iter()
         .filter_map(|key| node.fragment_mempool.remove(&key))
         .collect::<Vec<_>>();
@@ -481,7 +539,7 @@ impl Network {
             .chain(genesis.iter().map(|g| g.faucet.pubkey().to_string()))
             .collect::<BTreeSet<_>>();
         let state_writer = match state_store {
-            Some(store) => Some(crate::state::spawn_writer(store, saved.as_ref().map(|_| nodes[0].genesis.clone()))?),
+            Some(store) => Some(crate::state::spawn_writer(store, saved.as_ref().map(|_| nodes[0].genesis.clone()), resumed.map_or(0, |block| block.slot))?),
             None => None,
         };
         {
@@ -554,6 +612,10 @@ impl Network {
             admission_slots: BTreeMap::new(),
             progress: Arc::new(std::sync::Mutex::new(Progress::default())),
             observed_final: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
+            held_finals: Vec::new(),
+            performance: VecDeque::new(),
+            performance_mark: (Instant::now(), 0, 0),
+            executed_count: (0, 0),
             observed_skip: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             handover_trace: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             state_checks: Arc::new(std::sync::Mutex::new(StateChecks::default())),
@@ -805,6 +867,10 @@ impl Network {
             admission_slots: BTreeMap::new(),
                     progress: self.progress.clone(),
                     observed_final: self.observed_final.clone(),
+                    held_finals: Vec::new(),
+                    performance: VecDeque::new(),
+                    performance_mark: (Instant::now(), 0, 0),
+                    executed_count: (0, 0),
                     observed_skip: self.observed_skip.clone(),
                     handover_trace: self.handover_trace.clone(),
                     state_checks: self.state_checks.clone(),
@@ -876,7 +942,7 @@ impl Network {
         Ok(())
     }
     async fn dispatch(&mut self, node: usize, step: Step) -> Result<()> {
-        if step.out.is_empty() && step.events.is_empty() && step.persist.is_empty() {
+        if step.out.is_empty() && step.events.is_empty() && step.persist.is_empty() && self.held_finals.is_empty() {
             return Ok(());
         }
         let _phase = self.profile.measure(Some(node), "dispatch.total");
@@ -911,23 +977,60 @@ impl Network {
                 }
                 if node == 0 && event.kind == "cblock.finalized" && self.finalized.insert(slot / 4) {
                     self.save_state(slot / 4);
-                    self.keep_finalized(slot / 4).await;
-                    self.final_times.push(event.at);
-                    self.observed_final.lock().unwrap().insert(slot / 4);
                 }
                 // These local seeds only support node zero's own slot-start and execution views.
                 // The observer owns the complete projection, including other validators' arrivals.
                 if node == 0 && matches!(event.kind, "slot.started" | "slot.executed") {
                     self.slot_views.insert(slot, event.data.clone());
                 }
+                if node == 0 && event.kind == "slot.executed" {
+                    let merged = event.data["mergedOrder"].as_array().map_or(0, |m| m.iter().filter(|t| t["selected"] != false).count() as u64);
+                    self.executed_count = (self.executed_count.0.max(slot), self.executed_count.1 + merged);
+                }
             }
+        }
+        if node == 0 && self.performance_mark.0.elapsed() >= std::time::Duration::from_secs(60) {
+            let (at, slot, transactions) = self.performance_mark;
+            let (now_slot, now_transactions) = self.executed_count;
+            if slot > 0 {
+                self.performance.push_back(json!({
+                    "slot": now_slot, "numSlots": now_slot - slot, "numTransactions": now_transactions - transactions,
+                    "numNonVoteTransactions": now_transactions - transactions, "samplePeriodSecs": at.elapsed().as_secs(),
+                }));
+                if self.performance.len() > 720 {
+                    self.performance.pop_front();
+                }
+            }
+            self.performance_mark = (Instant::now(), now_slot, now_transactions);
         }
         while self.slot_views.len() > 64 {
             let first = *self.slot_views.keys().next().unwrap();
             self.slot_views.remove(&first);
         }
+        // A cblock is reported final (the event stream, statuses, kept transactions) only once its
+        // state is on disk, so a crash never takes back what was reported final.
+        let durable = crate::state::durable();
+        let (mut events, held): (Vec<_>, Vec<_>) = step
+            .events
+            .into_iter()
+            .partition(|e| e.kind != "cblock.finalized" || e.slot.map_or(true, |slot| slot / 4 <= durable));
+        self.held_finals.extend(held);
+        let (released, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held_finals)
+            .into_iter()
+            .partition(|e| e.slot.map_or(true, |slot| slot / 4 <= durable));
+        self.held_finals = held;
+        events.extend(released);
+        if node == 0 {
+            for event in events.iter().filter(|e| e.kind == "cblock.finalized") {
+                let cblock = event.slot.unwrap() / 4;
+                if self.observed_final.lock().unwrap().insert(cblock) {
+                    self.keep_finalized(cblock).await;
+                    self.final_times.push(event.at);
+                }
+            }
+        }
         let queued = Instant::now();
-        self.observer.submit(node, step.events, step.persist).await?;
+        self.observer.submit(node, events, step.persist).await?;
         self.profile.record(Some(node), "observer.queue_wait", queued.elapsed());
         Ok(())
     }
@@ -2712,28 +2815,32 @@ impl Network {
                 self.nodes[id].executed_blocks.insert(i, block.id);
                 if i % 4 == 3 && self.proposer_ids(w).contains(&id) {
                     let next = self.proposer_ids(w + 1);
-                    step.out.push(Outbox {
-                        from: id,
-                        to: next,
-                        body: Wire::Handover {
-                            slot: i * 4 + 3,
-                            parent: block.id,
-                            shreds: (i * 4..i * 4 + 4)
-                                .flat_map(|slot| {
-                                    self.nodes[id].slots[&slot]
-                                        .shreds
-                                        .values()
-                                        .flatten()
-                                        .cloned()
-                                })
-                                .collect(),
-                            attestations: (i * 4..i * 4 + 4)
-                                .flat_map(|slot| {
-                                    self.nodes[id].slots[&slot].attest.values().cloned()
-                                })
-                                .collect(),
-                        },
-                    });
+                    // 32 shreds rebuild a slice, so no more go; the rest is split into messages
+                    // under the network limit, the attestations riding on the first.
+                    let shreds = (i * 4..i * 4 + 4)
+                        .flat_map(|slot| {
+                            self.nodes[id].slots[&slot]
+                                .shreds
+                                .values()
+                                .flat_map(|pile| pile.iter().take(32))
+                                .cloned()
+                        })
+                        .collect::<Vec<_>>();
+                    let mut attestations = (i * 4..i * 4 + 4)
+                        .flat_map(|slot| self.nodes[id].slots[&slot].attest.values().cloned())
+                        .collect::<Vec<_>>();
+                    for part in handover_parts(shreds) {
+                        step.out.push(Outbox {
+                            from: id,
+                            to: next.clone(),
+                            body: Wire::Handover {
+                                slot: i * 4 + 3,
+                                parent: block.id,
+                                shreds: part,
+                                attestations: std::mem::take(&mut attestations),
+                            },
+                        });
+                    }
                 }
                 actions = self.nodes[id].votor.local_block(block)?;
                 let c = view::cblock_json(i, parent, &hex::encode(hash), &state, "pending");
@@ -3038,8 +3145,8 @@ impl Network {
                 let result=self.nodes[0].executor.as_ref().unwrap().balance(&address).map(|value|json!({"address":address,"lamports":value.to_string(),"reserveLamports":self.config.reserve.to_string(),"spendableLamports":value.saturating_sub(self.config.reserve).to_string(),"slot":self.nodes[0].last_executed.unwrap_or(0)})).map_err(|e|e.to_string());
                 let _ = reply.send(result);
             }
-            GatewayCommand::Solana { method, params, reply } => {
-                let result = self.solana_rpc(&method, params).await;
+            GatewayCommand::Solana { method, params, client, reply } => {
+                let result = self.solana_rpc(&method, params, client).await;
                 let _ = reply.send(result.map_err(|e| e.to_string()));
             }
             GatewayCommand::Credit {
@@ -3061,7 +3168,7 @@ impl Network {
         Ok((genesis, reserves, self.nodes[0].last_executed.unwrap_or(0)))
     }
     async fn faucet_transfer(&mut self, address: &str, lamports: u64) -> Result<Value> {
-        let target = self.latest_started() + 3;
+        let target = self.latest_started() + SEND_LEAD_SLOTS;
         let recipient: solana_sdk::pubkey::Pubkey = address.parse()?;
         let genesis = self.genesis.clone();
         let (payer, instructions) = match &genesis {
@@ -3589,7 +3696,7 @@ impl NodeRunner {
 /// Solana's JSON-RPC, the part a wallet, web3.js or the `acrux hub` commands use: reads of
 /// accounts, balances, blockhashes and the epoch, and `sendTransaction` with its status.
 impl Network {
-    async fn solana_rpc(&mut self, method: &str, params: Value) -> Result<Value> {
+    async fn solana_rpc(&mut self, method: &str, params: Value, client: Option<std::net::IpAddr>) -> Result<Value> {
         let arg = |i: usize| params.get(i).cloned().unwrap_or(Value::Null);
         let slot = self.nodes[0].last_executed.unwrap_or(0);
         let context = json!({"slot": slot, "apiVersion": "2.2.1"});
@@ -3711,10 +3818,13 @@ impl Network {
                     self.submit(params).await?;
                     return Ok(json!(signature));
                 }
-                let target = self.latest_started() + 3;
+                let target = self.latest_started() + SEND_LEAD_SLOTS;
                 let valid = executor.validate_transaction(&bytes, target).map_err(|e| anyhow::anyhow!("Transaction simulation failed: {e}"))?;
                 if arg(1)["skipPreflight"] != json!(true) {
+                    let limits = crate::limits::limits();
+                    anyhow::ensure!(limits.simulation_ready(client), "RATE_LIMITED: too much simulation from this address; slow down or send with skipPreflight");
                     let simulated = self.nodes[0].executor.as_mut().unwrap().simulate(&bytes, true, false)?;
+                    limits.simulation_charge(client, simulated.units);
                     if let Some(err) = simulated.err {
                         anyhow::bail!("Transaction simulation failed: {err}. {}", simulated.logs.join(" "));
                     }
@@ -3726,6 +3836,11 @@ impl Network {
                 json!(signature)
             }
             "getGenesisHash" => json!(self.genesis_hash),
+            // Newest first, as Solana answers; Acrux has no vote transactions, so every one counts.
+            "getRecentPerformanceSamples" => {
+                let limit = arg(0).as_u64().unwrap_or(720).min(720) as usize;
+                json!(self.performance.iter().rev().take(limit).cloned().collect::<Vec<_>>())
+            }
             // The slot's wall-clock time: slots run every 50 ms behind the latest executed one.
             "getBlockTime" => {
                 let asked = arg(0).as_u64().context("slot")?;
@@ -3751,7 +3866,10 @@ impl Network {
                     _ => bs58::decode(&encoded).into_vec()?,
                 };
                 let replace = config["replaceRecentBlockhash"] == json!(true);
+                let limits = crate::limits::limits();
+                anyhow::ensure!(limits.simulation_ready(client), "RATE_LIMITED: too much simulation from this address; slow down");
                 let sim = self.nodes[0].executor.as_mut().unwrap().simulate(&bytes, config["sigVerify"] == json!(true), replace)?;
+                limits.simulation_charge(client, sim.units);
                 json!({"context": context, "value": {
                     "err": sim.err.map(|e| serde_json::to_value(e).unwrap()), "logs": sim.logs, "accounts": null, "unitsConsumed": sim.units, "returnData": null,
                     "innerInstructions": null,

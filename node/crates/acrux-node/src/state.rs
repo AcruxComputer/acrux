@@ -7,6 +7,20 @@ use anyhow::{ensure, Context, Result};
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// The newest cblock whose state is committed to disk. Nothing reports a cblock final before it is
+/// here. `u64::MAX` while the net keeps no state (a Fault Lab sandbox): every cblock is reported at once.
+pub static DURABLE: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Set while the newest write of the state has failed; it is retried until one succeeds.
+pub static FAILING: AtomicBool = AtomicBool::new(false);
+
+pub fn durable() -> u64 {
+    DURABLE.load(Ordering::Acquire)
+}
+pub fn failing() -> bool {
+    FAILING.load(Ordering::Acquire)
+}
 
 const ACCOUNTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("accounts");
 const EXECUTED: TableDefinition<&str, u64> = TableDefinition::new("executed");
@@ -109,17 +123,48 @@ pub struct Pending {
 }
 
 /// The writer thread: takes the newest finalized state queued and writes what changed since the
-/// one before; states queued while it writes are passed over for the newest.
-pub fn spawn_writer(store: StateStore, mut written: Option<ExecutorCheckpoint>) -> Result<std::sync::mpsc::Sender<Pending>> {
+/// one before; states queued while it writes are passed over for the newest. A failed write is
+/// retried every second, with the newest state, until one succeeds. `durable` is the cblock the
+/// store already holds.
+pub fn spawn_writer(store: StateStore, mut written: Option<ExecutorCheckpoint>, durable: u64) -> Result<std::sync::mpsc::Sender<Pending>> {
+    DURABLE.store(durable, Ordering::Release);
+    // Checks only: a slow disk (`ACRUX_STATE_WRITE_DELAY_MS`) and a disk that refuses writes for a
+    // while after the start (`ACRUX_STATE_WRITE_FAIL_MS`).
+    let delay = std::env::var("ACRUX_STATE_WRITE_DELAY_MS").ok().and_then(|v| v.parse().ok()).map(std::time::Duration::from_millis);
+    let refuse_until = std::env::var("ACRUX_STATE_WRITE_FAIL_MS").ok().and_then(|v| v.parse().ok()).map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
     let (sender, receiver) = std::sync::mpsc::channel::<Pending>();
     std::thread::Builder::new().name("acrux-state".into()).spawn(move || {
-        while let Ok(mut pending) = receiver.recv() {
+        let mut retry: Option<Pending> = None;
+        loop {
+            let mut pending = match retry.take() {
+                Some(pending) => pending,
+                None => match receiver.recv() {
+                    Ok(pending) => pending,
+                    Err(_) => return,
+                },
+            };
             while let Ok(newer) = receiver.try_recv() {
                 pending = newer;
             }
-            match store.write(&pending.checkpoint, written.as_ref(), &pending.meta) {
-                Ok(()) => written = Some(pending.checkpoint),
-                Err(error) => tracing::error!(%error, cblock = pending.meta.cblock, "writing the chain state failed"),
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
+            }
+            let result = match refuse_until {
+                Some(until) if std::time::Instant::now() < until => Err(anyhow::anyhow!("the disk refused the write (ACRUX_STATE_WRITE_FAIL_MS)")),
+                _ => store.write(&pending.checkpoint, written.as_ref(), &pending.meta),
+            };
+            match result {
+                Ok(()) => {
+                    DURABLE.store(pending.meta.cblock, Ordering::Release);
+                    FAILING.store(false, Ordering::Release);
+                    written = Some(pending.checkpoint);
+                }
+                Err(error) => {
+                    FAILING.store(true, Ordering::Release);
+                    tracing::error!(%error, cblock = pending.meta.cblock, "writing the chain state failed; retrying");
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    retry = Some(pending);
+                }
             }
         }
     })?;

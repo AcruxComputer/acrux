@@ -73,6 +73,13 @@ export function createNodeApi() {
   // The site's Solana RPC for the mainnet Hub Registry: the keyed URL stays here, and the public
   // endpoints refuse a browser origin.
   const solanaRelay = createRpc({ url: env.SOLANA_RPC_URL, service: 'solana-relay', rps: env.SOLANA_RELAY_RPS, scanIntervalMs: 60_000 })
+  // Only the site's own pages: a request with no Origin (a script, curl) would make it a public
+  // keyed mainnet RPC on the shared key.
+  const siteOrigins = new Set(env.CORS_ORIGINS)
+  app.use('/v1/solana-rpc', async (c, next) => {
+    if (!siteOrigins.has(c.req.header('Origin') ?? '')) return c.json({ jsonrpc: '2.0', id: null, error: { code: -32003, message: 'The relay serves the site only.' } }, 403)
+    await next()
+  })
   app.route('/v1/solana-rpc', rpcRelay({ rpc: solanaRelay, methods: SOLANA_RELAY_METHODS, readsPerMinute: 300, writesPerMinute: 20 }))
   app.get('/v1/buyback', async c => c.json(await readBuyback(db, { mint: env.ACRUX_MINT, wallet: env.LAUNCH_WALLET })))
 

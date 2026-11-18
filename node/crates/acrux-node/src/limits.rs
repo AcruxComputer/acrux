@@ -37,11 +37,33 @@ impl Bucket {
             false
         }
     }
+    /// Whether the client has anything left, without taking from it.
+    fn ready(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut clients = self.clients.lock().unwrap();
+        let (tokens, at) = clients.entry(ip).or_insert((self.burst, now));
+        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * self.rate).min(self.burst);
+        *at = now;
+        *tokens > 0.0
+    }
+    /// Takes `cost` after the fact; the bucket may go below zero and refills from there.
+    fn charge(&self, ip: IpAddr, cost: f64) {
+        if let Some((tokens, _)) = self.clients.lock().unwrap().get_mut(&ip) {
+            *tokens -= cost;
+        }
+    }
 }
+
+/// Every client's simulations together are charged here as well.
+const ALL: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
 
 pub struct Limits {
     reads: Bucket,
     submits: Bucket,
+    /// Compute units of simulation (`simulateTransaction`, `sendTransaction`'s preflight), per IP
+    /// and for all clients together: each runs on validator 0's own executor.
+    simulation: Bucket,
+    simulation_all: Bucket,
     sockets: Mutex<HashMap<IpAddr, usize>>,
     sockets_per_ip: usize,
     /// Stream connections in all (`ACRUX_WS_MAX`).
@@ -55,7 +77,9 @@ fn env<T: std::str::FromStr>(name: &str, default: T) -> T {
 
 /// The limits, from `ACRUX_RPC_RATE` (reads a second per IP, default 50, burst twice that),
 /// `ACRUX_SUBMIT_RATE` (submits a second per IP, default 50, burst ten seconds of it: a program
-/// deploy sends its few hundred buffer writes at once) and `ACRUX_WS_PER_IP` (8).
+/// deploy sends its few hundred buffer writes at once), `ACRUX_SIMULATION_CU` (compute units of
+/// simulation a second per IP, default 4,000,000, burst twice that; ten times it for all clients)
+/// and `ACRUX_WS_PER_IP` (8).
 pub fn limits() -> &'static Limits {
     static LIMITS: OnceLock<Limits> = OnceLock::new();
     LIMITS.get_or_init(|| {
@@ -65,6 +89,14 @@ pub fn limits() -> &'static Limits {
             submits: {
                 let rate = env("ACRUX_SUBMIT_RATE", 50.0);
                 Bucket::new(rate, rate * 10.0)
+            },
+            simulation: {
+                let rate = env("ACRUX_SIMULATION_CU", 4_000_000.0);
+                Bucket::new(rate, rate * 2.0)
+            },
+            simulation_all: {
+                let rate = env("ACRUX_SIMULATION_CU", 4_000_000.0) * 10.0;
+                Bucket::new(rate, rate * 2.0)
             },
             sockets: Mutex::new(HashMap::new()),
             sockets_per_ip: env("ACRUX_WS_PER_IP", 8),
@@ -93,6 +125,16 @@ impl Limits {
     }
     pub fn submit(&self, ip: IpAddr) -> bool {
         self.submits.allow(ip)
+    }
+    /// Whether a simulation for this client may run now; `None` is the node's own.
+    pub fn simulation_ready(&self, ip: Option<IpAddr>) -> bool {
+        ip.map_or(true, |ip| self.simulation_all.ready(ALL) && self.simulation.ready(ip))
+    }
+    pub fn simulation_charge(&self, ip: Option<IpAddr>, units: u64) {
+        if let Some(ip) = ip {
+            self.simulation.charge(ip, units as f64);
+            self.simulation_all.charge(ALL, units as f64);
+        }
     }
     /// Takes one of the client's event-stream connections; `None` when it holds all of them.
     pub fn open_socket(&'static self, ip: IpAddr) -> Option<SocketPermit> {
