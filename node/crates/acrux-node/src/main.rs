@@ -70,6 +70,24 @@ enum Command {
     /// Algorithm 3 for a set of hubs: reads `{ epoch, seed, windows, totalStake, hubs }` as JSON on
     /// stdin and prints `{ hubStakes, schedule }`, the code path the node's own schedule runs.
     Schedule,
+    /// One Solana mainnet block through Acrux's merge and selection, beside its leader's order:
+    /// `acrux replay --block <file>` or `acrux replay --rpc <url> --slot <n>`.
+    Replay {
+        /// A file holding a `getBlock` result.
+        #[arg(long)]
+        block: Option<String>,
+        /// A Solana RPC to read the block from, with `--slot`.
+        #[arg(long)]
+        rpc: Option<String>,
+        #[arg(long)]
+        slot: Option<u64>,
+        /// Writes the block read from `--rpc` to this file, to replay it again with `--block`.
+        #[arg(long)]
+        save: Option<String>,
+        /// How many rows of the two orders to print.
+        #[arg(long, default_value_t = 40)]
+        rows: usize,
+    },
     /// The Fault Lab.
     Lab {
         #[command(subcommand)]
@@ -212,6 +230,7 @@ async fn run() -> anyhow::Result<()> {
         Command::Schedule => return schedule_preview(),
         Command::Keygen { out } => return cli::keygen(&out),
         Command::Identities { out } => return cli::identities(&out),
+        Command::Replay { block, rpc, slot, save, rows } => return acrux_node::replay::run(block.as_deref(), rpc.as_deref(), slot, save.as_deref(), rows).await,
         Command::Send { rpc, keypair, to, lamports, n, t, priority } => return cli::send(&rpc, &keypair, &to, lamports, n, t, priority).await,
         Command::Node { command: NodeCommand::Follow { url, genesis } } => return cli::follow(&url, &genesis).await,
         Command::Net { command: NetCommand::Import { url, store, genesis } } => return cli::import(&url, &store, &genesis).await,
@@ -271,7 +290,7 @@ async fn run() -> anyhow::Result<()> {
             Configuration { gateway_port, websocket_port: ws_port, base_port, metrics_port, store_path: store, genesis_path: Some(genesis), ..Default::default() }
         }
         Command::Net { command: NetCommand::Import { .. } } => unreachable!("handled above"),
-        Command::Schedule | Command::Identities { .. } | Command::Keygen { .. } | Command::Send { .. } | Command::Node { .. } | Command::Hub { .. } => unreachable!("handled above"),
+        Command::Schedule | Command::Identities { .. } | Command::Keygen { .. } | Command::Send { .. } | Command::Replay { .. } | Command::Node { .. } | Command::Hub { .. } => unreachable!("handled above"),
         Command::Lab { command: LabCommand::Run { scenario, seed, base_port, out, genesis } } => {
             // The faulty window is the fifth, after the net has settled; its attacker is the
             // scenario's proposer role (for censorship, the honest proposer that carries the transaction).
