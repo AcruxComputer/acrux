@@ -8,6 +8,7 @@ skip-lint = false
 [programs.localnet]
 hub_registry = "ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm"
 demo_pool = "CUBR9LNdTwxwp5ARBQj1EopfuH8dr8u4i7DsXcb8HbHN"
+acrux_bridge = "EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5"
 
 [provider]
 cluster = "http://127.0.0.1:4990"

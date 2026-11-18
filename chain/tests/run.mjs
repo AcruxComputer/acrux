@@ -1,5 +1,5 @@
-// Starts the local validator (hub_registry, demo_pool and the Acrux Net genesis accounts
-// loaded), runs the test files against it, and stops it again.
+// Starts the local validator (hub_registry, demo_pool, acrux_bridge and the Acrux Net genesis
+// accounts loaded), runs the test files against it, and stops it again.
 import { spawn, spawnSync } from 'node:child_process'
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -24,6 +24,8 @@ const validator = spawn('bash', [
   join(chainDir, 'scripts/validator.sh'), state, '32',
   '--bpf-program', genesis.programs[0].address, join(chainDir, genesis.programs[0].path),
   '--account-dir', accounts,
+  // The bridge, built beside the genesis programs.
+  '--bpf-program', 'EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5', join(chainDir, 'target/deploy/acrux_bridge.so'),
 ], { stdio: 'ignore' })
 
 let status = 1
@@ -35,7 +37,7 @@ try {
     if (i > 120) throw new Error('The validator did not start')
     await new Promise((r) => setTimeout(r, 500))
   }
-  const files = process.argv.slice(2).length ? process.argv.slice(2) : ['tests/hub_registry.test.mjs', 'tests/demo_pool.test.mjs']
+  const files = process.argv.slice(2).length ? process.argv.slice(2) : ['tests/hub_registry.test.mjs', 'tests/demo_pool.test.mjs', 'tests/acrux_bridge.test.mjs']
   status = spawnSync(process.execPath, ['--test', '--test-concurrency=1', ...files], { cwd: chainDir, stdio: 'inherit' }).status ?? 1
 } finally {
   // Stop exactly the validator this run started.
