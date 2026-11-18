@@ -5,6 +5,18 @@
 import { ACRUX_BRIDGE_IDL, paginate, type Bridge, type BridgeTransfer, type PageQuery } from '@acrux/contract'
 import { BorshAccountsCoder, type Idl } from '@coral-xyz/anchor'
 import { PublicKey } from '@solana/web3.js'
+import type { PrismaClient } from '@prisma/client'
+
+export async function readBridgeRelayer(db: PrismaClient, program: string | null): Promise<Bridge['relayer']> {
+  if (!program) return null
+  const state = await db.bridgeRelayerState.findUnique({ where: { program } })
+  return state ? {
+    wallet: state.wallet, lamports: state.lamports.toFixed(0),
+    lastCblock: state.lastCblock === null ? null : Number(state.lastCblock),
+    lastHandedEpoch: state.lastHandedEpoch === null ? null : Number(state.lastHandedEpoch),
+    lastRelayedAt: state.lastRelayedAt?.toISOString() ?? null,
+  } : null
+}
 
 const coder = new BorshAccountsCoder(ACRUX_BRIDGE_IDL as unknown as Idl)
 const u64 = (n: number) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b }
@@ -19,7 +31,7 @@ export class BridgeReader {
   private withdrawals = new Map<number, Withdrawal>()
   private credited = 0
   private decimals = new Map<string, number>()
-  private view: Omit<Bridge, 'status' | 'program' | 'fromSlot'> = { lightClient: { epoch: null, validators: 0, latestCertified: null }, vaults: [], totals: { deposits: 0, credited: 0, withdrawals: 0, released: 0 }, readAt: null }
+  private view: Omit<Bridge, 'status' | 'program' | 'fromSlot' | 'relayer'> = { lightClient: { epoch: null, validators: 0, latestCertified: null }, vaults: [], totals: { deposits: 0, credited: 0, withdrawals: 0, released: 0 }, readAt: null }
 
   constructor(program: string | undefined, private readonly fromSlot: number | null, private readonly solanaUrl: string, private readonly acruxUrl: string, private readonly pollMs: number) {
     this.program = program ? new PublicKey(program) : null
@@ -94,8 +106,16 @@ export class BridgeReader {
       if (proof?.hash) w.hash = proof.hash
     }
     for (const w of pending) w.certified = !!w.hash && certified.has(w.hash)
-    const releases = await this.accounts(this.solanaUrl, pending.map(w => this.pda(Buffer.from('released'), u64(w.sequence))))
-    pending.forEach((w, i) => { w.released = !!releases[i] })
+    const releases = await this.accounts(this.solanaUrl, pending.map(w => this.pda(Buffer.from('released'), u64(Math.floor(w.sequence / 8192)))))
+    pending.forEach((w, i) => {
+      const account = releases[i]
+      if (!account) return
+      if (account.owner !== this.program!.toBase58()) throw new Error('Invalid released bitmap owner.')
+      const guard = coder.decode('Released', account.data)
+      if (Number(guard.bucket) !== Math.floor(w.sequence / 8192)) throw new Error('Invalid released bitmap bucket.')
+      const bit = w.sequence % 8192
+      w.released = !!(guard.bits[Math.floor(bit / 8)] & (1 << (bit % 8)))
+    })
 
     // Vaults on Solana and the bridged mints on Acrux, for every mint that came across.
     const mints = [...new Set([...this.deposits.values()].map(d => d.mint))]
@@ -121,7 +141,7 @@ export class BridgeReader {
   }
 
   overview(): Bridge {
-    return { status: this.program && this.view.readAt ? 'live' : 'waiting', program: this.program?.toBase58() ?? null, fromSlot: this.fromSlot, ...this.view }
+    return { status: this.program && this.view.readAt ? 'live' : 'waiting', program: this.program?.toBase58() ?? null, fromSlot: this.fromSlot, relayer: null, ...this.view }
   }
 
   transfers(query: PageQuery & { address?: string; kind?: 'deposit' | 'withdrawal' }) {
@@ -133,7 +153,7 @@ export class BridgeReader {
     const withdrawals = [...this.withdrawals.values()].map((w): BridgeTransfer & { seenAt: number } => ({
       kind: 'withdrawal', sequence: w.sequence, status: w.released ? 'released' : w.certified ? 'certified' : 'burned', solanaMint: w.solanaMint, acruxMint: acruxMint(w.solanaMint),
       amount: w.amount, from: w.owner, to: w.recipient, solanaSlot: null, acruxSlot: w.slot, cblock: Math.floor(w.slot / 4),
-      releaseAccount: w.released ? this.pda(Buffer.from('released'), u64(w.sequence)).toBase58() : null, seenAt: w.seenAt,
+      releaseAccount: w.released ? this.pda(Buffer.from('released'), u64(Math.floor(w.sequence / 8192))).toBase58() : null, seenAt: w.seenAt,
     }))
     const rows = [...deposits, ...withdrawals]
       .filter(t => (!query.kind || t.kind === query.kind) && (!query.address || t.from === query.address || t.to === query.address))

@@ -12,6 +12,16 @@ ACRUX is the chain's native token, with 9 decimals: amounts are in lamports, 1 A
 
 The genesis loads the same `hub_registry` program as Solana's (`ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm`) with its accounts: the registry (deposit 1 ACRUX, fee 500 bps, cooldown 1 epoch, inactivity 4 epochs, n_min 4), the hubs FRA, NYC and TYO, and the twelve validators' memberships. The node takes its hubs, their places and their members from those accounts: the link delays between validators and Algorithm 3's proposer schedule both come from the registry. `acrux hub register|join|leave|move|release --rpc <Acrux RPC>` sends the instructions to Acrux, as `--rpc <Solana RPC>` does to Solana mainnet. An epoch on Acrux is 432,000 slots.
 
+## Bridge proofs
+
+`chain/bridge.json` (or `ACRUX_BRIDGE`) enables the Solana bridge from `fromSlot` for `program` and requires a nonempty `chainId` name. Its optional `epochSlots` defaults to 432,000 and must be positive and divisible by four. This is the bridge light client's epoch length, independent of the consensus scheduler's `windows_per_epoch`; local bridge checks explicitly use 1,536 slots. Every enabled cblock's outbox commits the validator set for the next bridge epoch and its withdrawals.
+
+From the first cblock whose initial slot reaches `fromSlot`, consensus votes sign `SHA256(chainId)` followed by their existing bincode vote bytes. Earlier votes, certificates and their stored encodings remain unchanged. A bridge-enabled node refuses an absent, blank, or published development `ACRUX_IDENTITY_SEED`, and requires `ACRUX_BRIDGE_RPC` to name the two deposit RPCs before starting network listeners. The follower continues checking attestation signatures and re-executed state; its existing historical flow does not require archived bridge proofs for ordinary cblocks.
+
+Set `ACRUX_BRIDGE_PROOF_MAX` when enabling the bridge; it has no default. It bounds the number of archived cblocks shared by withdrawal proofs and one representative per bridge epoch, separately from the rolling 4,096-cblock window. Size it for the withdrawal volume and relayer downtime to support. A full archive refuses a new required proof before its state checkpoint can become final; accepted withdrawal proofs are never evicted. A persistent net keeps the archive in `bridge-proofs.redb` beside `state.redb`. Proofs are archived before their state checkpoint and become readable only once that state is durable, so restarts preserve proofs for persisted withdrawals. A finalized descendant also commits its ancestors: validators supply missing Finalize votes for those finalized ancestors, and the node waits for each ancestor's own relayable quorum and archived proof before saving the descendant's state.
+
+`getCblockProof` accepts exactly one selector: `{consensusSlot}` for that cblock in the rolling window or archive, `{epoch}` for a retained representative of that bridge epoch, or `{latest: true}` for the newest finalized proof held. Proofs include `epochSlots`, `chainId`, the hash preimage, encoded outbox entries and the validators' signed votes. A cblock outside both the rolling window and archive answers `NOT_FOUND`.
+
 ## Crates
 
 | Crate | Concern |

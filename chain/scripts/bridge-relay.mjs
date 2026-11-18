@@ -15,7 +15,10 @@ import { createAssociatedTokenAccountIdempotentInstruction, getAssociatedTokenAd
 import { Connection, PublicKey, SYSVAR_INSTRUCTIONS_PUBKEY, Transaction, TransactionInstruction } from '@solana/web3.js'
 import { chainDir, devKeypair } from './dev-keys.mjs'
 
-export const EPOCH_SLOTS = 1536 // 96 windows of 16 slots, Acrux Net's epoch
+export const DEFAULT_EPOCH_SLOTS = 432_000 // Acrux's validator/stake epoch; proposer windows have a separate cadence.
+export const RELEASED_BITS = 8192
+export const chainTag = name => sha256(Buffer.from(name))
+export const programData = programId => PublicKey.findProgramAddressSync([programId.toBuffer()], new PublicKey('BPFLoaderUpgradeab1e11111111111111111111111'))[0]
 const ED25519 = new PublicKey('Ed25519SigVerify111111111111111111111111111')
 const VOTES_PER_TX = 4
 const sha256 = (...parts) => createHash('sha256').update(Buffer.concat(parts)).digest()
@@ -32,12 +35,16 @@ export const pdas = (programId) => {
     bridge: pda(Buffer.from('bridge')),
     set: (epoch) => pda(Buffer.from('set'), u64(epoch)),
     cblock: (hash) => pda(Buffer.from('cblock'), hash),
-    released: (sequence) => pda(Buffer.from('released'), u64(sequence)),
+    released: (sequence) => pda(Buffer.from('released'), u64(BigInt(sequence.toString()) / BigInt(RELEASED_BITS))),
+    allowed: mint => pda(Buffer.from('allowed'), mint.toBuffer()),
   }
 }
 
 /// The bincode `Vote` a validator signs: validator, slot, Some(hash), kind (Notar 0, Finalize 4).
-export const voteMessage = (validator, slot, hash, kind) => Buffer.concat([u64(validator), u64(slot), Buffer.from([1]), hash, Buffer.from(Uint32Array.of(kind === 'finalize' ? 4 : 0).buffer)])
+export const voteMessage = (chainId, validator, slot, hash, kind) => {
+  const tag = Buffer.alloc(4); tag.writeUInt32LE(kind === 'finalize' ? 4 : 0)
+  return Buffer.concat([chainId, u64(validator), u64(slot), Buffer.from([1]), hash, tag])
+}
 
 /// One ed25519 precompile instruction verifying several signatures, all held in its own data.
 export function ed25519Instruction(entries) {
@@ -94,11 +101,16 @@ export function decodeEntry(bytes) {
 
 const send = (program, instructions) => program.provider.sendAndConfirm(new Transaction().add(...instructions), [])
 
-/// Seeds `epoch` with the proof's validator set, creating the bridge first if it is not there.
-export async function seed(program, proof, epoch) {
+/// Seeds the proof's epoch, creating the bridge with the configured epoch length if absent.
+export async function seed(program, proof, epochSlots = DEFAULT_EPOCH_SLOTS) {
   const { bridge, set } = pdas(program.programId)
   const payer = program.provider.wallet.publicKey
-  if (!(await program.provider.connection.getAccountInfo(bridge))) await program.methods.initialize(new anchor.BN(EPOCH_SLOTS)).accounts({ payer }).rpc()
+  if (!(await program.provider.connection.getAccountInfo(bridge))) {
+    if (!proof.chainId) throw new Error('Gateway proof must identify the chain.')
+    await program.methods.initialize(new anchor.BN(epochSlots), new anchor.BN(Math.floor(proof.consensusSlot * 4 / epochSlots)), [...chainTag(proof.chainId)])
+      .accountsStrict({ payer, bridge, program: program.programId, programData: programData(program.programId), systemProgram: anchor.web3.SystemProgram.programId }).rpc()
+  }
+  const epoch = Math.floor(proof.consensusSlot * 4 / (await program.account.bridge.fetch(bridge)).epochSlots.toNumber())
   if (await program.provider.connection.getAccountInfo(set(epoch))) return
   const validators = proof.validators.map((key, i) => ({ key: new PublicKey(key), stake: new anchor.BN(proof.stakes[i]) }))
   await program.methods.initValidatorSet(new anchor.BN(epoch), validators).accounts({ authority: payer }).rpc()
@@ -112,7 +124,9 @@ export async function relay(program, proof) {
   const cblock = cblockOf(hash)
   const connection = program.provider.connection
   const payer = program.provider.wallet.publicKey
-  const report = { slot: proof.consensusSlot, epoch: Math.floor((proof.consensusSlot * 4) / EPOCH_SLOTS), cblock: cblock.toBase58(), transactions: [] }
+  const bridgeState = await program.account.bridge.fetch(pdas(program.programId).bridge)
+  const epochSlots = bridgeState.epochSlots.toNumber()
+  const report = { slot: proof.consensusSlot, epoch: Math.floor((proof.consensusSlot * 4) / epochSlots), cblock: cblock.toBase58(), transactions: [] }
   if (!(await connection.getAccountInfo(cblock))) {
     report.transactions.push(await program.methods.postCblock([...hash], [...Buffer.from(proof.outboxRoot, 'hex')], Buffer.from(proof.preimage, 'base64')).accountsPartial({ payer, cblock }).rpc())
   }
@@ -122,9 +136,9 @@ export async function relay(program, proof) {
     const entries = votes.slice(i, i + VOTES_PER_TX).map((v) => ({
       key: new PublicKey(proof.validators[v.validator]).toBuffer(),
       signature: Buffer.from(v.signature, 'base64'),
-      message: voteMessage(v.validator, proof.consensusSlot, hash, v.kind),
+      message: voteMessage(Buffer.from(bridgeState.chainId), v.validator, proof.consensusSlot, hash, v.kind),
     }))
-    const attest = await program.methods.attestCblock().accountsPartial({ cblock, set: set(report.epoch), instructions: SYSVAR_INSTRUCTIONS_PUBKEY }).instruction()
+    const attest = await program.methods.attestCblock().accountsPartial({ bridge: pdas(program.programId).bridge, cblock, set: set(report.epoch), instructions: SYSVAR_INSTRUCTIONS_PUBKEY }).instruction()
     report.transactions.push(await send(program, [ed25519Instruction(entries), attest]))
   }
   const state = await program.account.cblock.fetch(cblock)
@@ -138,12 +152,14 @@ export async function relay(program, proof) {
     const entry = decodeEntry(leaf)
     if (!state.certified || !entry) continue
     if (entry.withdrawal) {
-      if (await connection.getAccountInfo(released(entry.sequence.toNumber()))) continue
+      const guard = await program.account.released.fetchNullable(released(entry.sequence))
+      const bit = Number(BigInt(entry.sequence.toString()) % BigInt(RELEASED_BITS))
+      if (guard && (guard.bits[Math.floor(bit / 8)] & (1 << (bit % 8)))) continue
       // The recipient's token account at the mint, made if it is missing, receives the payout.
       const tokenProgram = (await connection.getAccountInfo(entry.mint)).owner
       const destination = getAssociatedTokenAddressSync(entry.mint, entry.recipient, true, tokenProgram)
       const release = await program.methods.release(entry.sequence, entry.recipient, entry.amount, outboxProof(leaves, index))
-        .accountsPartial({ payer, cblock, mint: entry.mint, destination, tokenProgram }).instruction()
+        .accountsPartial({ payer, cblock, mint: entry.mint, destination, released: released(entry.sequence), tokenProgram }).instruction()
       report.transactions.push(await send(program, [createAssociatedTokenAccountIdempotentInstruction(payer, destination, entry.recipient, entry.mint, tokenProgram), release]))
       report.released.push({ sequence: entry.sequence.toNumber(), recipient: entry.recipient.toBase58(), amount: entry.amount.toString() })
       continue
@@ -165,6 +181,6 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const arg = (name, fallback) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback }
   const program = bridgeProgram(new Connection(arg('rpc', 'http://127.0.0.1:4990'), 'confirmed'), devKeypair('local-authority'))
   const proof = await cblockProof(arg('acrux', 'http://127.0.0.1:4930'), Number(arg('cblock')))
-  if (process.argv.includes('--seed')) await seed(program, proof, Math.floor((proof.consensusSlot * 4) / EPOCH_SLOTS))
+  if (process.argv.includes('--seed')) await seed(program, proof)
   console.log(JSON.stringify(await relay(program, proof)))
 }

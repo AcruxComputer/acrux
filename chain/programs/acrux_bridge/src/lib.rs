@@ -23,11 +23,21 @@ declare_id!("EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5");
 pub mod acrux_bridge {
     use super::*;
 
-    /// Creates the bridge's one state account, which numbers the deposits. Its payer becomes the
-    /// authority that seeds the first validator set; `epoch_slots` is an Acrux epoch's length.
-    pub fn initialize(ctx: Context<Initialize>, epoch_slots: u64) -> Result<()> {
+    /// Only the program's upgrade authority can initialize the bridge. The first validator epoch
+    /// and the chain tag are fixed here before the one permitted validator-set seed.
+    pub fn initialize(ctx: Context<Initialize>, epoch_slots: u64, first_epoch: u64, chain_id: [u8; 32]) -> Result<()> {
         require!(epoch_slots > 0 && epoch_slots % 4 == 0, BridgeError::BadEpoch);
-        ctx.accounts.bridge.set_inner(Bridge { deposits: 0, bump: ctx.bumps.bridge, authority: ctx.accounts.payer.key(), epoch_slots });
+        require!(chain_id != [0; 32], BridgeError::BadChainId);
+        ctx.accounts.bridge.set_inner(Bridge {
+            deposits: 0, bump: ctx.bumps.bridge, authority: ctx.accounts.payer.key(), epoch_slots,
+            first_epoch, seeded: false, chain_id,
+        });
+        Ok(())
+    }
+
+    /// The authority explicitly admits a mint before its tokens can be deposited.
+    pub fn allow_mint(ctx: Context<AllowMint>) -> Result<()> {
+        ctx.accounts.allowed.set_inner(AllowedMint { mint: ctx.accounts.mint.key() });
         Ok(())
     }
 
@@ -73,9 +83,11 @@ pub mod acrux_bridge {
 
     /// Seeds the light client: Acrux's validators and stakes for `epoch`, in Acrux's validator order.
     pub fn init_validator_set(ctx: Context<InitValidatorSet>, epoch: u64, validators: Vec<Validator>) -> Result<()> {
+        require!(!ctx.accounts.bridge.seeded && epoch == ctx.accounts.bridge.first_epoch, BridgeError::AlreadySeeded);
         require!(!validators.is_empty() && validators.len() <= MAX_VALIDATORS, BridgeError::BadSet);
         let total = validators.iter().map(|v| v.stake).sum();
-        ctx.accounts.set.set_inner(ValidatorSet { epoch, total, validators });
+        ctx.accounts.set.set_inner(ValidatorSet { epoch, total, validators, payer: ctx.accounts.authority.key() });
+        ctx.accounts.bridge.seeded = true;
         Ok(())
     }
 
@@ -85,8 +97,8 @@ pub mod acrux_bridge {
     pub fn post_cblock(ctx: Context<PostCblock>, hash: [u8; 32], outbox_root: [u8; 32], preimage: Vec<u8>) -> Result<()> {
         require!(hashv(&[&preimage, &outbox_root]).to_bytes() == hash, BridgeError::BadPreimage);
         let slot = u64::from_le_bytes(preimage.get(..8).ok_or(BridgeError::BadPreimage)?.try_into().unwrap());
-        let epoch = slot * 4 / ctx.accounts.bridge.epoch_slots;
-        ctx.accounts.cblock.set_inner(Cblock { slot, epoch, hash, outbox_root, notar: 0, finalize: 0, certified: false });
+        let epoch = slot.checked_mul(4).ok_or(BridgeError::BadPreimage)? / ctx.accounts.bridge.epoch_slots;
+        ctx.accounts.cblock.set_inner(Cblock { slot, epoch, hash, outbox_root, notar: 0, finalize: 0, certified: false, payer: ctx.accounts.payer.key() });
         Ok(())
     }
 
@@ -104,14 +116,15 @@ pub mod acrux_bridge {
             }
             for (key, message) in ed25519_entries(&ix.data)? {
                 let v = set.validators.iter().position(|x| x.key.to_bytes() == key).ok_or(BridgeError::BadVote)?;
-                // bincode Vote: validator (u64), slot (u64), Some (1) and the hash, kind (u32).
-                let mut signed = Vec::with_capacity(49);
+                // Chain tag, then bincode Vote: validator, slot, Some(hash), kind.
+                let mut signed = Vec::with_capacity(81);
+                signed.extend_from_slice(&ctx.accounts.bridge.chain_id);
                 signed.extend_from_slice(&(v as u64).to_le_bytes());
                 signed.extend_from_slice(&cblock.slot.to_le_bytes());
                 signed.push(1);
                 signed.extend_from_slice(&cblock.hash);
-                require!(message.len() == 53 && message[..49] == signed[..], BridgeError::BadVote);
-                match u32::from_le_bytes(message[49..53].try_into().unwrap()) {
+                require!(message.len() == 85 && message[..81] == signed[..], BridgeError::BadVote);
+                match u32::from_le_bytes(message[81..85].try_into().unwrap()) {
                     VOTE_NOTAR => cblock.notar |= 1 << v,
                     VOTE_FINALIZE => cblock.finalize |= 1 << v,
                     _ => return err!(BridgeError::BadVote),
@@ -157,6 +170,9 @@ pub mod acrux_bridge {
     /// against the outbox root of a certified cblock. Each sequence is paid once.
     pub fn release(ctx: Context<Release>, sequence: u64, recipient: Pubkey, amount: u64, proof: Vec<ProofNode>) -> Result<()> {
         require!(ctx.accounts.cblock.certified, BridgeError::NotCertified);
+        let index = (sequence % RELEASES_PER_BUCKET) as usize;
+        let mask = 1u8 << (index % 8);
+        require!(ctx.accounts.released.bits[index / 8] & mask == 0, BridgeError::AlreadyReleased);
         let mint = ctx.accounts.mint.key();
         // bincode OutboxEntry::Withdrawal: variant (u32 1), sequence, Solana mint, recipient, amount.
         let mut entry = Vec::with_capacity(84);
@@ -181,7 +197,8 @@ pub mod acrux_bridge {
             amount,
             ctx.accounts.mint.decimals,
         )?;
-        ctx.accounts.released.set_inner(Released { sequence, cblock: ctx.accounts.cblock.key() });
+        ctx.accounts.released.bucket = sequence / RELEASES_PER_BUCKET;
+        ctx.accounts.released.bits[index / 8] |= mask;
         Ok(())
     }
 
@@ -202,12 +219,26 @@ pub mod acrux_bridge {
         }
         require!(merkle_root(&entry, &proof) == cblock.outbox_root, BridgeError::BadProof);
         let total = validators.iter().map(|v| v.stake).sum();
-        ctx.accounts.next.set_inner(ValidatorSet { epoch, total, validators });
+        ctx.accounts.next.set_inner(ValidatorSet { epoch, total, validators, payer: ctx.accounts.payer.key() });
+        Ok(())
+    }
+
+    /// Returns a posted cblock's rent to its payer. Only its payer can discard it, so another
+    /// relayer cannot close it between attestation and release. It can be posted again when needed.
+    pub fn close_cblock(_ctx: Context<CloseCblock>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Returns an old validator set's rent to its payer, retaining the newest two sets.
+    /// The relayer releases all pending withdrawals of the old epoch before it calls this.
+    pub fn close_validator_set(ctx: Context<CloseValidatorSet>) -> Result<()> {
+        require!(ctx.accounts.newest.epoch.saturating_sub(ctx.accounts.set.epoch) >= 2, BridgeError::RecentValidatorSet);
         Ok(())
     }
 }
 
 pub const MAX_VALIDATORS: usize = 32;
+pub const RELEASES_PER_BUCKET: u64 = 8192;
 const VOTE_NOTAR: u32 = 0;
 const VOTE_FINALIZE: u32 = 4;
 const ED25519_PROGRAM: Pubkey = pubkey!("Ed25519SigVerify111111111111111111111111111");
@@ -248,6 +279,18 @@ pub struct Bridge {
     pub authority: Pubkey,
     /// An Acrux epoch's length in slots.
     pub epoch_slots: u64,
+    /// The only epoch the authority can seed directly.
+    pub first_epoch: u64,
+    pub seeded: bool,
+    /// Prefix of every validator's signed vote, unique to this Acrux chain.
+    pub chain_id: [u8; 32],
+}
+
+/// A mint admitted by the bridge authority, at `["allowed", mint]`.
+#[account]
+#[derive(InitSpace)]
+pub struct AllowedMint {
+    pub mint: Pubkey,
 }
 
 /// One deposit, at `["deposit", sequence]`.
@@ -289,12 +332,13 @@ pub struct Withdrawal {
     pub bump: u8,
 }
 
-/// On Solana: a withdrawal paid, at `["released", sequence]`.
+/// On Solana: replay guards for 8,192 withdrawals, at `["released", sequence / 8192]`.
 #[account]
 #[derive(InitSpace)]
 pub struct Released {
-    pub sequence: u64,
-    pub cblock: Pubkey,
+    pub bucket: u64,
+    /// Low bit first within each byte; a bit is set only after the payout succeeds.
+    pub bits: [u8; 1024],
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, InitSpace)]
@@ -318,6 +362,8 @@ pub struct ValidatorSet {
     pub total: u64,
     #[max_len(32)]
     pub validators: Vec<Validator>,
+    /// Receives the rent when this account is closed.
+    pub payer: Pubkey,
 }
 
 /// A cblock posted to the light client, at `["cblock", hash]`, with the validators that voted for
@@ -332,6 +378,8 @@ pub struct Cblock {
     pub notar: u32,
     pub finalize: u32,
     pub certified: bool,
+    /// Receives the rent when this account is closed.
+    pub payer: Pubkey,
 }
 
 #[event]
@@ -350,6 +398,22 @@ pub struct Initialize<'info> {
     pub payer: Signer<'info>,
     #[account(init, payer = payer, space = 8 + Bridge::INIT_SPACE, seeds = [b"bridge"], bump)]
     pub bridge: Account<'info, Bridge>,
+    #[account(constraint = program.programdata_address()? == Some(program_data.key()) @ BridgeError::NotUpgradeAuthority)]
+    pub program: Program<'info, crate::program::AcruxBridge>,
+    #[account(constraint = program_data.upgrade_authority_address == Some(payer.key()) @ BridgeError::NotUpgradeAuthority)]
+    pub program_data: Account<'info, ProgramData>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AllowMint<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(seeds = [b"bridge"], bump = bridge.bump, has_one = authority)]
+    pub bridge: Account<'info, Bridge>,
+    pub mint: InterfaceAccount<'info, Mint>,
+    #[account(init, payer = authority, space = 8 + AllowedMint::INIT_SPACE, seeds = [b"allowed", mint.key().as_ref()], bump)]
+    pub allowed: Account<'info, AllowedMint>,
     pub system_program: Program<'info, System>,
 }
 
@@ -362,6 +426,8 @@ pub struct Deposit<'info> {
     pub bridge: Account<'info, Bridge>,
     #[account(mint::token_program = token_program)]
     pub mint: InterfaceAccount<'info, Mint>,
+    #[account(seeds = [b"allowed", mint.key().as_ref()], bump, has_one = mint)]
+    pub allowed: Account<'info, AllowedMint>,
     #[account(mut, token::mint = mint, token::authority = depositor, token::token_program = token_program)]
     pub source: InterfaceAccount<'info, TokenAccount>,
     /// The mint's vault: a token account at `["vault", mint]` that is its own authority, created
@@ -393,7 +459,7 @@ pub struct Deposit<'info> {
 pub struct InitValidatorSet<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
-    #[account(seeds = [b"bridge"], bump = bridge.bump, has_one = authority)]
+    #[account(mut, seeds = [b"bridge"], bump = bridge.bump, has_one = authority)]
     pub bridge: Account<'info, Bridge>,
     #[account(init, payer = authority, space = 8 + ValidatorSet::INIT_SPACE, seeds = [b"set", epoch.to_le_bytes().as_ref()], bump)]
     pub set: Account<'info, ValidatorSet>,
@@ -414,6 +480,8 @@ pub struct PostCblock<'info> {
 
 #[derive(Accounts)]
 pub struct AttestCblock<'info> {
+    #[account(seeds = [b"bridge"], bump = bridge.bump)]
+    pub bridge: Account<'info, Bridge>,
     #[account(mut, seeds = [b"cblock", cblock.hash.as_ref()], bump)]
     pub cblock: Account<'info, Cblock>,
     #[account(seeds = [b"set", cblock.epoch.to_le_bytes().as_ref()], bump)]
@@ -459,8 +527,8 @@ pub struct Release<'info> {
     pub vault: InterfaceAccount<'info, TokenAccount>,
     #[account(mut, token::mint = mint, token::authority = recipient, token::token_program = token_program)]
     pub destination: InterfaceAccount<'info, TokenAccount>,
-    #[account(init, payer = payer, space = 8 + Released::INIT_SPACE, seeds = [b"released", sequence.to_le_bytes().as_ref()], bump)]
-    pub released: Account<'info, Released>,
+    #[account(init_if_needed, payer = payer, space = 8 + Released::INIT_SPACE, seeds = [b"released", (sequence / RELEASES_PER_BUCKET).to_le_bytes().as_ref()], bump)]
+    pub released: Box<Account<'info, Released>>,
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
@@ -475,6 +543,24 @@ pub struct HandOff<'info> {
     #[account(init, payer = payer, space = 8 + ValidatorSet::INIT_SPACE, seeds = [b"set", epoch.to_le_bytes().as_ref()], bump)]
     pub next: Account<'info, ValidatorSet>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CloseCblock<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, seeds = [b"cblock", cblock.hash.as_ref()], bump, has_one = payer, close = payer)]
+    pub cblock: Account<'info, Cblock>,
+}
+
+#[derive(Accounts)]
+pub struct CloseValidatorSet<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, seeds = [b"set", set.epoch.to_le_bytes().as_ref()], bump, has_one = payer, close = payer)]
+    pub set: Account<'info, ValidatorSet>,
+    #[account(seeds = [b"set", newest.epoch.to_le_bytes().as_ref()], bump)]
+    pub newest: Account<'info, ValidatorSet>,
 }
 
 #[error_code]
@@ -493,4 +579,14 @@ pub enum BridgeError {
     NotCertified,
     #[msg("The validator set is not in the cblock's outbox.")]
     BadProof,
+    #[msg("The newest two validator sets stay open.")]
+    RecentValidatorSet,
+    #[msg("Only the program's upgrade authority can initialize the bridge.")]
+    NotUpgradeAuthority,
+    #[msg("The first validator epoch can be seeded only once.")]
+    AlreadySeeded,
+    #[msg("The chain tag must be set.")]
+    BadChainId,
+    #[msg("This withdrawal has already been released.")]
+    AlreadyReleased,
 }

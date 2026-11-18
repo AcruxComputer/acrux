@@ -10,6 +10,82 @@ export const ACRUX_BRIDGE_IDL = {
  },
  "instructions": [
   {
+   "name": "allow_mint",
+   "docs": [
+    "The authority explicitly admits a mint before its tokens can be deposited."
+   ],
+   "discriminator": [
+    240,
+    28,
+    240,
+    70,
+    124,
+    240,
+    245,
+    225
+   ],
+   "accounts": [
+    {
+     "name": "authority",
+     "writable": true,
+     "signer": true,
+     "relations": [
+      "bridge"
+     ]
+    },
+    {
+     "name": "bridge",
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         98,
+         114,
+         105,
+         100,
+         103,
+         101
+        ]
+       }
+      ]
+     }
+    },
+    {
+     "name": "mint"
+    },
+    {
+     "name": "allowed",
+     "writable": true,
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         97,
+         108,
+         108,
+         111,
+         119,
+         101,
+         100
+        ]
+       },
+       {
+        "kind": "account",
+        "path": "mint"
+       }
+      ]
+     }
+    },
+    {
+     "name": "system_program",
+     "address": "11111111111111111111111111111111"
+    }
+   ],
+   "args": []
+  },
+  {
    "name": "attest_cblock",
    "docs": [
     "Counts the votes this transaction's ed25519 instructions verified: each must be a validator",
@@ -26,6 +102,24 @@ export const ACRUX_BRIDGE_IDL = {
     175
    ],
    "accounts": [
+    {
+     "name": "bridge",
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         98,
+         114,
+         105,
+         100,
+         103,
+         101
+        ]
+       }
+      ]
+     }
+    },
     {
      "name": "cblock",
      "writable": true,
@@ -78,6 +172,127 @@ export const ACRUX_BRIDGE_IDL = {
    "args": []
   },
   {
+   "name": "close_cblock",
+   "docs": [
+    "Returns a posted cblock's rent to its payer. Only its payer can discard it, so another",
+    "relayer cannot close it between attestation and release. It can be posted again when needed."
+   ],
+   "discriminator": [
+    184,
+    70,
+    147,
+    162,
+    48,
+    247,
+    249,
+    79
+   ],
+   "accounts": [
+    {
+     "name": "payer",
+     "writable": true,
+     "signer": true,
+     "relations": [
+      "cblock"
+     ]
+    },
+    {
+     "name": "cblock",
+     "writable": true,
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         99,
+         98,
+         108,
+         111,
+         99,
+         107
+        ]
+       },
+       {
+        "kind": "account",
+        "path": "cblock.hash",
+        "account": "Cblock"
+       }
+      ]
+     }
+    }
+   ],
+   "args": []
+  },
+  {
+   "name": "close_validator_set",
+   "docs": [
+    "Returns an old validator set's rent to its payer, retaining the newest two sets.",
+    "The relayer releases all pending withdrawals of the old epoch before it calls this."
+   ],
+   "discriminator": [
+    49,
+    189,
+    218,
+    157,
+    6,
+    74,
+    251,
+    207
+   ],
+   "accounts": [
+    {
+     "name": "payer",
+     "writable": true,
+     "signer": true,
+     "relations": [
+      "set"
+     ]
+    },
+    {
+     "name": "set",
+     "writable": true,
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         115,
+         101,
+         116
+        ]
+       },
+       {
+        "kind": "account",
+        "path": "set.epoch",
+        "account": "ValidatorSet"
+       }
+      ]
+     }
+    },
+    {
+     "name": "newest",
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         115,
+         101,
+         116
+        ]
+       },
+       {
+        "kind": "account",
+        "path": "newest.epoch",
+        "account": "ValidatorSet"
+       }
+      ]
+     }
+    }
+   ],
+   "args": []
+  },
+  {
    "name": "deposit",
    "docs": [
     "Locks `amount` of the depositor's tokens in the mint's vault and records the deposit for",
@@ -120,7 +335,33 @@ export const ACRUX_BRIDGE_IDL = {
      }
     },
     {
-     "name": "mint"
+     "name": "mint",
+     "relations": [
+      "allowed"
+     ]
+    },
+    {
+     "name": "allowed",
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         97,
+         108,
+         108,
+         111,
+         119,
+         101,
+         100
+        ]
+       },
+       {
+        "kind": "account",
+        "path": "mint"
+       }
+      ]
+     }
     },
     {
      "name": "source",
@@ -351,6 +592,7 @@ export const ACRUX_BRIDGE_IDL = {
     },
     {
      "name": "bridge",
+     "writable": true,
      "pda": {
       "seeds": [
        {
@@ -412,8 +654,8 @@ export const ACRUX_BRIDGE_IDL = {
   {
    "name": "initialize",
    "docs": [
-    "Creates the bridge's one state account, which numbers the deposits. Its payer becomes the",
-    "authority that seeds the first validator set; `epoch_slots` is an Acrux epoch's length."
+    "Only the program's upgrade authority can initialize the bridge. The first validator epoch",
+    "and the chain tag are fixed here before the one permitted validator-set seed."
    ],
    "discriminator": [
     175,
@@ -451,6 +693,13 @@ export const ACRUX_BRIDGE_IDL = {
      }
     },
     {
+     "name": "program",
+     "address": "EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5"
+    },
+    {
+     "name": "program_data"
+    },
+    {
      "name": "system_program",
      "address": "11111111111111111111111111111111"
     }
@@ -459,6 +708,19 @@ export const ACRUX_BRIDGE_IDL = {
     {
      "name": "epoch_slots",
      "type": "u64"
+    },
+    {
+     "name": "first_epoch",
+     "type": "u64"
+    },
+    {
+     "name": "chain_id",
+     "type": {
+      "array": [
+       "u8",
+       32
+      ]
+     }
     }
    ]
   },
@@ -632,28 +894,7 @@ export const ACRUX_BRIDGE_IDL = {
     },
     {
      "name": "released",
-     "writable": true,
-     "pda": {
-      "seeds": [
-       {
-        "kind": "const",
-        "value": [
-         114,
-         101,
-         108,
-         101,
-         97,
-         115,
-         101,
-         100
-        ]
-       },
-       {
-        "kind": "arg",
-        "path": "sequence"
-       }
-      ]
-     }
+     "writable": true
     },
     {
      "name": "token_program"
@@ -810,6 +1051,19 @@ export const ACRUX_BRIDGE_IDL = {
  ],
  "accounts": [
   {
+   "name": "AllowedMint",
+   "discriminator": [
+    173,
+    229,
+    179,
+    46,
+    121,
+    164,
+    247,
+    6
+   ]
+  },
+  {
    "name": "Bridge",
    "discriminator": [
     231,
@@ -951,9 +1205,49 @@ export const ACRUX_BRIDGE_IDL = {
    "code": 6006,
    "name": "BadProof",
    "msg": "The validator set is not in the cblock's outbox."
+  },
+  {
+   "code": 6007,
+   "name": "RecentValidatorSet",
+   "msg": "The newest two validator sets stay open."
+  },
+  {
+   "code": 6008,
+   "name": "NotUpgradeAuthority",
+   "msg": "Only the program's upgrade authority can initialize the bridge."
+  },
+  {
+   "code": 6009,
+   "name": "AlreadySeeded",
+   "msg": "The first validator epoch can be seeded only once."
+  },
+  {
+   "code": 6010,
+   "name": "BadChainId",
+   "msg": "The chain tag must be set."
+  },
+  {
+   "code": 6011,
+   "name": "AlreadyReleased",
+   "msg": "This withdrawal has already been released."
   }
  ],
  "types": [
+  {
+   "name": "AllowedMint",
+   "docs": [
+    "A mint admitted by the bridge authority, at `[\"allowed\", mint]`."
+   ],
+   "type": {
+    "kind": "struct",
+    "fields": [
+     {
+      "name": "mint",
+      "type": "pubkey"
+     }
+    ]
+   }
+  },
   {
    "name": "Bridge",
    "type": {
@@ -983,6 +1277,29 @@ export const ACRUX_BRIDGE_IDL = {
        "An Acrux epoch's length in slots."
       ],
       "type": "u64"
+     },
+     {
+      "name": "first_epoch",
+      "docs": [
+       "The only epoch the authority can seed directly."
+      ],
+      "type": "u64"
+     },
+     {
+      "name": "seeded",
+      "type": "bool"
+     },
+     {
+      "name": "chain_id",
+      "docs": [
+       "Prefix of every validator's signed vote, unique to this Acrux chain."
+      ],
+      "type": {
+       "array": [
+        "u8",
+        32
+       ]
+      }
      }
     ]
    }
@@ -1033,6 +1350,13 @@ export const ACRUX_BRIDGE_IDL = {
      {
       "name": "certified",
       "type": "bool"
+     },
+     {
+      "name": "payer",
+      "docs": [
+       "Receives the rent when this account is closed."
+      ],
+      "type": "pubkey"
      }
     ]
    }
@@ -1163,18 +1487,26 @@ export const ACRUX_BRIDGE_IDL = {
   {
    "name": "Released",
    "docs": [
-    "On Solana: a withdrawal paid, at `[\"released\", sequence]`."
+    "On Solana: replay guards for 8,192 withdrawals, at `[\"released\", sequence / 8192]`."
    ],
    "type": {
     "kind": "struct",
     "fields": [
      {
-      "name": "sequence",
+      "name": "bucket",
       "type": "u64"
      },
      {
-      "name": "cblock",
-      "type": "pubkey"
+      "name": "bits",
+      "docs": [
+       "Low bit first within each byte; a bit is set only after the payout succeeds."
+      ],
+      "type": {
+       "array": [
+        "u8",
+        1024
+       ]
+      }
      }
     ]
    }
@@ -1220,6 +1552,13 @@ export const ACRUX_BRIDGE_IDL = {
         }
        }
       }
+     },
+     {
+      "name": "payer",
+      "docs": [
+       "Receives the rent when this account is closed."
+      ],
+      "type": "pubkey"
      }
     ]
    }

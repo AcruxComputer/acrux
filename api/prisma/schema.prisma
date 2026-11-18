@@ -220,3 +220,17 @@ model ReplaySlot {
 
   @@map("replay_slots")
 }
+
+/// The bridge keeper's latest report, shared with the API across processes.
+model BridgeRelayerState {
+  program                String   @id @db.VarChar(44)
+  wallet                 String   @db.VarChar(44)
+  lamports               Decimal  @db.Decimal(20, 0)
+  lastCblock             BigInt?  @map("last_cblock")
+  lastHandedEpoch        BigInt?  @map("last_handed_epoch")
+  lastRelayedAt          DateTime? @map("last_relayed_at") @db.Timestamptz(3)
+  nextWithdrawalSequence BigInt   @default(0) @map("next_withdrawal_sequence")
+  updatedAt              DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("bridge_relayer_states")
+}

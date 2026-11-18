@@ -115,6 +115,9 @@ export const BridgeVault = z.strictObject({
 })
 /** The newest cblock Solana's light client certified. */
 export const BridgeCertified = z.strictObject({ consensusSlot: Count, epoch: Count, hash: Hash, outboxRoot: Hash, account: Address })
+export const BridgeRelayer = z.strictObject({
+  wallet: Address, lamports: U64, lastCblock: Count.nullable(), lastHandedEpoch: Count.nullable(), lastRelayedAt: Timestamp.nullable(),
+})
 export const Bridge = z.strictObject({
   status: z.enum(['waiting', 'live']),
   /** The program's address, on Solana and on Acrux. */
@@ -122,6 +125,7 @@ export const Bridge = z.strictObject({
   /** The first Acrux slot of the bridge rule. */
   fromSlot: Count.nullable(),
   lightClient: z.strictObject({ epoch: Count.nullable(), validators: Count, latestCertified: BridgeCertified.nullable() }),
+  relayer: BridgeRelayer.nullable(),
   vaults: z.array(BridgeVault),
   totals: z.strictObject({ deposits: Count, credited: Count, withdrawals: Count, released: Count }),
   readAt: Timestamp.nullable(),
@@ -142,7 +146,7 @@ export const BridgeTransfer = z.strictObject({
   solanaSlot: Count.nullable(),
   /** A withdrawal's Acrux slot, and the cblock whose outbox carries it. */
   acruxSlot: Count.nullable(), cblock: Count.nullable(),
-  /** The account on Solana that records a withdrawal's release. */
+  /** The bitmap account on Solana containing this withdrawal's released bit. */
   releaseAccount: Address.nullable(),
 })
 export const BridgeTransfers = page(BridgeTransfer)

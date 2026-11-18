@@ -19,6 +19,16 @@ pub struct SignedVote {
     pub vote: consensus::Vote,
     pub signature: Vec<u8>,
 }
+/// The existing bincode Vote, prefixed by the configured chain's SHA-256 only from the bridge's
+/// first cblock onward. Earlier signatures and their on-disk encodings remain unchanged.
+pub fn vote_message(vote: &consensus::Vote, bridge: Option<&crate::genesis::BridgeConfig>) -> anyhow::Result<Vec<u8>> {
+    let mut message = vec![];
+    if let Some(bridge) = bridge.filter(|rule| vote.slot >= rule.from_slot.div_ceil(4)) {
+        message.extend_from_slice(&bridge.chain_tag());
+    }
+    message.extend_from_slice(&bincode::serialize(vote)?);
+    Ok(message)
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Wire {
     Shreds(Vec<Shred>),
@@ -168,6 +178,48 @@ impl Default for Configuration {
             persist: false,
             keep_days: 7,
             keep_max: 200_000,
+        }
+    }
+}
+
+#[cfg(test)]
+mod vote_tests {
+    use super::*;
+    use crate::{crypto, genesis::BridgeConfig};
+
+    fn rule(chain_id: &str) -> BridgeConfig {
+        BridgeConfig { program: solana_sdk::pubkey::Pubkey::new_unique(), from_slot: 400, epoch_slots: 432_000, chain_id: chain_id.into() }
+    }
+
+    #[test]
+    fn bridge_vote_is_bound_to_its_chain() {
+        let vote = consensus::Vote { validator: 2, slot: 100, hash: Some([7; 32]), kind: consensus::VoteKind::Finalize };
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let original = vote_message(&vote, Some(&rule("chain-a"))).unwrap();
+        let other = vote_message(&vote, Some(&rule("chain-b"))).unwrap();
+        let signature = crypto::sign_bytes(&signer, &original);
+        assert_eq!(&original[..32], &crypto::hash(b"chain-a"));
+        assert_eq!(&original[32..], bincode::serialize(&vote).unwrap());
+        assert!(crypto::verify_bytes(&signer.verifying_key(), &original, &signature).is_ok());
+        assert!(crypto::verify_bytes(&signer.verifying_key(), &other, &signature).is_err());
+        assert!(crypto::verify_bytes(&signer.verifying_key(), &bincode::serialize(&vote).unwrap(), &signature).is_err());
+    }
+
+    #[test]
+    fn votes_before_bridge_activation_keep_their_original_signatures() {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[6; 32]);
+        for kind in [consensus::VoteKind::Notar, consensus::VoteKind::NotarFallback, consensus::VoteKind::Skip, consensus::VoteKind::SkipFallback, consensus::VoteKind::Finalize] {
+            let vote = consensus::Vote { validator: 3, slot: 99, hash: Some([9; 32]), kind };
+            let legacy = bincode::serialize(&vote).unwrap();
+            let signature = crypto::sign_bytes(&signer, &legacy);
+            assert_eq!(vote_message(&vote, None).unwrap(), legacy);
+            let message = vote_message(&vote, Some(&rule("chain-a"))).unwrap();
+            assert_eq!(message, legacy);
+            assert!(crypto::verify_bytes(&signer.verifying_key(), &message, &signature).is_ok());
+            // Stored certificate votes retain their original bincode layout as well.
+            let stored = bincode::serialize(&SignedVote { vote, signature }).unwrap();
+            let restored: SignedVote = bincode::deserialize(&stored).unwrap();
+            assert!(crypto::verify_bytes(&signer.verifying_key(), &vote_message(&restored.vote, Some(&rule("chain-a"))).unwrap(), &restored.signature).is_ok());
         }
     }
 }

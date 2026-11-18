@@ -1,1 +1,1 @@
-export const CONTRACT_VERSION = '0.1.16'
+export const CONTRACT_VERSION = '0.1.18'

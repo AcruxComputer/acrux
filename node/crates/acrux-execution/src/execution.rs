@@ -120,6 +120,38 @@ pub struct BridgeCredit {
     pub amount: u64,
 }
 
+/// Why a finalized deposit was consumed without minting on Acrux. The ordinal is persisted by
+/// bincode in SkippedBridgeCredit, so append variants instead of reordering them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BridgeCreditSkipReason {
+    InvalidSolanaMint,
+    InvalidRecipient,
+    MintOwner,
+    MintLayout,
+    MintLamportsOverflow,
+    SupplyOverflow,
+    RecipientOwner,
+    RecipientLayout,
+    RecipientLamportsOverflow,
+    BalanceOverflow,
+    SequenceOverflow,
+}
+
+/// A skipped deposit remains in committed account state for inspection. It cannot be reapplied:
+/// the same sequence counter advances for successful and skipped deposits.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedBridgeCredit {
+    pub credit: BridgeCredit,
+    pub reason: BridgeCreditSkipReason,
+}
+
+/// The bridge-owned account holding bincode SkippedBridgeCredit, without an Anchor discriminator.
+pub fn bridge_skipped_credit(bridge: &Pubkey, sequence: u64) -> Pubkey {
+    Pubkey::find_program_address(&[b"skipped_credit", &sequence.to_le_bytes()], bridge).0
+}
+
 /// Where the bridge's tokens live on Acrux, all derived from the Solana bridge program's address:
 /// a mint per Solana mint at `["mint", solana mint]`, minted by `["authority"]`, and the next
 /// sequence to credit in the account at `["credited"]`, so it is part of the state.
@@ -802,47 +834,110 @@ impl SvmExecutor {
         self.credits = credits;
     }
 
-    /// Applies the queued credits in sequence: each mints its amount of the bridged token to the
-    /// recipient's associated token account (both created on the first credit that needs them).
-    /// A sequence already credited is passed over; one past a gap waits for the gap.
+    /// Prepares both accounts before changing state. Only a non-executable, empty system account
+    /// may become a bridged mint or ATA; its lamports remain alongside the allocated rent.
+    fn prepare_bridge_credit(&self, bridge: &Pubkey, credit: &BridgeCredit) -> std::result::Result<[(Pubkey, Account); 2], BridgeCreditSkipReason> {
+        use BridgeCreditSkipReason::*;
+        let token = spl_token_id();
+        let solana_mint = Pubkey::from_str(&credit.solana_mint).map_err(|_| InvalidSolanaMint)?;
+        let recipient = Pubkey::from_str(&credit.recipient).map_err(|_| InvalidRecipient)?;
+        let mint = bridge_mint(bridge, &solana_mint);
+        let authority = bridge_authority(bridge);
+        let shell = |account: &Account| account.owner == system_program::id() && account.data.is_empty() && !account.executable;
+        let mut mint_account = match self.svm.get_account(&mint) {
+            Some(account) if account.owner == token => {
+                let d = &account.data;
+                if account.executable || d.len() != 82 || d[..4] != 1u32.to_le_bytes()
+                    || d[4..36] != authority.to_bytes() || d[44] != credit.decimals || d[45] != 1
+                    || d[46..50] != 0u32.to_le_bytes() {
+                    return Err(MintLayout);
+                }
+                account
+            }
+            account if account.as_ref().is_none_or(&shell) => {
+                let existing = account.map_or(0, |a| a.lamports);
+                let lamports = self.rent_exempt_minimum(82).checked_add(existing).ok_or(MintLamportsOverflow)?;
+                let mut data = vec![0u8; 82];
+                data[..4].copy_from_slice(&1u32.to_le_bytes());
+                data[4..36].copy_from_slice(authority.as_ref());
+                data[44] = credit.decimals;
+                data[45] = 1;
+                Account { lamports, data, owner: token, executable: false, rent_epoch: 0 }
+            }
+            _ => return Err(MintOwner),
+        };
+        let supply = u64::from_le_bytes(mint_account.data[36..44].try_into().unwrap())
+            .checked_add(credit.amount).ok_or(SupplyOverflow)?;
+        let ata = Pubkey::find_program_address(
+            &[recipient.as_ref(), token.as_ref(), mint.as_ref()],
+            &Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap(),
+        ).0;
+        let mut holder = match self.svm.get_account(&ata) {
+            Some(account) if account.owner == token => {
+                let d = &account.data;
+                if account.executable || d.len() != 165 || d[..32] != mint.to_bytes()
+                    || d[32..64] != recipient.to_bytes() || d[108] != 1
+                    || !matches!(d[72..76], [0, 0, 0, 0] | [1, 0, 0, 0])
+                    || d[109..113] != 0u32.to_le_bytes()
+                    || !matches!(d[129..133], [0, 0, 0, 0] | [1, 0, 0, 0]) {
+                    return Err(RecipientLayout);
+                }
+                account
+            }
+            account if account.as_ref().is_none_or(&shell) => {
+                let existing = account.map_or(0, |a| a.lamports);
+                let lamports = self.rent_exempt_minimum(165).checked_add(existing).ok_or(RecipientLamportsOverflow)?;
+                let mut data = vec![0u8; 165];
+                data[..32].copy_from_slice(mint.as_ref());
+                data[32..64].copy_from_slice(recipient.as_ref());
+                data[108] = 1;
+                Account { lamports, data, owner: token, executable: false, rent_epoch: 0 }
+            }
+            _ => return Err(RecipientOwner),
+        };
+        let amount = u64::from_le_bytes(holder.data[64..72].try_into().unwrap())
+            .checked_add(credit.amount).ok_or(BalanceOverflow)?;
+        mint_account.data[36..44].copy_from_slice(&supply.to_le_bytes());
+        holder.data[64..72].copy_from_slice(&amount.to_le_bytes());
+        Ok([(mint, mint_account), (ata, holder)])
+    }
+
+    /// Applies each deposit once, in sequence. Invalid destination state or arithmetic records a
+    /// skipped deposit and advances the counter, so the same finalized deposit cannot halt slots.
     fn apply_credits(&mut self) -> Result<()> {
         let mut credits = std::mem::take(&mut self.credits);
         credits.sort_by_key(|c| c.sequence);
         let Some(bridge) = self.bridge else { return Ok(()) };
-        let token = spl_token_id();
         for credit in credits {
             let next = self.next_credit();
             if credit.sequence != next {
                 continue;
             }
-            let mint = bridge_mint(&bridge, &Pubkey::from_str(&credit.solana_mint)?);
-            let recipient = Pubkey::from_str(&credit.recipient)?;
-            // The mint: SPL Token layout, the bridge's authority minting, no freeze authority.
-            let mut mint_account = self.svm.get_account(&mint).unwrap_or_else(|| {
-                let mut data = vec![0u8; 82];
-                data[..4].copy_from_slice(&1u32.to_le_bytes());
-                data[4..36].copy_from_slice(bridge_authority(&bridge).as_ref());
-                data[44] = credit.decimals;
-                data[45] = 1;
-                Account { lamports: self.rent_exempt_minimum(82), data, owner: token, executable: false, rent_epoch: 0 }
-            });
-            let supply = u64::from_le_bytes(mint_account.data[36..44].try_into().unwrap()).checked_add(credit.amount).context("Bridged supply overflow")?;
-            mint_account.data[36..44].copy_from_slice(&supply.to_le_bytes());
-            self.put(mint, mint_account)?;
-            // The recipient's associated token account for it: SPL Token account layout, initialized.
-            let ata = Pubkey::find_program_address(&[recipient.as_ref(), token.as_ref(), mint.as_ref()], &Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")?).0;
-            let mut holder = self.svm.get_account(&ata).unwrap_or_else(|| {
-                let mut data = vec![0u8; 165];
-                data[..32].copy_from_slice(mint.as_ref());
-                data[32..64].copy_from_slice(recipient.as_ref());
-                data[108] = 1;
-                Account { lamports: self.rent_exempt_minimum(165), data, owner: token, executable: false, rent_epoch: 0 }
-            });
-            let amount = u64::from_le_bytes(holder.data[64..72].try_into().unwrap()).checked_add(credit.amount).context("Bridged balance overflow")?;
-            holder.data[64..72].copy_from_slice(&amount.to_le_bytes());
-            self.put(ata, holder)?;
-            let counter = Account { lamports: self.rent_exempt_minimum(8), data: (next + 1).to_le_bytes().to_vec(), owner: bridge, executable: false, rent_epoch: 0 };
-            self.put(bridge_counter(&bridge), counter)?;
+            let prepared = if next == u64::MAX {
+                Err(BridgeCreditSkipReason::SequenceOverflow)
+            } else {
+                self.prepare_bridge_credit(&bridge, &credit)
+            };
+            match prepared {
+                Ok(accounts) => {
+                    // Both layouts and every checked addition passed; these are ordinary data
+                    // accounts at PDAs, so LiteSVM cannot reject them as executables or sysvars.
+                    for (key, account) in accounts {
+                        self.put(key, account)?;
+                    }
+                }
+                Err(reason) => {
+                    let key = bridge_skipped_credit(&bridge, credit.sequence);
+                    let data = bincode::serialize(&SkippedBridgeCredit { credit, reason })?;
+                    let lamports = self.svm.get_account(&key).map_or(0, |a| a.lamports).max(self.rent_exempt_minimum(data.len()));
+                    self.put(key, Account { lamports, data, owner: bridge, executable: false, rent_epoch: 0 })?;
+                }
+            }
+            let key = bridge_counter(&bridge);
+            let lamports = self.svm.get_account(&key).map_or(0, |a| a.lamports).max(self.rent_exempt_minimum(8));
+            // u64::MAX cannot be a finalized deposit sequence (the on-chain counter refuses its
+            // increment). Saturate malformed input rather than panic at this internal boundary.
+            self.put(key, Account { lamports, data: next.saturating_add(1).to_le_bytes().to_vec(), owner: bridge, executable: false, rent_epoch: 0 })?;
         }
         Ok(())
     }
@@ -1269,6 +1364,115 @@ mod tests {
         system_instruction,
         transaction::Transaction,
     };
+
+    #[test]
+    fn bridge_credit_preserves_prefunded_system_mint_and_ata() {
+        let bridge = Pubkey::new_unique();
+        let solana_mint = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let mint = bridge_mint(&bridge, &solana_mint);
+        let ata = Pubkey::find_program_address(
+            &[recipient.as_ref(), spl_token_id().as_ref(), mint.as_ref()],
+            &Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap(),
+        ).0;
+        let credit = BridgeCredit { sequence: 0, solana_mint: solana_mint.to_string(), decimals: 6, recipient: recipient.to_string(), amount: 42 };
+        let mut first = SvmExecutor::new([], &[]).unwrap();
+        let mut second = SvmExecutor::new([], &[]).unwrap();
+        for executor in [&mut first, &mut second] {
+            executor.set_bridge(bridge);
+            executor.put(mint, Account { lamports: 2_000_000, ..Account::default() }).unwrap();
+            executor.put(ata, Account { lamports: 1_000_000, ..Account::default() }).unwrap();
+            executor.set_credits(vec![credit.clone()]);
+            executor.execute_slot(0, vec![]).unwrap();
+            let mint_account = executor.svm.get_account(&mint).unwrap();
+            let holder = executor.svm.get_account(&ata).unwrap();
+            assert_eq!(mint_account.owner, spl_token_id());
+            assert_eq!(holder.owner, spl_token_id());
+            assert_eq!(mint_account.lamports, executor.rent_exempt_minimum(82) + 2_000_000);
+            assert_eq!(holder.lamports, executor.rent_exempt_minimum(165) + 1_000_000);
+            assert_eq!(u64::from_le_bytes(mint_account.data[36..44].try_into().unwrap()), 42);
+            assert_eq!(u64::from_le_bytes(holder.data[64..72].try_into().unwrap()), 42);
+            assert_eq!(executor.next_credit(), 1);
+            // Reproposing a consumed deposit cannot mint it again.
+            executor.set_credits(vec![credit.clone()]);
+            executor.execute_slot(1, vec![]).unwrap();
+            assert_eq!(executor.svm.get_account(&mint).unwrap(), mint_account);
+            assert_eq!(executor.svm.get_account(&ata).unwrap(), holder);
+        }
+        assert_eq!(first.state_hash(), second.state_hash());
+    }
+
+    #[test]
+    fn bridge_credit_skips_foreign_mint_and_the_next_slot_executes() {
+        let bridge = Pubkey::new_unique();
+        let solana_mint = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let mint = bridge_mint(&bridge, &solana_mint);
+        let foreign = Account { lamports: 1_000_000, data: vec![7; 3], owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 };
+        let failed = BridgeCredit { sequence: 0, solana_mint: solana_mint.to_string(), decimals: 6, recipient: recipient.to_string(), amount: 42 };
+        let mut executor = SvmExecutor::new([], &[]).unwrap();
+        executor.set_bridge(bridge);
+        executor.put(mint, foreign.clone()).unwrap();
+        executor.set_credits(vec![failed.clone()]);
+        executor.execute_slot(0, vec![]).unwrap();
+        assert_eq!(executor.svm.get_account(&mint).unwrap(), foreign);
+        assert_eq!(executor.next_credit(), 1);
+        let key = bridge_skipped_credit(&bridge, 0);
+        let record = executor.svm.get_account(&key).unwrap();
+        assert_eq!(record.owner, bridge);
+        let skipped: SkippedBridgeCredit = bincode::deserialize(&record.data).unwrap();
+        assert_eq!(skipped, SkippedBridgeCredit { credit: failed.clone(), reason: BridgeCreditSkipReason::MintOwner });
+        let checkpoint = executor.checkpoint();
+        let mut saved = executor.snapshot_meta(&checkpoint);
+        saved.accounts = checkpoint.account_changes(None).0.into_iter().map(|(k, a)| (k.to_string(), a.as_ref().clone())).collect();
+        saved.executed = checkpoint.executed_changes(None).0;
+        let mut restored = SvmExecutor::from_state(&[], saved).unwrap();
+        restored.set_bridge(bridge);
+        assert_eq!(restored.state_hash(), executor.state_hash());
+        assert_eq!(restored.svm.get_account(&key).unwrap(), record);
+        let next_mint = Pubkey::new_unique();
+        let next = BridgeCredit { sequence: 1, solana_mint: next_mint.to_string(), decimals: 6, recipient: recipient.to_string(), amount: 9 };
+        for executor in [&mut executor, &mut restored] {
+            executor.set_credits(vec![failed.clone(), next.clone()]);
+            executor.execute_slot(1, vec![]).unwrap();
+            assert_eq!(executor.next_credit(), 2);
+            assert_eq!(executor.svm.get_account(&mint).unwrap(), foreign);
+            assert_eq!(executor.svm.get_account(&key).unwrap(), record);
+            let credited = executor.svm.get_account(&bridge_mint(&bridge, &next_mint)).unwrap();
+            assert_eq!(u64::from_le_bytes(credited.data[36..44].try_into().unwrap()), 9);
+        }
+        assert_eq!(restored.state_hash(), executor.state_hash());
+    }
+
+    #[test]
+    fn bridge_credit_balance_overflow_skips_without_partial_mint_update() {
+        let bridge = Pubkey::new_unique();
+        let solana_mint = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let mint = bridge_mint(&bridge, &solana_mint);
+        let ata = Pubkey::find_program_address(
+            &[recipient.as_ref(), spl_token_id().as_ref(), mint.as_ref()],
+            &Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap(),
+        ).0;
+        let mut executor = SvmExecutor::new([], &[]).unwrap();
+        executor.set_bridge(bridge);
+        let credit = BridgeCredit { sequence: 0, solana_mint: solana_mint.to_string(), decimals: 6, recipient: recipient.to_string(), amount: 1 };
+        executor.set_credits(vec![credit.clone()]);
+        executor.execute_slot(0, vec![]).unwrap();
+        let mut holder = executor.svm.get_account(&ata).unwrap();
+        holder.data[64..72].copy_from_slice(&u64::MAX.to_le_bytes());
+        executor.put(ata, holder.clone()).unwrap();
+        let mint_before = executor.svm.get_account(&mint).unwrap();
+        let overflow = BridgeCredit { sequence: 1, ..credit };
+        executor.set_credits(vec![overflow.clone()]);
+        executor.execute_slot(1, vec![]).unwrap();
+        assert_eq!(executor.svm.get_account(&mint).unwrap(), mint_before);
+        assert_eq!(executor.svm.get_account(&ata).unwrap(), holder);
+        assert_eq!(executor.next_credit(), 2);
+        let record = executor.svm.get_account(&bridge_skipped_credit(&bridge, 1)).unwrap();
+        assert_eq!(bincode::deserialize::<SkippedBridgeCredit>(&record.data).unwrap(), SkippedBridgeCredit { credit: overflow, reason: BridgeCreditSkipReason::BalanceOverflow });
+        executor.execute_slot(2, vec![]).unwrap();
+    }
 
     #[test]
     fn real_transfer_exact_fees_and_deterministic_state() {

@@ -202,3 +202,20 @@ All keys under `keys/` are local only and never committed.
 
 - `keys/dev/*.json` derive from the published development seed `acrux-dev-seed-v1` (`keypair = ed25519 from sha256(seed + "/" + label)`, rewritten by `node scripts/dev-keys.mjs`). They only ever hold local test funds: the demo pool's program id, the two mints, the mint authority, the faucet, and the local validator's authority and fee destination.
 - `keys/hub_registry-keypair.json` is the program keypair of `hub_registry`, generated at random and kept out of version control. Its public key is the program id on every cluster.
+
+## acrux_bridge light-client epochs and rent
+
+A bridge rule (`bridge.json` or `ACRUX_BRIDGE`) names `program`, `fromSlot`, required
+`chainId` (a name hashed with SHA-256 for vote signatures), and optionally `epochSlots` (default 432,000). Initialize the Bridge with exactly
+that length; the node's 1,536-slot proposer schedule is independent. Local
+light-client and round-trip checks write `epochSlots: 1536` explicitly. The
+node also requires the archive bound `ACRUX_BRIDGE_PROOF_MAX` when enabled.
+
+`close_cblock` requires its recorded payer to sign and returns all rent to it.
+`close_validator_set` does the same for a set at least two epochs older than an
+authenticated newer set. Existing field prefixes remain; the payer is appended.
+The Bridge prefix and Withdrawal layout retain their offsets. Released bitmaps
+cover 8,192 sequences each and never close. Initialization requires the program
+upgrade authority through ProgramData and fixes the first epoch and chain tag;
+seeding is allowed once. Every deposit requires an authority-admitted mint.
+The keeper releases pending withdrawals before retiring old sets.

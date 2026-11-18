@@ -29,10 +29,18 @@ services:
       ACRUX_KEEP_DAYS: "${ACRUX_KEEP_DAYS:-7}"
       ACRUX_KEEP_MAX: "${ACRUX_KEEP_MAX:-200000}"
       ACRUX_LOG_RPC: "${ACRUX_LOG_RPC:-}"
+      ACRUX_BRIDGE: "${ACRUX_BRIDGE:-}"
+      ACRUX_BRIDGE_RPC: "${ACRUX_BRIDGE_RPC:-}"
+      ACRUX_BRIDGE_PROOF_MAX: "${ACRUX_BRIDGE_PROOF_MAX:-100000}"
     # The chain's saved state and kept transactions: a start continues from the last finalized cblock.
     volumes:
       - acrux-net:/var/lib/acrux
       - "${ACRUX_GENESIS_FILE}:/app/chain/genesis/acrux-net.json:ro"
+      - type: bind
+        source: /etc/acrux/bridge.json
+        target: /etc/acrux/bridge.json
+        read_only: true
+        bind: { create_host_path: false }
     restart: unless-stopped
 
   api:
@@ -77,8 +85,17 @@ services:
     environment:
       DATABASE_URL: "postgresql://acrux:${POSTGRES_PASSWORD}@postgres:5432/acrux"
       LAUNCH_KEYPAIR_FILE: /etc/acrux/launch-keypair.json
+      BRIDGE_PROGRAM_ID: "${BRIDGE_PROGRAM_ID:-}"
+      GATEWAY_RPC_URL: http://net:4930
+      BRIDGE_RELAYER_KEYPAIR_FILE: /etc/acrux/bridge-relayer-keypair.json
     command: ["node", "api/scripts/start-service.mjs", "keeper"]
-    volumes: ["/etc/acrux/launch-keypair.json:/etc/acrux/launch-keypair.json:ro"]
+    volumes:
+      - "/etc/acrux/launch-keypair.json:/etc/acrux/launch-keypair.json:ro"
+      - type: bind
+        source: /etc/acrux/bridge-relayer-keypair.json
+        target: /etc/acrux/bridge-relayer-keypair.json
+        read_only: true
+        bind: { create_host_path: false }
     restart: unless-stopped
 
   caddy:

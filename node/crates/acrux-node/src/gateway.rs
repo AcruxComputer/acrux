@@ -93,6 +93,9 @@ pub struct GatewayState {
     /// Finalized cblocks' proofs for Solana's light client, by consensus slot: the hash's
     /// preimage, the outbox and the signed finalizing votes.
     pub cblock_proofs: BTreeMap<u64, Value>,
+    /// Withdrawal proofs and one representative per bridge epoch, outside the rolling window.
+    pub archived_cblock_proofs: BTreeMap<u64, Value>,
+    pub epoch_cblock_proofs: BTreeMap<u64, u64>,
     pub parameters: Value,
     pub balances: BTreeMap<String, u64>,
     pub stream_id: String,
@@ -116,6 +119,8 @@ impl GatewayState {
             upcoming_windows: vec![],
             facts: Value::Null,
             cblock_proofs: BTreeMap::new(),
+            archived_cblock_proofs: BTreeMap::new(),
+            epoch_cblock_proofs: BTreeMap::new(),
             counters: json!({"slots":0,"finalizedCblocks":0,"skips":0,"averageCommitSpreadUs":0}),
             counter_base: (0, 0),
             kept: None,
@@ -331,9 +336,23 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
         "getSnapshot" => Ok(state.read().await.snapshot()),
         "getCurrentWindow" => Ok(state.read().await.current_window.clone()),
         "getCounters" => Ok(state.read().await.counters.clone()),
-        "getCblockProof" => match params.get("consensusSlot").and_then(Value::as_u64) {
-            Some(slot) => state.read().await.cblock_proofs.get(&slot).cloned().ok_or(("NOT_FOUND", "No proof is held for this cblock: it is not finalized under a bridge rule, or it is too old.")),
-            None => Err(("INVALID_INPUT", "Give consensusSlot.")),
+        "getCblockProof" => {
+            let state = state.read().await;
+            let selectors = [params.get("consensusSlot"), params.get("epoch"), params.get("latest")].iter().filter(|s| s.is_some()).count();
+            let slot = params.get("consensusSlot").and_then(Value::as_u64);
+            let epoch = params.get("epoch").and_then(Value::as_u64);
+            if selectors != 1 || (slot.is_none() && epoch.is_none() && params.get("latest") != Some(&Value::Bool(true))) {
+                Err(("INVALID_INPUT", "Give exactly one of consensusSlot, epoch, or latest: true."))
+            } else {
+                let proof = if let Some(slot) = slot {
+                    state.cblock_proofs.get(&slot).or_else(|| state.archived_cblock_proofs.get(&slot))
+                } else if let Some(epoch) = epoch {
+                    state.epoch_cblock_proofs.get(&epoch).and_then(|slot| state.archived_cblock_proofs.get(slot))
+                } else {
+                    state.cblock_proofs.last_key_value().into_iter().chain(state.archived_cblock_proofs.last_key_value()).max_by_key(|(slot, _)| *slot).map(|(_, proof)| proof)
+                };
+                proof.cloned().ok_or(("NOT_FOUND", "No finalized bridge proof is held for this selector; the archive capacity may have expired it."))
+            }
         },
         "getFacts" => match state.read().await.facts.clone() {
             Value::Null => Err(("NET_UNAVAILABLE", "The net has not measured enough slots yet.")),
@@ -1153,6 +1172,34 @@ async fn metrics(State(state): State<SharedGateway>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bridge_review_withdrawal_proof_survives_capacity_and_restart() {
+        use crate::bridge::ProofArchive;
+        let dir = std::path::Path::new("target").join(format!("bridge-review-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bridge-proofs.redb");
+        let previous = std::env::var_os("ACRUX_BRIDGE_PROOF_MAX");
+        std::env::set_var("ACRUX_BRIDGE_PROOF_MAX", "1");
+        let proof = json!({"consensusSlot":7,"epochSlots":432000,"hash":"withdrawal-proof"});
+        {
+            let mut archive = ProofArchive::open(Some(&path),432000,Some(7)).unwrap();
+            archive.keep(7,0,true,&proof).unwrap();
+            assert!(archive.keep(8,0,true,&json!({"epochSlots":432000})).is_err(), "capacity must never evict an unpaid withdrawal proof");
+        }
+        let archive = ProofArchive::open(Some(&path),432000,Some(7)).unwrap();
+        if let Some(value) = previous { std::env::set_var("ACRUX_BRIDGE_PROOF_MAX",value); } else { std::env::remove_var("ACRUX_BRIDGE_PROOF_MAX"); }
+        let (commands, _) = mpsc::channel(1);
+        let mut state = GatewayState::new(commands);
+        state.archived_cblock_proofs = archive.proofs.clone();
+        state.epoch_cblock_proofs = archive.epochs.clone();
+        let response = rpc_one(Arc::new(RwLock::new(state)), "127.0.0.1".parse().unwrap(), json!({"jsonrpc":"2.0","id":1,"method":"getCblockProof","params":{"consensusSlot":7}})).await;
+        let bytes = axum::body::to_bytes(response.into_body(), 10000).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["result"],proof);
+        drop(archive);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn oversized_base58_is_refused_before_decoding() {

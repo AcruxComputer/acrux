@@ -27,7 +27,7 @@ async function suite(files, withGenesis) {
     '--bpf-program', genesis.programs[0].address, join(chainDir, genesis.programs[0].path),
     '--account-dir', accounts,
     // The bridge, built beside the genesis programs.
-    '--bpf-program', 'EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5', join(chainDir, 'target/deploy/acrux_bridge.so'),
+    '--upgradeable-program', 'EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5', join(chainDir, 'target/deploy/acrux_bridge.so'), join(chainDir, 'keys/dev/local-authority.json'),
   ], { stdio: 'ignore' })
   let status = 1
   try {

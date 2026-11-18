@@ -7,19 +7,21 @@
 // read the release and prints it with /v1/bridge/transfers.
 // Usage (from backend/chain): node scripts/bridge-round-trip-check.mjs [acrux binary, from backend/node]
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import anchor from '@coral-xyz/anchor'
 import { TOKEN_PROGRAM_ID, getAccount, getAssociatedTokenAddressSync } from '@solana/spl-token'
 import { Connection, Keypair, PublicKey } from '@solana/web3.js'
 import { devKeypair } from './dev-keys.mjs'
-import { EPOCH_SLOTS, bridgeProgram, cblockProof, relay, seed } from './bridge-relay.mjs'
+import { bridgeProgram, cblockProof, relay, seed } from './bridge-relay.mjs'
 
 const chain = resolve(import.meta.dirname, '..')
 const node = resolve(chain, '../node')
 const acrux = resolve(node, process.argv[2] ?? 'target/release/acrux')
 const program = 'EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5'
+if (!process.env.ACRUX_IDENTITY_SEED?.trim() || process.env.ACRUX_IDENTITY_SEED.trim() === '20261116') throw new Error('Set a private local-check ACRUX_IDENTITY_SEED before running a bridge check.')
 const solanaUrl = 'http://127.0.0.1:4990'
+const epochSlots = 1536 // Short rule for a local hand-off within the check.
 const gateway = 'http://127.0.0.1:4930'
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const rpc = async (url, method, params) => (await (await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })).json()).result
@@ -33,15 +35,22 @@ const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); r
 const state = join(chain, '.ledger')
 rmSync(state, { recursive: true, force: true })
 mkdirSync(state, { recursive: true })
-const validator = spawn('bash', [join(chain, 'scripts/validator.sh'), state, '32', '--bpf-program', program, join(chain, 'target/deploy/acrux_bridge.so')], { stdio: 'ignore' })
 const store = join(node, 'target/bridge-round-trip-check')
 rmSync(store, { recursive: true, force: true })
 mkdirSync(join(store, 'placements'), { recursive: true })
-writeFileSync(join(store, 'bridge.json'), JSON.stringify({ program, fromSlot: 0 }))
+writeFileSync(join(store, 'bridge.json'), JSON.stringify({ program, fromSlot: 0, epochSlots, chainId: 'acrux-bridge-local-check' }))
 spawnSync(process.execPath, ['scripts/place-bridge.mjs', join(store, 'placements/acrux-bridge.json')], { cwd: chain, stdio: 'inherit' })
 writeFileSync(join(store, 'placements/placements.json'), JSON.stringify({ placements: [{ file: 'acrux-bridge.json', slot: 0 }] }))
-const env = { ...process.env, ACRUX_BRIDGE: join(store, 'bridge.json'), ACRUX_BRIDGE_RPC: solanaUrl, ACRUX_PLACEMENTS: join(store, 'placements/placements.json') }
-const net = spawn(acrux, ['net', 'up', '--store', join(store, 'net')], { cwd: node, env, stdio: 'ignore' })
+const env = { ...process.env, ACRUX_BRIDGE_PROOF_MAX: '100000', ACRUX_BRIDGE: join(store, 'bridge.json'), ACRUX_BRIDGE_RPC: `${solanaUrl},${solanaUrl}`, ACRUX_PLACEMENTS: join(store, 'placements/placements.json') }
+const genesisPath = join(store, 'genesis', 'acrux-net.json')
+mkdirSync(join(store, 'genesis'), { recursive: true })
+const generated = spawnSync(process.execPath, ['scripts/genesis.mjs', genesisPath], { cwd: chain, env, stdio: 'pipe' })
+if (generated.status !== 0) throw new Error('Local bridge genesis generation failed.')
+const genesis = JSON.parse(readFileSync(genesisPath, 'utf8'))
+for (const entry of genesis.programs) entry.path = resolve(chain, entry.path)
+writeFileSync(genesisPath, JSON.stringify(genesis))
+const validator = spawn('bash', [join(chain, 'scripts/validator.sh'), state, '32', '--upgradeable-program', program, join(chain, 'target/deploy/acrux_bridge.so'), join(chain, 'keys/dev/local-authority.json')], { stdio: 'ignore' })
+let net = spawn(acrux, ['net', 'up', '--genesis', genesisPath, '--store', join(store, 'net')], { cwd: node, env, stdio: 'ignore' })
 let ok = false
 try {
   await up(solanaUrl)
@@ -49,14 +58,14 @@ try {
   const solana = bridgeProgram(new Connection(solanaUrl, 'confirmed'), devKeypair('local-authority'))
   // The light client, seeded from the net's first finalized cblock, which also hands epoch 1 on.
   const first = await until('a cblock proof', 60, async () => { for (let c = 1; c < 9; c++) { const p = await cblockProof(gateway, c).catch(() => null); if (p) return p } })
-  await seed(solana, first, Math.floor((first.consensusSlot * 4) / EPOCH_SLOTS))
+  await seed(solana, first, epochSlots)
   await relay(solana, first)
 
   // Solana to Acrux.
   const holder = Keypair.generate()
   const granted = await fetch('http://127.0.0.1:4989/internal/faucet', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ address: holder.publicKey.toBase58(), amountLamports: '2000000000' }) })
   if (!granted.ok) throw new Error(`faucet: ${await granted.text()}`)
-  const deposited = spawnSync(process.execPath, ['scripts/bridge-deposit.mjs', '--recipient', holder.publicKey.toBase58(), '--amount', '2500000000'], { cwd: chain, encoding: 'utf8' })
+  const deposited = spawnSync(process.execPath, ['scripts/bridge-deposit.mjs', '--recipient', holder.publicKey.toBase58(), '--amount', '2500000000'], { cwd: chain, env, encoding: 'utf8' })
   if (deposited.status !== 0) throw new Error(deposited.stderr)
   const record = JSON.parse(deposited.stdout.trim().split('\n').at(-1))
   const solanaMint = new PublicKey(record.mint)
@@ -82,6 +91,12 @@ try {
 
   // The cblock of the burn, certified on Solana, pays out of the vault.
   const proof = await until(`cblock ${cblock}'s proof`, 60, () => cblockProof(gateway, cblock))
+  await new Promise(resolve => { net.once('exit', resolve); net.kill() })
+  net = spawn(acrux, ['net', 'up', '--genesis', genesisPath, '--store', join(store, 'net')], { cwd: node, env, stdio: 'ignore' })
+  await up(gateway)
+  const restored = await cblockProof(gateway, cblock)
+  if (JSON.stringify(restored) !== JSON.stringify(proof)) throw new Error('M3: withdrawal proof changed or disappeared after net restart.')
+  console.log('M3: withdrawal proof served after restarting the saved net')
   const vaultBefore = (await getAccount(solana.provider.connection, PublicKey.findProgramAddressSync([Buffer.from('vault'), solanaMint.toBuffer()], solana.programId)[0])).amount
   const relayed = await relay(solana, proof)
   console.log('relayed:', JSON.stringify({ slot: relayed.slot, epoch: relayed.epoch, certified: relayed.certified, released: relayed.released, transactions: relayed.transactions.length }))
@@ -99,10 +114,11 @@ try {
   }
   ok = relayed.certified && paid === 1_000_000_000n && vaultBefore - vaultAfter === 1_000_000_000n && left === '1500000000' && again.released.length === 0
 } finally {
-  net.kill()
+  await new Promise(resolve => { if (net.exitCode !== null) return resolve(); net.once('exit', resolve); net.kill() })
   validator.kill('SIGTERM')
   await sleep(2000)
   rmSync(state, { recursive: true, force: true })
+  rmSync(store, { recursive: true, force: true })
 }
 console.log(ok ? 'the token went to Acrux and came back to Solana, paid once' : 'FAILED')
 process.exit(ok ? 0 : 1)

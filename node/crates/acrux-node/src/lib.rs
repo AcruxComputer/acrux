@@ -14,6 +14,13 @@ pub fn identity_key(i: usize) -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&crypto::hash(format!("acrux-local-identity-{seed}-{i}").as_bytes()))
 }
 
+/// A live bridge must never derive its validators from a missing, empty, or published seed.
+pub fn validate_bridge_identity(seed: Option<&str>) -> anyhow::Result<()> {
+    anyhow::ensure!(seed.is_some_and(|seed| !seed.trim().is_empty() && seed.trim() != "20261116"),
+        "ACRUX_IDENTITY_SEED must be set to a private non-development seed when a bridge rule is configured");
+    Ok(())
+}
+
 /// Raises the calling thread above the machine's normal work: slot timing is in milliseconds.
 pub fn raise_thread_priority() {
     #[cfg(windows)]
@@ -49,3 +56,14 @@ pub use acrux_crypto as crypto;
 pub use acrux_execution::{execution, selection, threshold};
 pub use acrux_schedule as schedule;
 pub use acrux_transport::{profiling, transport};
+
+#[cfg(test)]
+mod identity_tests {
+    #[test]
+    fn bridge_startup_requires_a_private_identity_seed() {
+        for seed in [None, Some(""), Some(" \t"), Some("20261116"), Some(" 20261116 ")] {
+            assert!(super::validate_bridge_identity(seed).is_err());
+        }
+        assert!(super::validate_bridge_identity(Some("isolated-test-identity")).is_ok());
+    }
+}

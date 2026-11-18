@@ -172,6 +172,11 @@ pub struct Network {
     held_finals: Vec<Telemetry>,
     /// Validator 0's cblock hash preimages (all but the outbox root) and outboxes, for the proofs.
     cblock_preimages: BTreeMap<u64, (Vec<u8>, Vec<crate::bridge::OutboxEntry>)>,
+    bridge_proofs: Option<crate::bridge::ProofArchive>,
+    /// Prepared and archived before the state checkpoint is saved, published after it is durable.
+    pending_bridge_proofs: BTreeMap<u64, (Value, Option<Vec<u64>>)>,
+    /// The finalized frontier whose ancestor proofs are prepared and whose checkpoint is queued.
+    proof_prepared_through: Option<u64>,
     /// Finalized Solana bridge deposits by sequence, as the deposit reader found them.
     bridge_deposits: Arc<std::sync::Mutex<BTreeMap<u64, crate::execution::BridgeCredit>>>,
     /// Solana's `getRecentPerformanceSamples`: one sample a minute of the slots and transactions
@@ -335,6 +340,62 @@ fn pack(
 fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>> {
     Ok(bincode::serialize(v)?)
 }
+/// Finalization of `tip` also finalizes every ancestor back to the prepared frontier. Window
+/// parents can skip cblocks, so following parents is required instead of iterating slot numbers.
+fn finalized_ancestors(tip: u64, after: Option<u64>, mut parent: impl FnMut(u64) -> Result<Option<u64>>) -> Result<Vec<u64>> {
+    let mut chain = vec![];
+    let mut at = Some(tip);
+    while let Some(c) = at.filter(|c| after.is_none_or(|done| *c > done)) {
+        chain.push(c);
+        at = parent(c)?;
+        ensure!(at.is_none_or(|previous| previous < c), "Finalized bridge ancestry does not move backward");
+    }
+    chain.reverse();
+    Ok(chain)
+}
+fn bridge_proof_quorum<'a>(votes: impl Iterator<Item = &'a SignedVote>, block: BlockRef, stakes: &[u64]) -> bool {
+    let (mut notar, mut finalize) = (0u32, 0u32);
+    for signed in votes.filter(|signed| signed.vote.slot == block.slot && signed.vote.hash == Some(block.hash)) {
+        match signed.vote.kind {
+            consensus::VoteKind::Notar => notar |= 1 << signed.vote.validator,
+            consensus::VoteKind::Finalize => finalize |= 1 << signed.vote.validator,
+            _ => {}
+        }
+    }
+    let stake = |bits: u32| stakes.iter().enumerate().filter(|(i, _)| bits >> i & 1 == 1).map(|(_, stake)| *stake as u128).sum::<u128>();
+    let total = stakes.iter().map(|stake| *stake as u128).sum::<u128>();
+    stake(finalize) * 100 >= total * 60 || stake(notar) * 100 >= total * 80
+}
+
+#[cfg(test)]
+mod bridge_finality_tests {
+    use super::*;
+
+    #[test]
+    fn bridge_ancestor_withdrawal_needs_its_proof_before_a_descendant_checkpoint() {
+        // Cblock 12 starts a new window on 7; 8..11 were skipped. A burn in 7 is in 14's state,
+        // even when consensus announces only 14's finalization.
+        let parents = BTreeMap::from([(7, Some(6)), (12, Some(7)), (13, Some(12)), (14, Some(13))]);
+        let chain = finalized_ancestors(14, Some(6), |c| parents.get(&c).copied().context("missing ancestor")).unwrap();
+        assert_eq!(chain, [7, 12, 13, 14]);
+        let stakes = vec![1u64; 12];
+        let block = |slot| BlockRef { slot, hash: [slot as u8; 32] };
+        let signed = |slot, validator, kind| SignedVote {
+            vote: consensus::Vote { validator, slot, hash: Some(block(slot).hash), kind }, signature: vec![],
+        };
+        let mut votes = vec![];
+        for slot in [12, 13, 14] {
+            votes.extend((0..8).map(|validator| signed(slot, validator, consensus::VoteKind::Finalize)));
+        }
+        // Eight Notar votes are enough to extend 7 in consensus, but not to certify it on Solana.
+        votes.extend((0..8).map(|validator| signed(7, validator, consensus::VoteKind::Notar)));
+        assert!(bridge_proof_quorum(votes.iter(), block(14), &stakes));
+        assert!(!chain.iter().all(|c| bridge_proof_quorum(votes.iter(), block(*c), &stakes)));
+        // Explicit Finalize votes on the known finalized ancestor make the entire chain relayable.
+        votes.extend((0..8).map(|validator| signed(7, validator, consensus::VoteKind::Finalize)));
+        assert!(chain.iter().all(|c| bridge_proof_quorum(votes.iter(), block(*c), &stakes)));
+    }
+}
 fn decode<T: serde::de::DeserializeOwned>(v: &[u8]) -> Result<T> {
     Ok(bincode::DefaultOptions::new()
         .with_fixint_encoding()
@@ -355,17 +416,22 @@ impl Network {
         commands: mpsc::Receiver<GatewayCommand>,
     ) -> Result<Self> {
         let profile = crate::profiling::Profiling::new();
+        let genesis = config
+            .genesis_path
+            .as_deref()
+            .map(|path| crate::genesis::Genesis::load(Path::new(path)).map(Arc::new))
+            .transpose()?;
+        let bridge_rpc_urls = if genesis.as_ref().is_some_and(|genesis| genesis.bridge.is_some()) {
+            crate::validate_bridge_identity(std::env::var("ACRUX_IDENTITY_SEED").ok().as_deref())?;
+            let urls = std::env::var("ACRUX_BRIDGE_RPC").context("ACRUX_BRIDGE_RPC is required when a bridge rule is configured")?;
+            Some(crate::bridge::deposit_rpcs(&urls)?)
+        } else { None };
         let keys = (0..12).map(|i| crate::identity_key(i)).collect::<Vec<_>>();
         let identities = keys
             .iter()
             .map(|k| bs58::encode(k.verifying_key().as_bytes()).into_string())
             .collect::<Vec<_>>();
         let stakes = vec![100_000_000u64; 12];
-        let genesis = config
-            .genesis_path
-            .as_deref()
-            .map(|path| crate::genesis::Genesis::load(Path::new(path)).map(Arc::new))
-            .transpose()?;
         // The hubs, their places and their members come from the chain's own Hub Registry in genesis.
         let registry = match &genesis {
             Some(genesis) => genesis.registry_hubs()?,
@@ -418,6 +484,15 @@ impl Network {
             Some(store) => store.load()?,
             None => None,
         };
+        let bridge_proof_path = Path::new(&config.store_path).join("bridge-proofs.redb");
+        let bridge_proofs = genesis.as_ref().and_then(|g| g.bridge.as_ref())
+            .map(|bridge| crate::bridge::ProofArchive::open(config.persist.then_some(bridge_proof_path.as_path()), bridge.epoch_slots, saved.as_ref().map(|state| state.meta.cblock)))
+            .transpose()?;
+        if let Some(archive) = &bridge_proofs {
+            let mut state = gateway.write().await;
+            state.archived_cblock_proofs = archive.proofs.clone();
+            state.epoch_cblock_proofs = archive.epochs.clone();
+        }
         let resumed = match &saved {
             Some(saved) => Some(BlockRef {
                 slot: saved.meta.cblock,
@@ -599,8 +674,8 @@ impl Network {
             gateway.clone(), persistence.clone(), identities.clone(), exchange.clone(), profile.clone(),
         );
         let bridge_deposits = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
-        if let (Some(bridge), Ok(url)) = (genesis.as_ref().and_then(|g| g.bridge.clone()), std::env::var("ACRUX_BRIDGE_RPC")) {
-            tokio::spawn(crate::bridge::read_deposits(url, bridge.program, bridge_deposits.clone()));
+        if let (Some(bridge), Some(urls)) = (genesis.as_ref().and_then(|g| g.bridge.clone()), bridge_rpc_urls) {
+            tokio::spawn(crate::bridge::read_deposits(urls, bridge.program, bridge_deposits.clone()));
         }
         Ok(Self {
             config,
@@ -639,6 +714,9 @@ impl Network {
             observed_final: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             held_finals: Vec::new(),
             cblock_preimages: BTreeMap::new(),
+            bridge_proofs,
+            pending_bridge_proofs: BTreeMap::new(),
+            proof_prepared_through: resumed.map(|block| block.slot),
             bridge_deposits: bridge_deposits.clone(),
             performance: VecDeque::new(),
             performance_mark: (Instant::now(), 0, 0),
@@ -681,7 +759,7 @@ impl Network {
     /// Cblock `i`'s outbox: every cblock carries the next epoch's validator set, so any one of an
     /// epoch certified on Solana hands its light client on, whichever slots were skipped.
     fn outbox(&self, i: u64) -> Vec<crate::bridge::OutboxEntry> {
-        let epoch_slots = 16 * self.config.windows_per_epoch as u64;
+        let epoch_slots = self.genesis.as_ref().and_then(|g| g.bridge.as_ref()).expect("bridge outbox requires bridge rule").epoch_slots;
         let validators = self.identities.iter().zip(&self.stakes).map(|(identity, stake)| {
             let key: [u8; 32] = bs58::decode(identity).into_vec().expect("identity is base58").try_into().expect("identity is 32 bytes");
             (key, *stake)
@@ -690,8 +768,10 @@ impl Network {
     }
     /// Validator 0, once cblock `c` is final: its hash preimage, outbox and the signed votes that
     /// finalized it (Finalize, or Notar for a fast finalization), for Solana's light client.
-    async fn record_proof(&mut self, c: u64) {
-        let (Some((preimage, outbox)), Some(block)) = (self.cblock_preimages.remove(&c), self.nodes[0].executed_blocks.get(&c).copied()) else { return };
+    fn prepare_proof(&mut self, c: u64) -> Result<()> {
+        let (preimage, outbox) = self.cblock_preimages.remove(&c).context("Finalized bridge cblock is missing its proof material")?;
+        let block = self.nodes[0].executed_blocks.get(&c).copied().context("Finalized bridge cblock is missing its executed hash")?;
+        let epoch_slots = self.genesis.as_ref().and_then(|g| g.bridge.as_ref()).expect("bridge proof requires bridge rule").epoch_slots;
         let votes = self.nodes[0]
             .votes
             .values()
@@ -699,13 +779,73 @@ impl Network {
             .map(|v| json!({"validator": v.vote.validator, "kind": if v.vote.kind == consensus::VoteKind::Finalize { "finalize" } else { "notar" }, "signature": B64.encode(&v.signature)}))
             .collect::<Vec<_>>();
         let proof = json!({
-            "consensusSlot": c, "hash": hex::encode(block.hash), "preimage": B64.encode(&preimage),
+            "consensusSlot": c, "epochSlots": epoch_slots, "chainId": self.genesis.as_ref().and_then(|g| g.bridge.as_ref()).expect("bridge proof requires bridge rule").chain_id, "hash": hex::encode(block.hash), "preimage": B64.encode(&preimage),
             "outboxRoot": hex::encode(crate::bridge::outbox_root(&outbox)),
             "outbox": outbox.iter().map(|e| B64.encode(bincode::serialize(e).expect("outbox entry encodes"))).collect::<Vec<_>>(),
             "validators": self.identities, "stakes": self.stakes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             "votes": votes,
         });
+        let withdrawal = outbox.iter().any(|entry| matches!(entry, crate::bridge::OutboxEntry::Withdrawal { .. }));
+        let archive = self.bridge_proofs.as_mut().expect("bridge proof archive configured");
+        let archived = archive.keep(c, c * 4 / epoch_slots, withdrawal, &proof)?;
+        self.pending_bridge_proofs.insert(c, (proof, archived));
+        Ok(())
+    }
+    fn bridge_ancestors(&self, id: usize, cblock: u64, after: Option<u64>) -> Result<Vec<u64>> {
+        finalized_ancestors(cblock, after, |c| {
+            ensure!(self.nodes[id].executed_blocks.contains_key(&c), "Finalized bridge ancestor {c} is missing its executed hash");
+            if c % 4 == 0 {
+                Ok(self.nodes[id].windows.get(&(c / 4)).context("Finalized bridge ancestor window is missing")?.parent.map(|p| p.slot))
+            } else { Ok(Some(c - 1)) }
+        })
+    }
+    /// A finalized descendant commits its ancestors too. Give those ancestors their own signed
+    /// Finalize votes, which the Solana light client can certify without an ancestry instruction.
+    fn sign_finalized_ancestors(&mut self, id: usize, block: BlockRef, step: &mut Step) -> Result<()> {
+        if !self.bridge_open(block.slot * 4) { return Ok(()) }
+        let first = self.genesis.as_ref().and_then(|g| g.bridge.as_ref()).unwrap().from_slot.div_ceil(4);
+        let after = [self.proof_prepared_through, first.checked_sub(1), self.nodes[id].votor.pruned_below().checked_sub(1)].into_iter().flatten().max();
+        for c in self.bridge_ancestors(id, block.slot, after)? {
+            let ancestor = self.nodes[id].executed_blocks[&c];
+            if bridge_proof_quorum(self.nodes[id].votes.values(), ancestor, &self.stakes) { continue }
+            let hash = ancestor.hash;
+            let vote = consensus::Vote { validator: id, slot: c, hash: Some(hash), kind: consensus::VoteKind::Finalize };
+            if !self.nodes[id].votes.contains_key(&encode(&vote)?) {
+                self.consensus_actions(id, vec![Action::SendVote(vote)], step)?;
+            }
+        }
+        Ok(())
+    }
+    /// No checkpoint may retain an ancestor's burn until that ancestor has a relayable proof.
+    /// Incoming votes wake dispatch again; held finalization events remain unpublished meanwhile.
+    fn prepare_finalized_chain(&mut self, cblock: u64) -> Result<bool> {
+        if !self.bridge_open(cblock * 4) { return Ok(true) }
+        let first = self.genesis.as_ref().and_then(|g| g.bridge.as_ref()).unwrap().from_slot.div_ceil(4);
+        let after = [self.proof_prepared_through, first.checked_sub(1)].into_iter().flatten().max();
+        let chain = self.bridge_ancestors(0, cblock, after)?;
+        for c in &chain {
+            let block = self.nodes[0].executed_blocks[c];
+            if !bridge_proof_quorum(self.nodes[0].votes.values(), block, &self.stakes) { return Ok(false) }
+        }
+        for c in chain { self.prepare_proof(c)?; }
+        Ok(true)
+    }
+    /// Publishes only proofs whose execution state is durable. Preparing the archive before the
+    /// state checkpoint ensures a restart cannot keep a burn while losing its withdrawal proof.
+    async fn record_proof(&mut self, c: u64) {
+        let Some((proof, archived)) = self.pending_bridge_proofs.remove(&c) else { return };
+        let archive = self.bridge_proofs.as_ref().expect("bridge proof archive configured");
         let mut gateway = self.gateway.write().await;
+        if let Some(expired) = archived {
+            if archive.proofs.contains_key(&c) {
+                gateway.archived_cblock_proofs.insert(c, proof.clone());
+            }
+            for slot in expired { gateway.archived_cblock_proofs.remove(&slot); }
+            gateway.epoch_cblock_proofs.clear();
+            let epoch_slots = proof["epochSlots"].as_u64().expect("proof epochSlots");
+            let slots = gateway.archived_cblock_proofs.keys().copied().collect::<Vec<_>>();
+            for slot in slots { gateway.epoch_cblock_proofs.entry(slot * 4 / epoch_slots).or_insert(slot); }
+        }
         gateway.cblock_proofs.insert(c, proof);
         while gateway.cblock_proofs.len() > 4096 {
             gateway.cblock_proofs.pop_first();
@@ -941,6 +1081,9 @@ impl Network {
                     observed_final: self.observed_final.clone(),
                     held_finals: Vec::new(),
                     cblock_preimages: BTreeMap::new(),
+                    bridge_proofs: if id == 0 { self.bridge_proofs.take() } else { None },
+                    pending_bridge_proofs: BTreeMap::new(),
+                    proof_prepared_through: self.proof_prepared_through,
                     bridge_deposits: self.bridge_deposits.clone(),
                     performance: VecDeque::new(),
                     performance_mark: (Instant::now(), 0, 0),
@@ -1049,9 +1192,7 @@ impl Network {
                     self.skipped.insert(slot / 4);
                     self.observed_skip.lock().unwrap().insert(slot / 4);
                 }
-                if node == 0 && event.kind == "cblock.finalized" && self.finalized.insert(slot / 4) {
-                    self.save_state(slot / 4);
-                }
+                if node == 0 && event.kind == "cblock.finalized" { self.finalized.insert(slot / 4); }
                 // These local seeds only support node zero's own slot-start and execution views.
                 // The observer owns the complete projection, including other validators' arrivals.
                 if node == 0 && matches!(event.kind, "slot.started" | "slot.executed") {
@@ -1061,6 +1202,17 @@ impl Network {
                     let merged = event.data["mergedOrder"].as_array().map_or(0, |m| m.iter().filter(|t| t["selected"] != false).count() as u64);
                     self.executed_count = (self.executed_count.0.max(slot), self.executed_count.1 + merged);
                 }
+            }
+        }
+        if node == 0 {
+            let waiting = self.finalized.iter().copied().filter(|c| self.proof_prepared_through.is_none_or(|done| *c > done)).collect::<Vec<_>>();
+            for c in waiting {
+                if !self.prepare_finalized_chain(c)? { break }
+                self.save_state(c)?;
+                self.proof_prepared_through = Some(c);
+                // Accepted ancestors were consumed above; older remaining material belongs to
+                // skipped/abandoned branches and cannot contain a committed withdrawal.
+                self.cblock_preimages.retain(|slot, _| *slot > c);
             }
         }
         if node == 0 && self.performance_mark.0.elapsed() >= std::time::Duration::from_secs(60) {
@@ -1099,10 +1251,11 @@ impl Network {
                 let cblock = event.slot.unwrap() / 4;
                 if self.observed_final.lock().unwrap().insert(cblock) {
                     self.keep_finalized(cblock).await;
-                    self.record_proof(cblock).await;
                     self.final_times.push(event.at);
                 }
             }
+            let prepared = self.pending_bridge_proofs.keys().copied().take_while(|c| *c <= durable).collect::<Vec<_>>();
+            for c in prepared { self.record_proof(c).await; }
         }
         let queued = Instant::now();
         self.observer.submit(node, events, step.persist).await?;
@@ -1418,12 +1571,15 @@ impl Network {
             }
         }
         for id in self.active.clone() {
+            let proof_floor = (id == 0).then(|| self.genesis.as_ref().and_then(|g| g.bridge.as_ref()).map(|rule| {
+                self.proof_prepared_through.map_or(rule.from_slot.div_ceil(4), |done| done + 1)
+            })).flatten();
             let node = &mut self.nodes[id];
             if let Some((&window, run)) = node.windows.iter().next_back() {
                 let parent = run.parent.map(|p| p.slot);
                 // Everything from the last finalized cblock on: after any run of skipped windows
                 // the next window's parent is that cblock or a later one.
-                let floor = node.votor.finalized().map_or(0, |f| f.slot);
+                let floor = node.votor.finalized().map_or(0, |f| f.slot).min(proof_floor.unwrap_or(u64::MAX));
                 node.checkpoints
                     .retain(|slot, _| *slot + 8 >= window * 4 || *slot >= floor || Some(*slot) == parent);
                 node.threshold_checkpoints
@@ -1431,7 +1587,7 @@ impl Network {
             }
             // Everything 64 consensus slots below finality is settled and already in the store.
             if let Some(finalized) = node.votor.finalized() {
-                let below = finalized.slot.saturating_sub(64);
+                let below = finalized.slot.saturating_sub(64).min(proof_floor.unwrap_or(u64::MAX));
                 if below > node.votor.pruned_below() {
                     node.votor.prune(below);
                     node.slots = node.slots.split_off(&(below * 4));
@@ -2076,11 +2232,12 @@ impl Network {
                     return Ok(());
                 }
                 ensure!(signed.vote.validator == e.from, "Wrong vote sender");
-                let digest = crypto::hash(&encode(&signed)?);
+                let message = vote_message(&signed.vote, self.genesis.as_ref().and_then(|g| g.bridge.as_ref()))?;
+                let digest = crypto::hash(&[self.keys[e.from].verifying_key().as_bytes().as_slice(), &message, &signed.signature].concat());
                 if !verified_cached(digest) {
                     crypto::verify_bytes(
                         &self.keys[e.from].verifying_key(),
-                        &encode(&signed.vote)?,
+                        &message,
                         &signed.signature,
                     )?;
                     remember_verified(digest);
@@ -2113,11 +2270,12 @@ impl Network {
                         v == &p.vote && v.validator < 12,
                         "Mismatched certificate vote"
                     );
-                    let digest = crypto::hash(&encode(p)?);
+                    let message = vote_message(v, self.genesis.as_ref().and_then(|g| g.bridge.as_ref()))?;
+                    let digest = crypto::hash(&[self.keys[v.validator].verifying_key().as_bytes().as_slice(), &message, &p.signature].concat());
                     if !verified_cached(digest) {
                         crypto::verify_bytes(
                             &self.keys[v.validator].verifying_key(),
-                            &encode(v)?,
+                            &message,
                             &p.signature,
                         )?;
                         remember_verified(digest);
@@ -2904,9 +3062,7 @@ impl Network {
                     let hash = crypto::hash(&[preimage.as_slice(), &crate::bridge::outbox_root(&outbox)].concat());
                     if id == 0 {
                         self.cblock_preimages.insert(i, (preimage, outbox));
-                        while self.cblock_preimages.len() > 4096 {
-                            self.cblock_preimages.pop_first();
-                        }
+                        ensure!(self.cblock_preimages.len() <= 4096, "Bridge proof material reached its pending cblock limit before finalization");
                     }
                     hash
                 } else {
@@ -3033,7 +3189,8 @@ impl Network {
                     if vote.slot % 4 == 3 {
                         self.handover_trace.lock().unwrap().entry(vote.slot / 4 + 1).or_default().push((id, "vote", Instant::now()));
                     }
-                    let signature = crypto::sign_bytes(&self.keys[id], &encode(&vote)?);
+                    let message = vote_message(&vote, self.genesis.as_ref().and_then(|g| g.bridge.as_ref()))?;
+                    let signature = crypto::sign_bytes(&self.keys[id], &message);
                     let signed = SignedVote {
                         vote: vote.clone(),
                         signature,
@@ -3092,6 +3249,7 @@ impl Network {
                     });
                 }
                 Action::Finalized(block) => {
+                    self.sign_finalized_ancestors(id, block, step)?;
                     let at = self.consensus_time(id, block.slot);
                     let state = self.nodes[id]
                         .slots
@@ -3362,13 +3520,14 @@ impl Network {
         }
     }
     /// Queues validator 0's state at a cblock it just finalized for the state writer.
-    fn save_state(&self, cblock: u64) {
+    fn save_state(&self, cblock: u64) -> Result<()> {
         let Some(writer) = &self.state_writer else {
-            return;
+            return Ok(());
         };
         let node = &self.nodes[0];
         let (Some(block), Some(checkpoint), Some(threshold)) = (node.executed_blocks.get(&cblock), node.checkpoints.get(&cblock), node.threshold_checkpoints.get(&cblock)) else {
-            return;
+            ensure!(!self.bridge_open(cblock * 4), "Finalized bridge cblock is missing its state checkpoint");
+            return Ok(());
         };
         let meta = crate::state::Meta {
             format: crate::state::FORMAT,
@@ -3382,7 +3541,8 @@ impl Network {
             genesis_hash: self.genesis_hash.clone(),
             saved_at_ms: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
         };
-        let _ = writer.send(crate::state::Pending { checkpoint: checkpoint.clone(), meta });
+        writer.send(crate::state::Pending { checkpoint: checkpoint.clone(), meta }).map_err(|_| anyhow::anyhow!("State checkpoint writer stopped"))?;
+        Ok(())
     }
     /// Hands the transactions people sent in the finalized chain through `cblock` to the kept
     /// transactions: the slots of skipped cblocks are passed over.

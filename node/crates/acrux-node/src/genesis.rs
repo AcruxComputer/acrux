@@ -101,6 +101,23 @@ pub struct BridgeConfig {
     #[serde(deserialize_with = "pubkey")]
     pub program: Pubkey,
     pub from_slot: u64,
+    /// Solana light-client epochs, independent of the consensus schedule's epochs.
+    #[serde(default = "bridge_epoch_slots")]
+    pub epoch_slots: u64,
+    /// The chain name whose SHA-256 prefixes votes from the bridge activation slot.
+    #[serde(deserialize_with = "chain_id")]
+    pub chain_id: String,
+}
+impl BridgeConfig {
+    pub fn chain_tag(&self) -> [u8; 32] { crate::crypto::hash(self.chain_id.as_bytes()) }
+}
+fn bridge_epoch_slots() -> u64 { 432_000 }
+fn chain_id<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    let name = String::deserialize(d)?;
+    if name.trim().is_empty() {
+        return Err(serde::de::Error::custom("bridge chainId must be a nonempty chain name"));
+    }
+    Ok(name)
 }
 fn pubkey<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Pubkey, D::Error> {
     let s = String::deserialize(d)?;
@@ -113,7 +130,10 @@ fn bridge(chain: &Path) -> Result<Option<BridgeConfig>> {
     if !path.exists() {
         return Ok(None);
     }
-    Ok(Some(serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("Read {}", path.display()))?)?))
+    let config: BridgeConfig = serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("Read {}", path.display()))?)?;
+    ensure!(config.epoch_slots > 0 && config.epoch_slots % 4 == 0, "bridge epochSlots must be positive and divisible by four");
+    ensure!(config.from_slot % 4 == 0, "bridge fromSlot must start at a four-slot cblock boundary");
+    Ok(Some(config))
 }
 
 /// The placements the chain applies: `chain/placements/placements.json` beside the genesis, or the

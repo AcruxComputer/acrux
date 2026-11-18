@@ -490,14 +490,14 @@ const bridgeProgram = 'EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5'
 const bridgeSolanaMint = '3A5GLMkvQndVrzcTTC7gXDUnBnaTDhQFWvumfhQ7uYyT'
 const bridgeAcruxMint = 'Bu5CMp2GSnpzLGNpVvpA3mMPPftbiJRYBTpqYGSAJxsN'
 export const bridgeFixture: z.infer<typeof Bridge> = {
-  status: 'live', program: bridgeProgram, fromSlot: 0,
+  status: 'live', program: bridgeProgram, fromSlot: 0, relayer: null,
   lightClient: { epoch: 1, validators: 12, latestCertified: { consensusSlot: 174, epoch: 0, hash: 'a7'.repeat(32), outboxRoot: '5c'.repeat(32), account: '7Wt8f36u8o2DdMmZaQQpdpSg8QFS6hEdTheKZqtZEgvb' } },
   vaults: [{ solanaMint: bridgeSolanaMint, acruxMint: bridgeAcruxMint, decimals: 6, lockedBaseUnits: '1500000000', bridgedBaseUnits: '1250000000' }],
   totals: { deposits: 1, credited: 1, withdrawals: 2, released: 1 },
   readAt: '2026-11-18T14:30:00.000Z',
 }
 export const bridgeWaitingFixture: z.infer<typeof Bridge> = {
-  status: 'waiting', program: null, fromSlot: null, lightClient: { epoch: null, validators: 0, latestCertified: null }, vaults: [],
+  status: 'waiting', program: null, fromSlot: null, relayer: null, lightClient: { epoch: null, validators: 0, latestCertified: null }, vaults: [],
   totals: { deposits: 0, credited: 0, withdrawals: 0, released: 0 }, readAt: null,
 }
 export const bridgeTransfersFixture: z.infer<typeof BridgeTransfer>[] = [
