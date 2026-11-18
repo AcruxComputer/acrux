@@ -226,6 +226,8 @@ struct FactsCursor {
 /// faucet) is aimed. The gateway sits beside the proposers, so the next slot is in reach; a copy
 /// that misses its slot's block is carried by the next, as any due transaction is.
 const SEND_LEAD_SLOTS: u64 = 1;
+/// What a faucet grant's payer needs beyond the grant: fees, two token accounts' rent, the reserve.
+const FAUCET_MARGIN: u64 = 10_000_000;
 
 /// A block carries at most this many bytes of transactions and fragments; what is due beyond it
 /// stays in the mempool for the next slots. Kept well under the 1 MiB block and network message
@@ -3263,15 +3265,24 @@ impl Network {
         let target = self.latest_started() + SEND_LEAD_SLOTS;
         let recipient: solana_sdk::pubkey::Pubkey = address.parse()?;
         let genesis = self.genesis.clone();
-        let (payer, instructions) = match &genesis {
+        // The grant's ACRUX comes from the genesis faucet while it can pay, then from the richest of
+        // the built-in traffic's senders; with no one able to pay, the grant is refused, not sent.
+        let executor = self.nodes[0].executor.as_ref().unwrap();
+        let need = lamports + FAUCET_MARGIN;
+        let funds = |k: &Keypair| executor.balance(&k.pubkey().to_string()).unwrap_or(0);
+        let funder = genesis.as_ref().map(|g| &g.faucet).filter(|f| funds(f) >= need)
+            .or_else(|| self.senders.iter().max_by_key(|k| funds(k)).filter(|k| funds(k) >= need))
+            .context("The faucet is empty.")?;
+        let (signers, instructions): (Vec<&Keypair>, _) = match &genesis {
             // The genesis faucet also hands out demo tokens.
-            Some(genesis) => (&genesis.faucet, genesis.faucet_instructions(&recipient, lamports)?),
-            None => (&self.senders[0], vec![system_instruction::transfer(&self.senders[0].pubkey(), &recipient, lamports)]),
+            Some(genesis) if funder.pubkey() == genesis.faucet.pubkey() => (vec![funder], genesis.faucet_instructions(&funder.pubkey(), &recipient, lamports)?),
+            Some(genesis) => (vec![funder, &genesis.faucet], genesis.faucet_instructions(&funder.pubkey(), &recipient, lamports)?),
+            None => (vec![funder], vec![system_instruction::transfer(&funder.pubkey(), &recipient, lamports)]),
         };
         let tx = Transaction::new_signed_with_payer(
             &instructions,
-            Some(&payer.pubkey()),
-            &[payer],
+            Some(&funder.pubkey()),
+            &signers,
             self.nodes[0]
                 .executor
                 .as_ref()
@@ -3859,7 +3870,7 @@ impl Network {
                 let limit = config["limit"].as_u64().unwrap_or(1_000).min(1_000) as usize;
                 // A transaction the gateway no longer holds in memory was finalized long ago.
                 let gateway = self.gateway.read().await;
-                let finalized = |id: &str| gateway.transactions.get(id).map_or(true, |tx| tx["state"] == "finalized");
+                let finalized = |id: &str| gateway.transactions.get(id).map_or(true, |tx| tx["state"] == "finalized" || !tx["finalization"].is_null());
                 let (before, until) = (config["before"].as_str(), config["until"].as_str());
                 let entry = |signature: &str, executed: &crate::solana::Executed, finalized: bool| json!({
                     "signature": signature,
@@ -3998,12 +4009,13 @@ impl Network {
                 let mut statuses = vec![];
                 for signature in arg(0).as_array().context("signatures")? {
                     let id = signature.as_str().and_then(|s| self.signature_ids.get(s)).cloned();
-                    let record = match id {
+                    // A record the gateway no longer holds in memory was finalized and moved to the store.
+                    let (record, stored) = match id {
                         Some(id) => match self.gateway.read().await.transactions.get(&id).cloned() {
-                            Some(tx) => Some(tx),
-                            None => self.store.get(&format!("transaction/{id}"))?,
+                            Some(tx) => (Some(tx), false),
+                            None => (self.store.get(&format!("transaction/{id}"))?, true),
                         },
-                        None => None,
+                        None => (None, false),
                     };
                     if record.is_none() {
                         if let (Some(kept), Some(signature)) = (&self.kept, signature.as_str()) {
@@ -4020,8 +4032,12 @@ impl Network {
                             }
                         }
                     }
+                    // A failed transaction is final once its cblock is, and then stored with its finalization.
+                    let is_final = |tx: &Value| tx["state"] == "finalized" || (tx["state"] == "failed" && (stored || !tx["finalization"].is_null()));
                     statuses.push(match record.as_ref().and_then(|tx| tx["state"].as_str()) {
-                        Some(state @ ("executed" | "finalized" | "failed")) => json!({
+                        Some("executed" | "finalized" | "failed") => {
+                            let state = if is_final(record.as_ref().unwrap()) { "finalized" } else { "executed" };
+                            json!({
                             "slot": record.as_ref().unwrap()["executedSlot"],
                             "confirmations": if state == "finalized" { Value::Null } else { json!(0) },
                             "err": if record.as_ref().unwrap()["result"] == "success" { Value::Null } else { crate::solana::FAILED.clone() },
@@ -4029,7 +4045,8 @@ impl Network {
                             // `confirmed` on Solana means a supermajority voted and it will not roll back; an executed
                             // transaction here can still go with a skipped cblock, so it is `processed` until finalized.
                             "confirmationStatus": if state == "finalized" { "finalized" } else { "processed" },
-                        }),
+                        })
+                        }
                         _ => Value::Null,
                     });
                 }

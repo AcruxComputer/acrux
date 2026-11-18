@@ -140,10 +140,13 @@ impl Observer {
                                 .into_iter()
                                 .filter_map(|id| {
                                     let tx = g.transactions.get_mut(&id)?;
-                                    if tx["state"] != "executed" {
-                                        return None;
+                                    // A transaction that ran and failed is final with its cblock too,
+                                    // as Solana finalizes it with its error; it keeps its `failed` state.
+                                    match tx["state"].as_str() {
+                                        Some("executed") => tx["state"] = json!("finalized"),
+                                        Some("failed") if tx["executedSlot"].is_u64() => {}
+                                        _ => return None,
                                     }
-                                    tx["state"] = json!("finalized");
                                     tx["finalization"] = certificate.clone().unwrap_or(Value::Null);
                                     Some(tx.clone())
                                 })
@@ -179,7 +182,8 @@ impl Observer {
                             }
                         }
                     }
-                    if event.kind == "transaction.updated" && event.data["state"] == "executed" {
+                    // Executed transactions, failed ones included, wait for their cblock to finalize.
+                    if event.kind == "transaction.updated" && matches!(event.data["state"].as_str(), Some("executed" | "failed")) {
                         if let (Some(slot), Some(id)) = (
                             event.data["executedSlot"].as_u64(),
                             event.data["header"]["id"].as_str(),

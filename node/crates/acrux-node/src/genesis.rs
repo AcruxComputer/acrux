@@ -166,19 +166,20 @@ impl Genesis {
         })
     }
 
-    /// An ACRUX transfer plus, per demo mint, the receiver's associated token account and a grant.
-    pub fn faucet_instructions(&self, receiver: &Pubkey, lamports: u64) -> Result<Vec<Instruction>> {
+    /// An ACRUX transfer from `funder` plus, per demo mint, the receiver's associated token account
+    /// (its rent paid by `funder`) and a grant signed by the faucet, which holds the demo tokens.
+    pub fn faucet_instructions(&self, funder: &Pubkey, receiver: &Pubkey, lamports: u64) -> Result<Vec<Instruction>> {
         let token = Pubkey::from_str(TOKEN_PROGRAM)?;
         let ata = Pubkey::from_str(ATA_PROGRAM)?;
-        let payer = self.faucet.pubkey();
-        let mut instructions = vec![solana_sdk::system_instruction::transfer(&payer, receiver, lamports)];
+        let faucet = self.faucet.pubkey();
+        let mut instructions = vec![solana_sdk::system_instruction::transfer(funder, receiver, lamports)];
         for (mint, source) in self.tokens.iter().zip(&self.faucet_token_accounts) {
             let mint_key = Pubkey::from_str(&mint.mint)?;
             let destination = associated_token_account(receiver, &mint_key);
             instructions.push(Instruction {
                 program_id: ata,
                 accounts: vec![
-                    AccountMeta::new(payer, true),
+                    AccountMeta::new(*funder, true),
                     AccountMeta::new(destination, false),
                     AccountMeta::new_readonly(*receiver, false),
                     AccountMeta::new_readonly(mint_key, false),
@@ -196,7 +197,7 @@ impl Genesis {
                     AccountMeta::new(Pubkey::from_str(source)?, false),
                     AccountMeta::new_readonly(mint_key, false),
                     AccountMeta::new(destination, false),
-                    AccountMeta::new_readonly(payer, true),
+                    AccountMeta::new_readonly(faucet, true),
                 ],
                 data,
             });

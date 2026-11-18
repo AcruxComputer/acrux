@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "acrux-consensus"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "acrux-crypto"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "anyhow",
  "bincode",
@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "acrux-execution"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "acrux-crypto",
  "anyhow",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "acrux-node"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "acrux-consensus",
  "acrux-crypto",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "acrux-schedule"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "anyhow",
  "rand 0.8.8",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "acrux-transport"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "anyhow",
  "quinn",

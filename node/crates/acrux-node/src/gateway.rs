@@ -943,7 +943,9 @@ async fn signature_reached(state: &SharedGateway, signature: &str, finalized: bo
     };
     let reached = match tx["state"].as_str()? {
         "finalized" => true,
-        "executed" | "failed" => !finalized,
+        // A failed transaction is final once its cblock is: it then carries a finalization.
+        "failed" => !finalized || !tx["finalization"].is_null(),
+        "executed" => !finalized,
         _ => false,
     };
     reached.then(|| (
