@@ -244,6 +244,105 @@ pub fn sandwiches(flows: &[Flow]) -> Vec<Sandwich> {
     found
 }
 
+/// Pump.fun's TradeEvent, as the program logs it after every trade on a bonding curve.
+const TRADE_EVENT: [u8; 8] = [0xbd, 0xdb, 0x7f, 0xd3, 0x4e, 0xe6, 0x61, 0xee];
+
+/// One Pump.fun trade as its event states it: the SOL that moved to or from the curve, the tokens,
+/// and the curve's virtual reserves after it.
+#[derive(Clone, Copy, Debug)]
+struct PumpTrade {
+    sol: i128,
+    tokens: i128,
+    virtual_sol: i128,
+    virtual_tokens: i128,
+}
+
+fn pump_trade(entry: &Value, mint: &str) -> Option<PumpTrade> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let mint = bs58::decode(mint).into_vec().ok()?;
+    entry["meta"]["logMessages"].as_array()?.iter().filter_map(|l| l.as_str()?.strip_prefix("Program data: ")).find_map(|data| {
+        let d = STANDARD.decode(data).ok()?;
+        // discriminator, mint, sol, tokens, is_buy, user, timestamp, virtual sol, virtual tokens
+        if d.len() < 113 || d[..8] != TRADE_EVENT || d[8..40] != mint[..] {
+            return None;
+        }
+        let u64_at = |o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap()) as i128;
+        Some(PumpTrade { sol: u64_at(40), tokens: u64_at(48), virtual_sol: u64_at(97), virtual_tokens: u64_at(105) })
+    })
+}
+
+/// A token account's mint and balance before and after a transaction, by address.
+fn token_account(entry: &Value, account: &str) -> Option<(String, i128, i128)> {
+    let meta = &entry["meta"];
+    let mut keys = entry["transaction"]["message"]["accountKeys"].as_array().cloned().unwrap_or_default();
+    keys.extend(meta["loadedAddresses"]["writable"].as_array().cloned().unwrap_or_default());
+    keys.extend(meta["loadedAddresses"]["readonly"].as_array().cloned().unwrap_or_default());
+    let index = keys.iter().position(|k| k.as_str() == Some(account))? as u64;
+    let find = |list: &Value| list.as_array()?.iter().find(|b| b["accountIndex"].as_u64() == Some(index)).cloned();
+    let (pre, post) = (find(&meta["preTokenBalances"]), find(&meta["postTokenBalances"]));
+    let mint = pre.as_ref().or(post.as_ref())?["mint"].as_str()?.to_owned();
+    let raw = |b: Option<Value>| b.and_then(|b| b["uiTokenAmount"]["amount"].as_str()?.parse::<i128>().ok()).unwrap_or(0);
+    Some((if mint == WSOL { "SOL".into() } else { mint }, raw(pre), raw(post)))
+}
+
+/// A sandwich repriced as it would land on Acrux.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Repricing {
+    /// "pump-curve" or "constant-product".
+    pub pool: &'static str,
+    /// What the victim got in the asset it bought, and what it would have got with no front leg.
+    pub victim_got: String,
+    pub victim_would_get: String,
+    /// The difference, valued in the asset the victim paid with at the victim's own price.
+    pub kept_paid: String,
+    /// Sent plain (t = 1), a proposer front-runs only by outbidding the victim's priority fee per CU
+    /// over the front leg's compute limit: that cost in lamports, and the trader's take after it.
+    pub outbid_lamports: String,
+    pub take_after_outbid: String,
+}
+
+/// The victim's output with the front leg taken out of the pool, from the pool's state recorded in
+/// the block: a Pump.fun curve's virtual reserves from its trade events, else the pool vaults'
+/// balances, on the constant-product rule with the fee the victim's own trade shows.
+pub fn reprice(block: &Value, sandwich: &Sandwich, candidates: &[Candidate]) -> Option<Repricing> {
+    let txs = block["transactions"].as_array()?;
+    let (front, victim) = (&txs[sandwich.front.index], &txs[sandwich.victim.index]);
+    let (pool, got, would_get) = if let (Some(f), Some(v)) = (pump_trade(front, &sandwich.bought), pump_trade(victim, &sandwich.bought)) {
+        // The victim's reserves before its trade, then without the front leg's buy.
+        let (sol, tokens) = (v.virtual_sol - v.sol - f.sol, v.virtual_tokens + v.tokens + f.tokens);
+        ("pump-curve", v.tokens, tokens * v.sol / (sol + v.sol))
+    } else {
+        // The pool's vault of each asset among those all three trades moved.
+        let vault = |asset: &str| sandwich.vaults.iter().find(|a| token_account(victim, a).is_some_and(|(m, _, _)| m == asset));
+        let (x_vault, y_vault) = (vault(&sandwich.bought)?, vault(&sandwich.paid)?);
+        let (_, x0, x1) = token_account(victim, x_vault)?;
+        let (_, y0, _) = token_account(victim, y_vault)?;
+        let (_, fx0, fx1) = token_account(front, x_vault)?;
+        let (_, fy0, fy1) = token_account(front, y_vault)?;
+        let out = x0 - x1;
+        if out <= 0 || x0 <= out {
+            return None;
+        }
+        // The input that, on the constant-product rule, gave the victim exactly what it got.
+        let input = out * y0 / (x0 - out);
+        let (x, y) = (x0 + (fx0 - fx1), y0 - (fy1 - fy0));
+        ("constant-product", out, x * input / (y + input))
+    };
+    let paid = -sandwich.victim.delta(&sandwich.victim_owner, &sandwich.paid);
+    let kept = if got > 0 { (would_get - got) * paid / got } else { 0 };
+    let by_id = |id: &str| candidates.iter().find(|c| c.id == id);
+    let outbid = by_id(&sandwich.front.signature).zip(by_id(&sandwich.victim.signature)).map(|(f, v)| ((v.priority_fee_per_cu + 1) as i128 * f.compute_limit as i128) / 1_000_000).unwrap_or(0);
+    Some(Repricing {
+        pool,
+        victim_got: got.to_string(),
+        victim_would_get: would_get.to_string(),
+        kept_paid: kept.to_string(),
+        outbid_lamports: outbid.to_string(),
+        take_after_outbid: (sandwich.take() - if sandwich.paid == "SOL" { outbid } else { 0 }).to_string(),
+    })
+}
+
 fn amount(raw: i128, decimals: u8) -> String {
     let scale = 10i128.pow(decimals as u32);
     let fraction = format!("{:0width$}", raw.abs() % scale, width = decimals as usize);
@@ -253,7 +352,7 @@ fn amount(raw: i128, decimals: u8) -> String {
 
 /// Reads the block, places it and prints both orders: the leader's, and Acrux's merged order
 /// with each transaction's Acrux slot, track and start.
-pub async fn run(file: Option<&str>, rpc: Option<&str>, slot: Option<u64>, save: Option<&str>, rows: usize) -> Result<()> {
+pub async fn run(file: Option<&str>, rpc: Option<&str>, slot: Option<u64>, save: Option<&str>, rows: usize, json: Option<&str>) -> Result<()> {
     let (block, number) = match (file, rpc, slot) {
         (Some(file), _, _) => {
             let block: Value = serde_json::from_slice(&std::fs::read(file).with_context(|| format!("Read {file}"))?)?;
@@ -319,6 +418,37 @@ pub async fn run(file: Option<&str>, rpc: Option<&str>, slot: Option<u64>, save:
         println!("  victim {} at {} bought {} with {}", s.victim.signature, s.victim.index + 1, name(&s.bought), name(&s.paid));
         println!("    front {} at {}, back {} at {}, trader {}", s.front.signature, s.front.index + 1, s.back.signature, s.back.index + 1, s.trader);
         println!("    pool vaults {}; the two legs left the trader {} {}", s.vaults.iter().map(|v| short(v)).collect::<Vec<_>>().join(", "), amount(s.take(), decimals), name(&s.paid));
+        match reprice(&block, s, &leader) {
+            Some(r) => {
+                let bought = s.victim.decimals.get(&s.bought).copied().unwrap_or(0);
+                let n = |v: &str| v.parse::<i128>().unwrap_or(0);
+                println!(
+                    "    on Acrux, sent 2-of-3: no front leg; the victim gets {} instead of {} {}, keeping {} {} ({})",
+                    amount(n(&r.victim_would_get), bought), amount(n(&r.victim_got), bought), name(&s.bought), amount(n(&r.kept_paid), decimals), name(&s.paid), r.pool
+                );
+                println!("    sent plain (t = 1): front-running costs {} lamports in priority over the victim's; the trader keeps {} {}", group(n(&r.outbid_lamports) as u64), amount(n(&r.take_after_outbid), decimals), name(&s.paid));
+            }
+            None => println!("    not priced: the pool is neither a Pump.fun curve nor a vault pair the three trades all moved"),
+        }
+    }
+    if let Some(path) = json {
+        let record = json!({
+            "slot": number,
+            "transactions": leader.len(),
+            "votesLeftOut": votes,
+            "cuRequested": requested,
+            "acruxSlots": slots.iter().map(|s| json!({"transactions": s.selected_ids.len(), "cuPerTrack": (1..=TRACKS).map(|t| s.placements.iter().filter(|p| p.track == t).map(|p| p.length_cu).sum::<u64>()).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+            "leaderOrder": leader.iter().map(|c| json!({"signature": c.id, "priorityFeePerCu": c.priority_fee_per_cu, "computeLimit": c.compute_limit})).collect::<Vec<_>>(),
+            "mergedOrder": merged.iter().map(|(c, slot, p)| json!({"signature": c.id, "priorityFeePerCu": c.priority_fee_per_cu, "acruxSlot": slot, "track": p.track, "startCu": p.start_cu, "lengthCu": p.length_cu})).collect::<Vec<_>>(),
+            "sandwiches": found.iter().map(|s| json!({
+                "victim": s.victim.signature, "victimPosition": s.victim.index + 1,
+                "front": s.front.signature, "frontPosition": s.front.index + 1,
+                "back": s.back.signature, "backPosition": s.back.index + 1,
+                "trader": s.trader, "bought": s.bought, "paid": s.paid, "vaults": s.vaults,
+                "take": s.take().to_string(), "repricing": reprice(&block, s, &leader),
+            })).collect::<Vec<_>>(),
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&record)?).with_context(|| format!("Write {path}"))?;
     }
     Ok(())
 }

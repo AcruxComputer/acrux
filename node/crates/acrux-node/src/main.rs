@@ -87,6 +87,9 @@ enum Command {
         /// How many rows of the two orders to print.
         #[arg(long, default_value_t = 40)]
         rows: usize,
+        /// Writes the slot, both orders and the sandwiches with their repricing as one JSON record.
+        #[arg(long)]
+        json: Option<String>,
     },
     /// The Fault Lab.
     Lab {
@@ -230,7 +233,7 @@ async fn run() -> anyhow::Result<()> {
         Command::Schedule => return schedule_preview(),
         Command::Keygen { out } => return cli::keygen(&out),
         Command::Identities { out } => return cli::identities(&out),
-        Command::Replay { block, rpc, slot, save, rows } => return acrux_node::replay::run(block.as_deref(), rpc.as_deref(), slot, save.as_deref(), rows).await,
+        Command::Replay { block, rpc, slot, save, rows, json } => return acrux_node::replay::run(block.as_deref(), rpc.as_deref(), slot, save.as_deref(), rows, json.as_deref()).await,
         Command::Send { rpc, keypair, to, lamports, n, t, priority } => return cli::send(&rpc, &keypair, &to, lamports, n, t, priority).await,
         Command::Node { command: NodeCommand::Follow { url, genesis } } => return cli::follow(&url, &genesis).await,
         Command::Net { command: NetCommand::Import { url, store, genesis } } => return cli::import(&url, &store, &genesis).await,
