@@ -8,7 +8,7 @@ export function createClient(baseUrl: string, options: Omit<HttpOptions, 'apiErr
   return {
     health: (call?: CallOptions) => http.get('/health', Health, call),
     buyback: (call?: CallOptions) => http.get('/v1/buyback', Buyback, call),
-    replay: (call?: CallOptions) => http.get('/v1/replay', ReplayRange, call),
+    replay: (range: { from?: number; to?: number } = {}, call?: CallOptions) => http.get('/v1/replay', ReplayRange, { ...call, query: range }),
     replaySlot: (slot: number, call?: CallOptions) => http.get(`/v1/replay/${slot}`, ReplaySlotRecord, call),
     hubs: (query: z.input<typeof PageQuery> = {}, call?: CallOptions) => http.get('/v1/hubs', Hubs, { ...call, query }),
     hub: (code: string, call?: CallOptions) => http.get(`/v1/hubs/${path(code)}`, Hub, call),

@@ -6,8 +6,8 @@ import { rpcMethods, RpcRequest, RpcFailure } from './rpc.js'
 import { openApiDocument, type Operation } from './openapi.js'
 const operations: Operation[] = [
   { method:'get', path:'/v1/buyback', operationId:'buyback',summary:'Creator fee buyback totals and recent confirmed actions', response:'Buyback' },
-  { method:'get', path:'/v1/replay', operationId:'replay',summary:'The replayed mainnet range: totals and its sandwiches, newest first',response:'ReplayRange' },
-  { method:'get', path:'/v1/replay/{slot}', operationId:'replaySlot',summary:'One replayed mainnet slot: both orders, the Acrux slots and its sandwiches repriced',response:'ReplaySlotRecord',params:{slot:'Count'} },
+  { method:'get', path:'/v1/replay', operationId:'replay',summary:'The replayed mainnet range: totals and its sandwiches, newest first; from and to narrow it to one slot range',response:'ReplayRange',query:z.object({from:s.Count.optional(),to:s.Count.optional()}) },
+  { method:'get', path:'/v1/replay/{slot}', operationId:'replaySlot',summary:'One replayed mainnet slot: both orders, the Acrux slots and its sandwiches repriced; across an epoch only slots with sandwiches are kept whole',response:'ReplaySlotRecord',params:{slot:'Count'} },
   { method:'get', path:'/health', operationId:'health',summary:'Service and configuration status', response:'Health' },
   { method:'get', path:'/v1/hubs', operationId:'hubs',summary:'Registry hubs',response:'Hubs',query:s.PageQuery },
   { method:'get', path:'/v1/hubs/{code}', operationId:'hub',summary:'Hub and members',response:'Hub',params:{code:'HubCode'} },

@@ -521,7 +521,7 @@ export const replaySlot: ReplaySlotRecord = {
 
 export const replayRange: ReplayRange = {
   fromSlot: replaySlot.slot, toSlot: replaySlot.slot, slotsReplayed: 1, transactions: replaySlot.transactions,
-  acruxSlots: replaySlot.acruxSlots.length, sandwichesFound: replaySlot.sandwiches.length,
+  acruxSlots: replaySlot.acruxSlots.length, sandwichCount: new Set(replaySlot.sandwiches.map(s => `${s.front}:${s.back}`)).size, sandwichesFound: replaySlot.sandwiches.length,
   sandwichesPriced: replaySlot.sandwiches.filter(s => s.repricing).length,
   // One front and back leg can sandwich several victims: each pair's take counts once.
   lamportsTaken: [...new Map(replaySlot.sandwiches.map(s => [s.front, s.take])).values()].reduce((n, take) => n + BigInt(take), 0n).toString(),

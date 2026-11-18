@@ -139,10 +139,14 @@ export const ReplaySlotRecord = z.strictObject({
   sandwiches: z.array(ReplaySandwich),
 })
 export const ReplaySandwichRow = ReplaySandwich.extend({ slot: Count })
-/** The replayed range with its totals; SOL-paid sandwiches sum into the lamport totals. */
+/**
+ * The replayed range with its totals, over every slot: `sandwichCount` counts each front and back
+ * pair once, `sandwichesFound` and `sandwichesPriced` count victims; SOL-paid sandwiches sum into
+ * the lamport totals. `sandwiches` lists the newest 500 victims only, so totals come from here.
+ */
 export const ReplayRange = z.strictObject({
   fromSlot: Count.nullable(), toSlot: Count.nullable(), slotsReplayed: Count, transactions: Count, acruxSlots: Count,
-  sandwichesFound: Count, sandwichesPriced: Count, lamportsTaken: SignedUnits, lamportsKept: SignedUnits,
+  sandwichCount: Count, sandwichesFound: Count, sandwichesPriced: Count, lamportsTaken: SignedUnits, lamportsKept: SignedUnits,
   readAt: Timestamp.nullable(),
   /** Newest first. */
   sandwiches: z.array(ReplaySandwichRow).max(500),

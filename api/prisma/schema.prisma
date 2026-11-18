@@ -207,14 +207,15 @@ model BuybackRow {
   @@map("buyback_rows")
 }
 
-/// A replayed Solana mainnet slot (`acrux replay --json`): the record whole, and its sandwiches
-/// and counts beside it for the range view.
+/// A replayed Solana mainnet slot (`acrux replay --json`): its counts and sandwiches for the range
+/// view, and the record whole (kept for every slot of a small range, only for slots with
+/// sandwiches across an epoch).
 model ReplaySlot {
   slot         BigInt   @id
   transactions Int
   acruxSlots   Int      @map("acrux_slots")
   sandwiches   Json
-  record       Json
+  record       Json?
   readAt       DateTime @default(now()) @map("read_at") @db.Timestamptz(3)
 
   @@map("replay_slots")
