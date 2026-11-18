@@ -23,9 +23,11 @@ declare_id!("EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5");
 pub mod acrux_bridge {
     use super::*;
 
-    /// Creates the bridge's one state account, which numbers the deposits. Its payer becomes the
-    /// authority that seeds the first validator set; `epoch_slots` is an Acrux epoch's length.
+    /// Creates the bridge's one state account, which numbers the deposits. Only the program's
+    /// upgrade authority can call it, and it becomes the authority that seeds the first validator
+    /// set, once; `epoch_slots` is an Acrux epoch's length.
     pub fn initialize(ctx: Context<Initialize>, epoch_slots: u64) -> Result<()> {
+        require_upgrade_authority(ctx.accounts.program_data.upgrade_authority_address, ctx.accounts.payer.key())?;
         require!(epoch_slots > 0 && epoch_slots % 4 == 0, BridgeError::BadEpoch);
         ctx.accounts.bridge.set_inner(Bridge { deposits: 0, bump: ctx.bumps.bridge, authority: ctx.accounts.payer.key(), epoch_slots });
         Ok(())
@@ -72,7 +74,10 @@ pub mod acrux_bridge {
     }
 
     /// Seeds the light client: Acrux's validators and stakes for `epoch`, in Acrux's validator order.
+    /// It works once: the bridge's authority is renounced here, and later sets arrive only through
+    /// `hand_off`.
     pub fn init_validator_set(ctx: Context<InitValidatorSet>, epoch: u64, validators: Vec<Validator>) -> Result<()> {
+        take_seed_authority(&mut ctx.accounts.bridge.authority, ctx.accounts.authority.key())?;
         require!(!validators.is_empty() && validators.len() <= MAX_VALIDATORS, BridgeError::BadSet);
         let total = validators.iter().map(|v| v.stake).sum();
         ctx.accounts.set.set_inner(ValidatorSet { epoch, total, validators });
@@ -244,7 +249,7 @@ pub struct Bridge {
     /// Deposits made so far; the next deposit's sequence number.
     pub deposits: u64,
     pub bump: u8,
-    /// Seeds the first validator set.
+    /// Seeds the first validator set, once; renounced (the default key) after it.
     pub authority: Pubkey,
     /// An Acrux epoch's length in slots.
     pub epoch_slots: u64,
@@ -334,6 +339,21 @@ pub struct Cblock {
     pub certified: bool,
 }
 
+/// The program's upgrade authority, and no one else, may initialize the bridge.
+fn require_upgrade_authority(upgrade_authority: Option<Pubkey>, signer: Pubkey) -> Result<()> {
+    require!(upgrade_authority == Some(signer), BridgeError::NotUpgradeAuthority);
+    Ok(())
+}
+
+/// Checks `signer` is the bridge's authority, then renounces it (the default key signs nothing), so
+/// the validator set is seeded once.
+fn take_seed_authority(authority: &mut Pubkey, signer: Pubkey) -> Result<()> {
+    require!(*authority != Pubkey::default(), BridgeError::AlreadySeeded);
+    require!(*authority == signer, BridgeError::NotUpgradeAuthority);
+    *authority = Pubkey::default();
+    Ok(())
+}
+
 #[event]
 pub struct Deposited {
     pub sequence: u64,
@@ -350,6 +370,10 @@ pub struct Initialize<'info> {
     pub payer: Signer<'info>,
     #[account(init, payer = payer, space = 8 + Bridge::INIT_SPACE, seeds = [b"bridge"], bump)]
     pub bridge: Account<'info, Bridge>,
+    #[account(constraint = program.programdata_address()? == Some(program_data.key()) @ BridgeError::NotUpgradeAuthority)]
+    pub program: Program<'info, crate::program::AcruxBridge>,
+    #[account(constraint = program_data.upgrade_authority_address == Some(payer.key()) @ BridgeError::NotUpgradeAuthority)]
+    pub program_data: Account<'info, ProgramData>,
     pub system_program: Program<'info, System>,
 }
 
@@ -393,7 +417,7 @@ pub struct Deposit<'info> {
 pub struct InitValidatorSet<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
-    #[account(seeds = [b"bridge"], bump = bridge.bump, has_one = authority)]
+    #[account(mut, seeds = [b"bridge"], bump = bridge.bump, has_one = authority)]
     pub bridge: Account<'info, Bridge>,
     #[account(init, payer = authority, space = 8 + ValidatorSet::INIT_SPACE, seeds = [b"set", epoch.to_le_bytes().as_ref()], bump)]
     pub set: Account<'info, ValidatorSet>,
@@ -479,6 +503,10 @@ pub struct HandOff<'info> {
 
 #[error_code]
 pub enum BridgeError {
+    #[msg("Only the program's upgrade authority can initialize the bridge.")]
+    NotUpgradeAuthority,
+    #[msg("The validator set was already seeded; the authority is renounced.")]
+    AlreadySeeded,
     #[msg("A deposit moves more than nothing.")]
     ZeroAmount,
     #[msg("An epoch is a positive number of cblocks.")]
@@ -494,3 +522,52 @@ pub enum BridgeError {
     #[msg("The validator set is not in the cblock's outbox.")]
     BadProof,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_err(result: Result<()>, name: &str) -> bool {
+        match result {
+            Err(e) => format!("{e:?}").contains(name),
+            Ok(()) => false,
+        }
+    }
+
+    #[test]
+    fn initialize_by_a_non_authority_is_rejected() {
+        let authority = Pubkey::new_unique();
+        let stranger = Pubkey::new_unique();
+        assert!(is_err(require_upgrade_authority(Some(authority), stranger), "NotUpgradeAuthority"));
+    }
+
+    #[test]
+    fn initialize_on_a_program_without_an_upgrade_authority_is_rejected() {
+        assert!(is_err(require_upgrade_authority(None, Pubkey::new_unique()), "NotUpgradeAuthority"));
+    }
+
+    #[test]
+    fn initialize_by_the_upgrade_authority_works() {
+        let authority = Pubkey::new_unique();
+        assert!(require_upgrade_authority(Some(authority), authority).is_ok());
+    }
+
+    #[test]
+    fn the_authority_seeds_once_then_cannot_reseed() {
+        let authority = Pubkey::new_unique();
+        let mut stored = authority;
+        assert!(take_seed_authority(&mut stored, authority).is_ok());
+        assert_eq!(stored, Pubkey::default());
+        assert!(is_err(take_seed_authority(&mut stored, authority), "AlreadySeeded"));
+        assert!(is_err(take_seed_authority(&mut stored, Pubkey::default()), "AlreadySeeded"));
+    }
+
+    #[test]
+    fn a_stranger_cannot_seed_and_does_not_burn_the_authority() {
+        let authority = Pubkey::new_unique();
+        let mut stored = authority;
+        assert!(is_err(take_seed_authority(&mut stored, Pubkey::new_unique()), "NotUpgradeAuthority"));
+        assert_eq!(stored, authority);
+        assert!(take_seed_authority(&mut stored, authority).is_ok());
+    }
+    }
