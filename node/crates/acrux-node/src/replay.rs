@@ -359,11 +359,118 @@ fn fit_pool(swaps: &[PoolSwap]) -> Option<(&'static str, PoolModel)> {
     [false, true].into_iter().filter_map(model).map(|m| (m.miss(swaps), m)).filter(|(miss, _)| *miss < POOL_FIT).min_by(|x, y| x.0.total_cmp(&y.0)).map(|(_, m)| ("constant-product", m))
 }
 
+/// The payloads (after the 8-byte discriminator) of every Anchor event with this discriminator in
+/// a transaction: logged (`Program data:`) or emitted through a self-invocation (`emit_cpi!`).
+fn anchor_events(entry: &Value, discriminator: [u8; 8]) -> Vec<Vec<u8>> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    const CPI_EVENT: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
+    let logged = entry["meta"]["logMessages"].as_array().into_iter().flatten().filter_map(|l| STANDARD.decode(l.as_str()?.strip_prefix("Program data: ")?).ok());
+    let inner = entry["meta"]["innerInstructions"].as_array().into_iter().flatten().flat_map(|i| i["instructions"].as_array().into_iter().flatten()).filter_map(|ix| {
+        let data = bs58::decode(ix["data"].as_str()?).into_vec().ok()?;
+        (data.len() > 16 && data[..8] == CPI_EVENT).then(|| data[8..].to_vec())
+    });
+    logged.chain(inner).filter(|d| d.len() > 8 && d[..8] == discriminator).map(|d| d[8..].to_vec()).collect()
+}
+
+/// One trade on a concentrated-liquidity pool as its program's own event states it: the pool, which
+/// way it went (token A in), what went in after the fee, what came out before any fee taken off
+/// the output, the square-root price after it (token B per token A), and the pool's liquidity when
+/// the event states it.
+#[derive(Clone, Copy, Debug)]
+struct RangeTrade {
+    pool: [u8; 32],
+    a_to_b: bool,
+    input: f64,
+    output: f64,
+    sqrt_after: f64,
+    liquidity: Option<f64>,
+}
+
+impl RangeTrade {
+    /// The pool's liquidity over the range the trade stayed in, and the virtual reserves of the
+    /// asset that went in and the one that came out, before the trade.
+    fn reserves_before(&self) -> Option<(f64, f64, f64)> {
+        let s = self.sqrt_after;
+        let (i, o) = (self.input, self.output);
+        // Virtual reserves are A = L/s and B = L·s; the trade moved them along A·B = L².
+        let l = self.liquidity.unwrap_or(if self.a_to_b { i * o / (o / s - i * s) } else { i * o / (o * s - i / s) });
+        if !(l.is_finite() && l > 0.0) {
+            return None;
+        }
+        let (a, b) = (l / s, l * s);
+        let (in_after, out_after) = if self.a_to_b { (a, b) } else { (b, a) };
+        Some((l, in_after - i, out_after + o))
+    }
+}
+
+fn u64_at(d: &[u8], o: usize) -> Option<f64> {
+    Some(u64::from_le_bytes(d.get(o..o + 8)?.try_into().ok()?) as f64)
+}
+fn u128_at(d: &[u8], o: usize) -> Option<f64> {
+    Some(u128::from_le_bytes(d.get(o..o + 16)?.try_into().ok()?) as f64)
+}
+fn pubkey_at(d: &[u8], o: usize) -> Option<[u8; 32]> {
+    d.get(o..o + 32)?.try_into().ok()
+}
+const Q64: f64 = 18_446_744_073_709_551_616.0;
+
+/// Every concentrated-liquidity trade in a transaction, from the events the programs emit (layouts
+/// from each program's IDL): Meteora DAMM v2 `EvtSwap2`, Orca Whirlpool `Traded`, Raydium CLMM
+/// `SwapEvent`. Meteora DLMM states only its bins, which do not tell the trade without the front
+/// leg, so it is not read.
+fn range_trades(entry: &Value) -> Vec<RangeTrade> {
+    let mut out = vec![];
+    for d in anchor_events(entry, [189, 66, 51, 168, 38, 80, 117, 153]) {
+        // pool, trade_direction, collect_fee_mode, has_referral, params (u64, u64, u8), then the result:
+        // fee-included input, fee-excluded input, amount left, output, next sqrt price, four fees.
+        let (Some(pool), Some(&direction)) = (pubkey_at(&d, 0), d.get(32)) else { continue };
+        let (Some(included), Some(excluded), Some(output), Some(sqrt)) = (u64_at(&d, 52), u64_at(&d, 60), u64_at(&d, 76), u128_at(&d, 84)) else { continue };
+        let fees = [100, 108, 116, 124].iter().filter_map(|&o| u64_at(&d, o)).sum::<f64>();
+        // A fee not taken off the input was taken off the output.
+        let output = if included == excluded { output + fees } else { output };
+        out.push(RangeTrade { pool, a_to_b: direction == 0, input: excluded, output, sqrt_after: sqrt / Q64, liquidity: None });
+    }
+    for d in anchor_events(entry, [225, 202, 73, 175, 147, 43, 160, 150]) {
+        // whirlpool, a_to_b, pre and post sqrt price, input, output, transfer fees, lp and protocol fee.
+        let (Some(pool), Some(&a_to_b)) = (pubkey_at(&d, 0), d.get(32)) else { continue };
+        let (Some(sqrt), Some(input), Some(output), Some(lp), Some(protocol)) = (u128_at(&d, 49), u64_at(&d, 65), u64_at(&d, 73), u64_at(&d, 97), u64_at(&d, 105)) else { continue };
+        out.push(RangeTrade { pool, a_to_b: a_to_b == 1, input: input - lp - protocol, output, sqrt_after: sqrt / Q64, liquidity: None });
+    }
+    for d in anchor_events(entry, [64, 198, 205, 232, 38, 8, 113, 226]) {
+        // pool, sender, two token accounts, amount_0, transfer_fee_0, amount_1, transfer_fee_1,
+        // zero_for_one, sqrt price, liquidity, tick. The input after the fee follows from the rest.
+        let (Some(pool), Some(&zero_for_one)) = (pubkey_at(&d, 0), d.get(160)) else { continue };
+        let (Some(amount_0), Some(amount_1), Some(sqrt), Some(liquidity)) = (u64_at(&d, 128), u64_at(&d, 144), u128_at(&d, 161), u128_at(&d, 177)) else { continue };
+        let a_to_b = zero_for_one == 1;
+        let (s, output) = (sqrt / Q64, if a_to_b { amount_1 } else { amount_0 });
+        let l = liquidity;
+        let input = if a_to_b { l / s - l * l / (l * s + output) } else { l * s - l * l / (l / s + output) };
+        out.push(RangeTrade { pool, a_to_b, input, output, sqrt_after: s, liquidity: Some(liquidity) });
+    }
+    out
+}
+
+/// The victim's trade repriced on a concentrated-liquidity pool: its virtual reserves before it, the
+/// front leg's trade taken back out of them, the victim's input run against what is left.
+fn reprice_range(front: &Value, victim: &Value) -> Option<(f64, f64)> {
+    let fronts = range_trades(front);
+    let v = range_trades(victim).into_iter().find(|v| fronts.iter().any(|f| f.pool == v.pool && f.a_to_b == v.a_to_b))?;
+    let f = fronts.into_iter().find(|f| f.pool == v.pool && f.a_to_b == v.a_to_b)?;
+    let (liquidity, paid_reserve, bought_reserve) = v.reserves_before()?;
+    // Both trades must read the same liquidity: one range, the events read right.
+    let (front_liquidity, _, _) = f.reserves_before()?;
+    if (front_liquidity / liquidity - 1.0).abs() > 0.01 {
+        return None;
+    }
+    let (paid, bought) = (paid_reserve - f.input, bought_reserve + f.output);
+    (paid > 0.0).then(|| (v.output, bought * v.input / (paid + v.input)))
+}
+
 /// A sandwich repriced as it would land on Acrux.
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Repricing {
-    /// "pump-curve" or "constant-product".
+    /// "pump-curve", "concentrated" (from the pool program's own swap events) or "constant-product".
     pub pool: &'static str,
     /// What the victim got in the asset it bought, and what it would have got with no front leg.
     pub victim_got: String,
@@ -377,8 +484,9 @@ pub struct Repricing {
 }
 
 /// The victim's output with the front leg taken out of the pool, from the pool's state recorded in
-/// the block: a Pump.fun curve's virtual reserves from its trade events, else the pool vaults'
-/// balances on the constant-product rule, where it reproduces every trade the block made there.
+/// the block: a Pump.fun curve's virtual reserves from its trade events; a concentrated-liquidity
+/// pool's liquidity and price from its swap events; else the pool vaults' balances on the
+/// constant-product rule, where it reproduces every trade the block made there.
 pub fn reprice(block: &Value, sandwich: &Sandwich, candidates: &[Candidate]) -> Option<Repricing> {
     let txs = block["transactions"].as_array()?;
     let (front, victim) = (&txs[sandwich.front.index], &txs[sandwich.victim.index]);
@@ -386,6 +494,8 @@ pub fn reprice(block: &Value, sandwich: &Sandwich, candidates: &[Candidate]) -> 
         // The victim's reserves before its trade, then without the front leg's buy.
         let (sol, tokens) = (v.virtual_sol - v.sol - f.sol, v.virtual_tokens + v.tokens + f.tokens);
         ("pump-curve", v.tokens, tokens * v.sol / (sol + v.sol))
+    } else if let Some((got, would_get)) = reprice_range(front, victim) {
+        ("concentrated", got as i128, would_get as i128)
     } else {
         // The pool's vault of each asset among those all three trades moved, and every trade the
         // block made against that pair.
@@ -512,7 +622,7 @@ pub async fn run(file: Option<&str>, rpc: Option<&str>, slot: Option<u64>, save:
                 );
                 println!("    sent plain (t = 1): front-running costs {} lamports in priority over the victim's; the trader keeps {} {}", group(n(&r.outbid_lamports) as u64), amount(n(&r.take_after_outbid), decimals), name(&s.paid));
             }
-            None => println!("    not priced: the pool is not a Pump.fun curve and the constant-product rule does not reproduce its trades in this block"),
+            None => println!("    not priced: no event states the pool's state (a Meteora DLMM bin pool, say) and the constant-product rule does not reproduce its trades in this block"),
         }
     }
     if let Some(path) = json {

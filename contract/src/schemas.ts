@@ -116,7 +116,7 @@ export const ReplayAsset = z.union([z.literal('SOL'), Address])
 export const ReplayLeaderItem = z.strictObject({ signature: Signature, priorityFeePerCu: Count, computeLimit: Count })
 export const ReplayMergedItem = z.strictObject({ signature: Signature, priorityFeePerCu: Count, acruxSlot: Count, track: z.number().int().min(1).max(4), startCu: Count, lengthCu: Count })
 export const ReplayRepricing = z.strictObject({
-  pool: z.enum(['pump-curve', 'constant-product']),
+  pool: z.enum(['pump-curve', 'concentrated', 'constant-product']),
   /** What the victim got of the asset it bought, and would have got with no front leg (sent 2-of-3). */
   victimGot: BaseUnits, victimWouldGet: BaseUnits,
   /** The difference valued in the asset the victim paid with, at its own price. */

@@ -3,7 +3,7 @@
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "info": {
     "title": "Acrux API",
-    "version": "0.1.12",
+    "version": "0.1.13",
     "description": "Round 1 fixture contract. Amounts are decimal integer strings. Times are relative microseconds with UTC slot wallTime."
   },
   "servers": [
@@ -9733,6 +9733,7 @@
                           "type": "string",
                           "enum": [
                             "pump-curve",
+                            "concentrated",
                             "constant-product"
                           ]
                         },
@@ -9824,6 +9825,7 @@
             "type": "string",
             "enum": [
               "pump-curve",
+              "concentrated",
               "constant-product"
             ]
           },
@@ -9949,6 +9951,7 @@
                     "type": "string",
                     "enum": [
                       "pump-curve",
+                      "concentrated",
                       "constant-product"
                     ]
                   },
@@ -10096,6 +10099,7 @@
                     "type": "string",
                     "enum": [
                       "pump-curve",
+                      "concentrated",
                       "constant-product"
                     ]
                   },
@@ -10378,6 +10382,7 @@
                           "type": "string",
                           "enum": [
                             "pump-curve",
+                            "concentrated",
                             "constant-product"
                           ]
                         },
