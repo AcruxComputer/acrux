@@ -116,7 +116,7 @@ export function createFixtureApi() {
     const remainingForKey = Math.max(0, env.FAUCET_PER_KEY_LIMIT! - live.filter(g => g.address === address).length)
     const remainingForIp = Math.max(0, env.FAUCET_PER_IP_LIMIT! - live.filter(g => g.ip === ip).length)
     return c.json({ address, policy: { amountLamports: env.FAUCET_GRANT_LAMPORTS!, perKey: env.FAUCET_PER_KEY_LIMIT!, perIp: env.FAUCET_PER_IP_LIMIT!, periodSeconds: env.FAUCET_WINDOW_SECONDS!, missingConfiguration: [] }, remainingForKey, remainingForIp,
-      resetsAt: new Date(now + period).toISOString(), eligible: remainingForKey > 0 && remainingForIp > 0 && !limited })
+      resetsAt: new Date(now + period).toISOString(), eligible: remainingForKey > 0 && remainingForIp > 0 && !limited, availableLamports: null })
   })
   app.post('/v1/faucet', async c => {
     const { address } = await readJson(c, FaucetRequest), state = c.get('scenario')

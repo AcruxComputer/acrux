@@ -228,6 +228,13 @@ struct FactsCursor {
 const SEND_LEAD_SLOTS: u64 = 1;
 /// What a faucet grant's payer needs beyond the grant: fees, two token accounts' rent, the reserve.
 const FAUCET_MARGIN: u64 = 10_000_000;
+/// What one built-in traffic transaction costs its sender, measured: the base fee, the inclusion fee
+/// and its priority fee.
+const TRAFFIC_TX_LAMPORTS: u64 = 8_020;
+/// Days of its own traffic a sender keeps when it pays faucet grants.
+const SENDER_RESERVE_DAYS: u64 = 30;
+/// What a validator's identity started with; the fees it earned above it can pay faucet grants.
+const VALIDATOR_START_LAMPORTS: u64 = 10_000_000_000;
 
 /// A block carries at most this many bytes of transactions and fragments; what is due beyond it
 /// stays in the mempool for the next slots. Kept well under the 1 MiB block and network message
@@ -3246,6 +3253,9 @@ impl Network {
                 let result = self.solana_rpc(&method, params, client).await;
                 let _ = reply.send(result.map_err(|e| e.to_string()));
             }
+            GatewayCommand::Faucet { reply } => {
+                let _ = reply.send(self.faucet_available().map_err(|e| e.to_string()));
+            }
             GatewayCommand::Credit {
                 address,
                 lamports,
@@ -3264,18 +3274,45 @@ impl Network {
         let reserves = [amount(&genesis.pool.vault_a)?, amount(&genesis.pool.vault_b)?];
         Ok((genesis, reserves, self.nodes[0].last_executed.unwrap_or(0)))
     }
+    /// What a traffic sender keeps for its own transactions: `SENDER_RESERVE_DAYS` of them.
+    fn sender_reserve(&self) -> u64 {
+        let per_sender_per_second = self.config.traffic_per_second as f64 / self.senders.len().max(1) as f64;
+        (per_sender_per_second * 86_400.0 * SENDER_RESERVE_DAYS as f64) as u64 * TRAFFIC_TX_LAMPORTS
+    }
+    /// Who else can pay a faucet grant, with what each keeps: the validators' identities, the fees
+    /// they earned above what they started with, and the traffic's senders, above their reserve.
+    fn faucet_funders(&self) -> Vec<(Keypair, u64)> {
+        let validators = self.keys.iter().map(|k| (solana_sdk::signer::keypair::keypair_from_seed(&k.to_bytes()).expect("a validator key is an ed25519 seed"), VALIDATOR_START_LAMPORTS));
+        let senders = self.senders.iter().map(|k| (k.insecure_clone(), self.sender_reserve()));
+        validators.chain(senders).collect()
+    }
+    /// What the faucet can still grant: the genesis faucet's balance and what every other funder holds
+    /// above what it keeps.
+    fn faucet_available(&self) -> Result<Value> {
+        let executor = self.nodes[0].executor.as_ref().unwrap();
+        let funds = |k: &Keypair| executor.balance(&k.pubkey().to_string()).unwrap_or(0);
+        let faucet = self.genesis.as_ref().map_or(0, |g| funds(&g.faucet));
+        let funders = self.faucet_funders();
+        let spare = |range: std::ops::Range<usize>| funders[range].iter().map(|(k, keep)| funds(k).saturating_sub(*keep)).sum::<u64>();
+        let (validators, senders) = (spare(0..self.keys.len()), spare(self.keys.len()..funders.len()));
+        Ok(json!({"availableLamports": (faucet + validators + senders).to_string(), "faucetLamports": faucet.to_string(),
+            "validatorsSpareLamports": validators.to_string(), "sendersSpareLamports": senders.to_string(),
+            "senderReserveLamports": self.sender_reserve().to_string(), "slot": self.nodes[0].last_executed.unwrap_or(0)}))
+    }
     async fn faucet_transfer(&mut self, address: &str, lamports: u64) -> Result<Value> {
         let target = self.latest_started() + SEND_LEAD_SLOTS;
         let recipient: solana_sdk::pubkey::Pubkey = address.parse()?;
         let genesis = self.genesis.clone();
-        // The grant's ACRUX comes from the genesis faucet while it can pay, then from the richest of
-        // the built-in traffic's senders; with no one able to pay, the grant is refused, not sent.
+        // The grant's ACRUX comes from the genesis faucet while it can pay, then from whichever
+        // validator or traffic sender has the most to spare; with no one able to pay, the grant is
+        // refused, not sent.
         let executor = self.nodes[0].executor.as_ref().unwrap();
         let need = lamports + FAUCET_MARGIN;
         let funds = |k: &Keypair| executor.balance(&k.pubkey().to_string()).unwrap_or(0);
+        let funders = self.faucet_funders();
         let funder = genesis.as_ref().map(|g| &g.faucet).filter(|f| funds(f) >= need)
-            .or_else(|| self.senders.iter().max_by_key(|k| funds(k)).filter(|k| funds(k) >= need))
-            .context("The faucet is empty.")?;
+            .or_else(|| funders.iter().map(|(k, keep)| (k, funds(k).saturating_sub(*keep))).max_by_key(|(_, spare)| *spare).filter(|(_, spare)| *spare >= need).map(|(k, _)| k))
+            .context("FAUCET_EMPTY: The faucet cannot pay this grant.")?;
         let (signers, instructions): (Vec<&Keypair>, _) = match &genesis {
             // The genesis faucet also hands out demo tokens.
             Some(genesis) if funder.pubkey() == genesis.faucet.pubkey() => (vec![funder], genesis.faucet_instructions(&funder.pubkey(), &recipient, lamports)?),

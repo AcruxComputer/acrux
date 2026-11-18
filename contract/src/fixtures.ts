@@ -146,7 +146,7 @@ export function makeFixtureBalance(address = fixtureAddress('sender'), funded = 
 }
 export function makeFaucetStatus(address = fixtureAddress('sender'), limited = false): z.infer<typeof FaucetStatus> {
   return { address, policy: faucetPolicy, remainingForKey: limited ? 0 : null, remainingForIp: limited ? 0 : null,
-    resetsAt: limited ? '2026-11-17T00:00:00.000Z' : null, eligible: false }
+    resetsAt: limited ? '2026-11-17T00:00:00.000Z' : null, eligible: false, availableLamports: null }
 }
 export const faucetStatus = makeFaucetStatus
 export function faucetGrant(address = fixtureAddress('sender')): z.infer<typeof FaucetGrant> {
@@ -435,7 +435,7 @@ export const specMap: z.infer<typeof SpecMap> = {
     { topic: 'Registry and faucet', decision: 'Deposit, registration fee, cooldown, inactivity, code rules and faucet limits must be configured.', status: 'configuration_required' },
   ],
 }
-const specialMessages: Record<string, string> = { NOT_FOUND: 'The requested resource was not found.', RATE_LIMITED: 'Too many requests. Try again shortly.', FAUCET_LIMIT: 'The faucet limit for this key or IP has been reached.', INVALID_INPUT: 'The request contains invalid input.', VALIDATION_ERROR: 'The request contains invalid input.', NET_STALLED: 'No new slot has arrived for one second.', NET_UNAVAILABLE: 'Acrux Net is unavailable.', PROGRAM_UNAVAILABLE: 'Waiting for the registry program.', CONFIGURATION_REQUIRED: 'Required configuration has not been set.', ORIGIN_NOT_ALLOWED: 'This origin is not allowed.', TRANSACTION_EXPIRED: 'The transaction fragments expired before reaching the threshold.' }
+const specialMessages: Record<string, string> = { NOT_FOUND: 'The requested resource was not found.', RATE_LIMITED: 'Too many requests. Try again shortly.', FAUCET_LIMIT: 'The faucet limit for this key or IP has been reached.', FAUCET_EMPTY: 'The faucet cannot pay this grant.', GRANT_FAILED: 'The grant transaction failed on Acrux Net.', INVALID_INPUT: 'The request contains invalid input.', VALIDATION_ERROR: 'The request contains invalid input.', NET_STALLED: 'No new slot has arrived for one second.', NET_UNAVAILABLE: 'Acrux Net is unavailable.', PROGRAM_UNAVAILABLE: 'Waiting for the registry program.', CONFIGURATION_REQUIRED: 'Required configuration has not been set.', ORIGIN_NOT_ALLOWED: 'This origin is not allowed.', TRANSACTION_EXPIRED: 'The transaction fragments expired before reaching the threshold.' }
 export const failureFixtures: Record<keyof typeof errors.status, ApiErrorBody> = Object.fromEntries(Object.keys(errors.status).map(code => [code, {
   error: { code, message: specialMessages[code] ?? `Fixture failure: ${code.toLowerCase().replaceAll('_', ' ')}.`, retryable: ['RATE_LIMITED', 'FAUCET_LIMIT', 'NET_STALLED', 'NET_UNAVAILABLE', 'PROGRAM_UNAVAILABLE', 'UPSTREAM_UNAVAILABLE'].includes(code), stage: code === 'INVALID_INPUT' || code === 'VALIDATION_ERROR' ? 'validation' : 'read',
     ...(['RATE_LIMITED', 'FAUCET_LIMIT'].includes(code) ? { retryAfterSeconds: 60 } : {}),

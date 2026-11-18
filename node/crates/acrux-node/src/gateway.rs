@@ -40,6 +40,10 @@ pub enum GatewayCommand {
         lamports: u64,
         reply: CommandReply,
     },
+    /// What the faucet can still grant.
+    Faucet {
+        reply: CommandReply,
+    },
     Balance {
         address: String,
         reply: CommandReply,
@@ -216,7 +220,7 @@ pub async fn run_gateway(
     let metrics = Router::new()
         .route("/metrics", get(metrics))
         .route("/health", get(health))
-        .route("/internal/faucet", post(credit))
+        .route("/internal/faucet", post(credit).get(faucet))
         .with_state(state);
     // 127.0.0.1 locally; a container sets ACRUX_BIND=0.0.0.0.
     let bind: IpAddr = std::env::var("ACRUX_BIND").unwrap_or_else(|_| "127.0.0.1".into()).parse()?;
@@ -764,11 +768,18 @@ async fn credit(State(state): State<SharedGateway>, headers: HeaderMap, body: St
     .await
     {
         Ok(value) => Json(value).into_response(),
-        Err(message) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(error("NET_UNAVAILABLE", &message)),
-        )
-            .into_response(),
+        Err(message) => match message.strip_prefix("FAUCET_EMPTY: ") {
+            Some(message) => (StatusCode::SERVICE_UNAVAILABLE, Json(error("FAUCET_EMPTY", message))).into_response(),
+            None => (StatusCode::SERVICE_UNAVAILABLE, Json(error("NET_UNAVAILABLE", &message))).into_response(),
+        },
+    }
+}
+
+/// The private port's read of what the faucet can still grant.
+async fn faucet(State(state): State<SharedGateway>) -> Response {
+    match command(&state, |reply| GatewayCommand::Faucet { reply }).await {
+        Ok(value) => Json(value).into_response(),
+        Err(message) => (StatusCode::SERVICE_UNAVAILABLE, Json(error("NET_UNAVAILABLE", &message))).into_response(),
     }
 }
 

@@ -151,11 +151,19 @@ export function createNodeApi() {
     return at ? new Date(at) : null
   }
   const policy = () => ({ amountLamports: env.FAUCET_GRANT_LAMPORTS!, perKey: env.FAUCET_PER_KEY_LIMIT!, perIp: env.FAUCET_PER_IP_LIMIT!, periodSeconds: env.FAUCET_WINDOW_SECONDS!, missingConfiguration: [] })
+  // What the faucet can still grant, from the node's private port; null while it cannot be read.
+  const available = async () => {
+    try {
+      const response = await fetch(new URL('/internal/faucet', env.GATEWAY_INTERNAL_URL), { signal: AbortSignal.timeout(2000) })
+      return response.ok ? z.object({ availableLamports: z.string().regex(/^\d+$/) }).parse(await response.json()).availableLamports : null
+    } catch { return null }
+  }
   app.get('/v1/faucet/:address', async c => {
     const address = readParam(c, 'address', Address), ip = clientIp(c), left = await remaining(address, ip)
-    const frees = await freesAt(address, ip, left)
+    const [frees, availableLamports] = await Promise.all([freesAt(address, ip, left), available()])
+    const canPay = availableLamports === null || BigInt(availableLamports) >= BigInt(env.FAUCET_GRANT_LAMPORTS!)
     return c.json({ address, policy: policy(), remainingForKey: left.key, remainingForIp: left.ip,
-      resetsAt: frees?.toISOString() ?? null, eligible: left.key > 0 && left.ip > 0 })
+      resetsAt: frees?.toISOString() ?? null, eligible: left.key > 0 && left.ip > 0 && canPay, availableLamports })
   })
   app.post('/v1/faucet', async c => {
     const { address } = await readJson(c, FaucetRequest), ip = clientIp(c), left = await remaining(address, ip)
@@ -167,11 +175,24 @@ export function createNodeApi() {
     let response: Response
     try { response = await fetch(new URL('/internal/faucet', env.GATEWAY_INTERNAL_URL), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address, amountLamports: env.FAUCET_GRANT_LAMPORTS }) }) }
     catch { fail('NET_UNAVAILABLE', 'Acrux Net is unavailable.', { retryable: true, stage: 'send' }) }
-    if (!response.ok) fail('NET_UNAVAILABLE', 'Acrux Net could not submit this grant.', { retryable: true, stage: 'send' })
+    if (!response.ok) {
+      const refused = await response.json().catch(() => null) as { error?: { code?: string } } | null
+      if (refused?.error?.code === 'FAUCET_EMPTY') fail('FAUCET_EMPTY', 'The faucet cannot pay this grant.', { retryable: false, stage: 'send' })
+      fail('NET_UNAVAILABLE', 'Acrux Net could not submit this grant.', { retryable: true, stage: 'send' })
+    }
     const grant = z.strictObject({ transactionId: TxId, signature: Signature, balance: Balance }).parse(await response.json())
+    // The answer follows the grant's execution: granted only once it ran, with the balance after it.
+    let state: string | undefined
+    for (const started = Date.now(); Date.now() - started < 10_000; await new Promise(r => setTimeout(r, 200))) {
+      state = (await net('getTransaction', { id: grant.transactionId }).catch(() => null) as { state?: string } | null)?.state
+      if (state === 'executed' || state === 'finalized' || state === 'failed' || state === 'expired') break
+    }
+    if (state === 'failed' || state === 'expired') fail('GRANT_FAILED', 'The grant transaction failed on Acrux Net.', { retryable: true, stage: 'confirmation' })
+    if (state !== 'executed' && state !== 'finalized') fail('NET_UNAVAILABLE', 'The grant did not execute within 10 seconds.', { retryable: true, stage: 'confirmation' })
+    const balance = await net('getBalance', { address }).catch(() => grant.balance)
     const row = await db.faucetGrant.create({ data: { address, ipHash: ipHash(ip), amountLamports: env.FAUCET_GRANT_LAMPORTS!, transactionId: grant.transactionId } })
     return c.json({ id: row.id, transactionId: grant.transactionId, address, amountLamports: env.FAUCET_GRANT_LAMPORTS!,
-      signature: grant.signature, balance: grant.balance, grantedAt: row.grantedAt.toISOString() })
+      signature: grant.signature, balance, grantedAt: row.grantedAt.toISOString() })
   })
 
   app.get('/v1/lab/scenarios', c => c.json(scenarios))

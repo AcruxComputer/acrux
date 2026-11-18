@@ -3,7 +3,7 @@ import { Address, Base64, BaseUnits, Signature, Timestamp, U64, page, PageQuery 
 import { defineErrors } from './errors.js'
 export { Address, Base64, BaseUnits, Signature, Timestamp, U64, PageQuery }
 export { CONTRACT_VERSION } from './version.js'
-export const errors = defineErrors({ FAUCET_LIMIT: 429, NET_STALLED: 503, NET_UNAVAILABLE: 503, INVALID_INPUT: 400 })
+export const errors = defineErrors({ FAUCET_LIMIT: 429, FAUCET_EMPTY: 503, GRANT_FAILED: 502, NET_STALLED: 503, NET_UNAVAILABLE: 503, INVALID_INPUT: 400 })
 export const ApiError = errors.ApiError
 export const ErrorCode = errors.ErrorCode
 export type ErrorCode = z.infer<typeof ErrorCode>
@@ -85,7 +85,8 @@ export const Hubs = page(Hub)
 export const RegistryConfig = z.strictObject({ status: z.enum(['fixture', 'waiting', 'ready']), chain: RegistryChain, programId: Address.nullable(), cluster: z.enum(['localnet', 'mainnet-beta', 'acrux']), depositLamports: U64.nullable(), registrationFeeBps: Count.max(10000).nullable(), cooldownEpochs: Count.nullable(), inactivityEpochs: Count.nullable(), codeRules: z.strictObject({ pattern: z.string().nullable(), minLength: Count.nullable(), maxLength: Count.nullable() }), minimumMembers: Count.nullable(), minimumStake: U64.nullable(), currentEpoch: Count, missingConfiguration: z.array(z.string()) })
 export const SchedulePreview = z.strictObject({ epoch: Count, seed: z.string(), source: z.enum(['fixture', 'registry']), algorithm: z.literal(3), alpha: z.number().min(0).max(1), totalWindows: Count, shares: z.array(z.strictObject({ hubCode: HubCode, proposerStake: U64, probability: z.number(), assignedWindows: Count })), regionalRuns: z.array(z.strictObject({ region: z.string(), firstWindow: Count, lastWindow: Count })), windows: z.array(Window) })
 export const FaucetPolicy = z.strictObject({ amountLamports: U64.nullable(), perKey: Count.nullable(), perIp: Count.nullable(), periodSeconds: Count.nullable(), missingConfiguration: z.array(z.string()) })
-export const FaucetStatus = z.strictObject({ address: Address, policy: FaucetPolicy, remainingForKey: Count.nullable(), remainingForIp: Count.nullable(), resetsAt: Timestamp.nullable(), eligible: z.boolean() })
+/** `availableLamports`: what the faucet can still grant, in lamports; null while the net cannot be read. */
+export const FaucetStatus = z.strictObject({ address: Address, policy: FaucetPolicy, remainingForKey: Count.nullable(), remainingForIp: Count.nullable(), resetsAt: Timestamp.nullable(), eligible: z.boolean(), availableLamports: U64.nullable() })
 export const FaucetRequest = z.strictObject({ address: Address })
 export const FaucetGrant = z.strictObject({ id: z.string(), transactionId: TxId.optional(), address: Address, amountLamports: U64, signature: Signature, balance: Balance, grantedAt: Timestamp })
 export const Facts = z.strictObject({ source: z.enum(['fixture', 'measured']), measuredAt: Timestamp, sampleSize: Count, slotPacingUs: z.strictObject({ p50: Count, p99: Count }), commitSpreadUs: z.strictObject({ p50: Count, p99: Count }), attestationRelativeToBlockUs: z.strictObject({ p50: z.number().int(), p99: z.number().int() }), cblockFinalizationUs: z.strictObject({ p50: Count, p99: Count }),

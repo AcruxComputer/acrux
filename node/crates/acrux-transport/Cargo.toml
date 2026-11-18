@@ -1,6 +1,6 @@
 [package]
 name = "acrux-transport"
-version = "0.4.9"
+version = "0.4.10"
 edition = "2021"
 description = "QUIC endpoints with hub geography delays, Rotor relay sampling, and phase profiling."
 

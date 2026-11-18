@@ -16,6 +16,10 @@ const [rpc = 'https://rpc.acrux.computer', faucet = 'https://api.acrux.computer/
 const connection = new Connection(rpc, 'confirmed')
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const payer = funded ? Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(funded, 'utf8')))) : Keypair.generate()
+// Raydium SDK v2 logs every transaction it executes as base64 ("simulate tx string"); the run keeps
+// to its own lines.
+const log = console.log
+console.log = (...args) => { if (args[0] !== 'simulate tx string:') log(...args) }
 const show = (program, what, signature = '') => console.log(`${program.padEnd(14)} ${what.padEnd(52)} ${signature}`)
 // Every step has a deadline: a step that does not finish in time stops the run and names itself.
 const within = (seconds, what, promise) => Promise.race([
