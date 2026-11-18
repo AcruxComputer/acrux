@@ -463,13 +463,15 @@ impl Network {
             let executor = match (&saved, resumed) {
                 (Some(saved), Some(block)) => {
                     votor.resume(block);
-                    let executor = SvmExecutor::from_state(&programs, saved.state.clone())?;
+                    let mut executor = SvmExecutor::from_state(&programs, saved.state.clone())?;
+                    executor.set_placements(genesis.iter().flat_map(|g| g.placements.clone()).collect());
                     anyhow::ensure!(executor.state_hash() == saved.state.state_hash, "the saved state at cblock {} hashes to {}, not to its saved hash {}", block.slot, executor.state_hash(), saved.state.state_hash);
                     executor
                 }
                 _ => {
                     votor.genesis();
                     let mut executor = SvmExecutor::new(balances.clone(), &programs)?;
+                    executor.set_placements(genesis.iter().flat_map(|g| g.placements.clone()).collect());
                     executor.set_fees(crate::execution::Fees {
                         reserve_lamports: config.reserve,
                         inclusion_lamports: config.inclusion_fee,

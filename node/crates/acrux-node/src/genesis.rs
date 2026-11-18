@@ -72,6 +72,48 @@ pub struct Genesis {
     pub pool: Pool,
     pub faucet: Keypair,
     faucet_token_accounts: Vec<String>,
+    /// Programs placed at their mainnet addresses from a named slot (`chain/placements/`).
+    pub placements: Vec<crate::execution::Placement>,
+}
+
+#[derive(Deserialize)]
+struct PlacementManifest {
+    placements: Vec<ManifestEntry>,
+}
+#[derive(Deserialize)]
+struct ManifestEntry {
+    file: String,
+    slot: u64,
+}
+#[derive(Deserialize)]
+struct PlacementFile {
+    name: String,
+    accounts: Vec<AccountEntry>,
+}
+
+/// The placements the chain applies: `chain/placements/placements.json` beside the genesis, or the
+/// manifest `ACRUX_PLACEMENTS` names; none when there is no manifest.
+fn placements(chain: &Path) -> Result<Vec<crate::execution::Placement>> {
+    let manifest = std::env::var("ACRUX_PLACEMENTS").map(PathBuf::from).unwrap_or_else(|_| chain.join("placements/placements.json"));
+    if !manifest.exists() {
+        return Ok(vec![]);
+    }
+    let dir = manifest.parent().context("placement manifest folder")?;
+    let entries: PlacementManifest = serde_json::from_slice(&std::fs::read(&manifest).with_context(|| format!("Read {}", manifest.display()))?)?;
+    entries
+        .placements
+        .into_iter()
+        .map(|entry| {
+            let file: PlacementFile = serde_json::from_slice(&std::fs::read(dir.join(&entry.file)).with_context(|| format!("Read placement {}", entry.file))?)?;
+            let accounts = file
+                .accounts
+                .into_iter()
+                .map(|a| Ok((Pubkey::from_str(&a.address)?, Account { lamports: a.lamports, data: B64.decode(a.data)?, owner: Pubkey::from_str(&a.owner)?, executable: a.executable, rent_epoch: 0 })))
+                .collect::<Result<Vec<_>>>()?;
+            ensure!(accounts.last().is_some_and(|(_, a)| a.executable), "placement {} must end with its program account", file.name);
+            Ok(crate::execution::Placement { name: file.name, slot: entry.slot, accounts })
+        })
+        .collect()
 }
 
 impl Genesis {
@@ -94,6 +136,7 @@ impl Genesis {
             pool: file.pool,
             faucet,
             faucet_token_accounts: file.faucet.token_accounts,
+            placements: placements(chain)?,
         })
     }
 

@@ -119,12 +119,14 @@ pub async fn send(url: &str, keypair_path: &str, to: &str, lamports: u64, n: u8,
 /// fragments), and compares the state hash with the net's and with its finalization certificate.
 pub async fn follow(url: &str, genesis: &str) -> Result<()> {
     let snapshot = rpc(url, "getExecutionSnapshot", json!({})).await?;
-    let programs = crate::genesis::Genesis::load(std::path::Path::new(genesis))?
+    let genesis = crate::genesis::Genesis::load(std::path::Path::new(genesis))?;
+    let programs = genesis
         .programs
-        .into_iter()
-        .map(|(address, path)| crate::execution::GenesisProgram { address, path })
+        .iter()
+        .map(|(address, path)| crate::execution::GenesisProgram { address: address.clone(), path: path.clone() })
         .collect::<Vec<_>>();
     let mut executor = crate::execution::SvmExecutor::new(Vec::<(String, u64)>::new(), &programs)?;
+    executor.set_placements(genesis.placements.clone());
     let state: crate::execution::ExecutorSnapshot = serde_json::from_value(snapshot["executor"].clone())?;
     let start_hash = state.state_hash.clone();
     executor.load(state)?;

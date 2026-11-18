@@ -107,6 +107,16 @@ pub struct GenesisProgram {
     pub path: PathBuf,
 }
 
+/// A program Solana runs at a fixed address, placed at the same address on Acrux from a named slot,
+/// the way Solana adds programs at fixed addresses: its accounts (program data first, the program
+/// last) are written into the state before the first slot executed at or after `slot`.
+#[derive(Clone, Debug)]
+pub struct Placement {
+    pub name: String,
+    pub slot: u64,
+    pub accounts: Vec<(Pubkey, Account)>,
+}
+
 pub trait Executor {
     fn validate_transaction(&self, bytes: &[u8], target_slot: u64) -> Result<ValidatedTx>;
     fn execute_slot(&mut self, slot: u64, items: Vec<ExecutionItem>) -> Result<SlotExecution>;
@@ -183,6 +193,8 @@ pub struct SvmExecutor {
     allowed_programs: BTreeSet<Pubkey>,
     fees: Fees,
     track_capacity_cu: u64,
+    /// The placements, each with the digest its program account has once placed.
+    placements: Vec<(Placement, [u8; 32])>,
 }
 
 impl SvmExecutor {
@@ -368,6 +380,7 @@ impl SvmExecutor {
             allowed_programs: BTreeSet::from([system_program::id()]),
             fees: Fees::default(),
             track_capacity_cu: selection::TRACK_CAPACITY_CU,
+            placements: vec![],
         };
         for program in [
             "ComputeBudget111111111111111111111111111111",
@@ -688,8 +701,36 @@ impl SvmExecutor {
         })
     }
 
+    pub fn set_placements(&mut self, placements: Vec<Placement>) {
+        self.placements = placements
+            .into_iter()
+            .map(|p| {
+                let (key, program) = p.accounts.last().expect("a placement holds its program account");
+                let digest = account_digest(key, program);
+                (p, digest)
+            })
+            .collect();
+    }
+
+    /// Writes every placement due by `slot` whose program account is not yet in the state as placed.
+    /// The same on every validator and follower, and again after a rollback past it.
+    fn apply_placements(&mut self, slot: u64) -> Result<()> {
+        for i in 0..self.placements.len() {
+            let (placement, digest) = &self.placements[i];
+            let program = placement.accounts.last().unwrap().0;
+            if placement.slot > slot || self.account_hashes.get(&program) == Some(digest) {
+                continue;
+            }
+            for (key, account) in placement.accounts.clone() {
+                self.put(key, account)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn execute_slot(&mut self, slot: u64, items: Vec<ExecutionItem>) -> Result<SlotExecution> {
         self.set_slot_clock(slot)?;
+        self.apply_placements(slot)?;
         let mut merged = BTreeMap::<String, ExecutionItem>::new();
         for item in items {
             // Recheck signed bytes at the execution boundary; a public header cannot
