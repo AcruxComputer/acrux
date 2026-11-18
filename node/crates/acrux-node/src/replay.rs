@@ -285,6 +285,80 @@ fn token_account(entry: &Value, account: &str) -> Option<(String, i128, i128)> {
     Some((if mint == WSOL { "SOL".into() } else { mint }, raw(pre), raw(post)))
 }
 
+/// One trade against a pool, as its two vaults recorded it: their balances before and the pool's change.
+#[derive(Clone, Copy, Debug)]
+struct PoolSwap {
+    x0: f64,
+    y0: f64,
+    dx: f64,
+    dy: f64,
+}
+
+impl PoolSwap {
+    /// The trade's input into the pool, its output out of it, and whether it bought X.
+    fn trade(&self) -> Option<(f64, f64, bool)> {
+        match (self.dx < 0.0, self.dy < 0.0) {
+            (true, false) if self.dy > 0.0 => Some((self.dy, -self.dx, true)),
+            (false, true) if self.dx > 0.0 => Some((self.dx, -self.dy, false)),
+            _ => None,
+        }
+    }
+}
+
+/// A pool on the constant-product rule over its vaults' balances, with a fee off the input, or
+/// off the Y side whichever way the trade goes (a pool that collects its fee in the quote asset).
+#[derive(Clone, Copy, Debug)]
+struct PoolModel {
+    fee: f64,
+    fee_on_y: bool,
+}
+
+impl PoolModel {
+    fn output(&self, s: &PoolSwap, input: f64, buys_x: bool) -> f64 {
+        let e = input * (1.0 - self.fee);
+        match (buys_x, self.fee_on_y) {
+            (true, _) => s.x0 * e / (s.y0 + e),
+            (false, true) => (1.0 - self.fee) * s.y0 * input / (s.x0 + input),
+            (false, false) => s.y0 * e / (s.x0 + e),
+        }
+    }
+    /// The worst relative miss over the trades.
+    fn miss(&self, swaps: &[PoolSwap]) -> f64 {
+        swaps.iter().filter_map(|s| s.trade().map(|(i, o, x)| ((self.output(s, i, x) / o) - 1.0).abs())).fold(0.0, f64::max)
+    }
+}
+
+/// How closely the model must reproduce every trade the block made against the pool to be trusted.
+const POOL_FIT: f64 = 0.002;
+
+/// Fits the pool to every trade the block made against it (two at least) on the constant-product
+/// rule, the fee being the median each trade implies, in either placement. A pool it does not
+/// reproduce within `POOL_FIT` on every trade (concentrated liquidity, bins, a fee that moves) is
+/// not priced.
+fn fit_pool(swaps: &[PoolSwap]) -> Option<(&'static str, PoolModel)> {
+    if swaps.len() < 2 {
+        return None;
+    }
+    let model = |fee_on_y: bool| {
+        let mut fees = swaps
+            .iter()
+            .filter_map(|s| {
+                let (input, out, buys_x) = s.trade()?;
+                match (buys_x, fee_on_y) {
+                    (false, true) => Some(1.0 - out * (s.x0 + input) / (s.y0 * input)),
+                    _ => {
+                        let (to, from) = if buys_x { (s.x0, s.y0) } else { (s.y0, s.x0) };
+                        (to > out).then(|| 1.0 - out * from / (to - out) / input)
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        fees.sort_by(f64::total_cmp);
+        fees.get(fees.len() / 2).copied().filter(|f| (0.0..0.2).contains(f)).map(|fee| PoolModel { fee, fee_on_y })
+    };
+    [false, true].into_iter().filter_map(model).map(|m| (m.miss(swaps), m)).filter(|(miss, _)| *miss < POOL_FIT).min_by(|x, y| x.0.total_cmp(&y.0)).map(|(_, m)| ("constant-product", m))
+}
+
 /// A sandwich repriced as it would land on Acrux.
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -304,7 +378,7 @@ pub struct Repricing {
 
 /// The victim's output with the front leg taken out of the pool, from the pool's state recorded in
 /// the block: a Pump.fun curve's virtual reserves from its trade events, else the pool vaults'
-/// balances, on the constant-product rule with the fee the victim's own trade shows.
+/// balances on the constant-product rule, where it reproduces every trade the block made there.
 pub fn reprice(block: &Value, sandwich: &Sandwich, candidates: &[Candidate]) -> Option<Repricing> {
     let txs = block["transactions"].as_array()?;
     let (front, victim) = (&txs[sandwich.front.index], &txs[sandwich.victim.index]);
@@ -313,21 +387,31 @@ pub fn reprice(block: &Value, sandwich: &Sandwich, candidates: &[Candidate]) -> 
         let (sol, tokens) = (v.virtual_sol - v.sol - f.sol, v.virtual_tokens + v.tokens + f.tokens);
         ("pump-curve", v.tokens, tokens * v.sol / (sol + v.sol))
     } else {
-        // The pool's vault of each asset among those all three trades moved.
+        // The pool's vault of each asset among those all three trades moved, and every trade the
+        // block made against that pair.
         let vault = |asset: &str| sandwich.vaults.iter().find(|a| token_account(victim, a).is_some_and(|(m, _, _)| m == asset));
         let (x_vault, y_vault) = (vault(&sandwich.bought)?, vault(&sandwich.paid)?);
-        let (_, x0, x1) = token_account(victim, x_vault)?;
-        let (_, y0, _) = token_account(victim, y_vault)?;
-        let (_, fx0, fx1) = token_account(front, x_vault)?;
-        let (_, fy0, fy1) = token_account(front, y_vault)?;
-        let out = x0 - x1;
-        if out <= 0 || x0 <= out {
+        let swaps = txs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t["meta"]["err"].is_null())
+            .filter_map(|(i, t)| {
+                let (_, x0, x1) = token_account(t, x_vault)?;
+                let (_, y0, y1) = token_account(t, y_vault)?;
+                let swap = PoolSwap { x0: x0 as f64, y0: y0 as f64, dx: (x1 - x0) as f64, dy: (y1 - y0) as f64 };
+                swap.trade().map(|_| (i, swap))
+            })
+            .collect::<Vec<_>>();
+        let (kind, model) = fit_pool(&swaps.iter().map(|(_, s)| *s).collect::<Vec<_>>())?;
+        let at = |index: usize| swaps.iter().find(|(i, _)| *i == index).map(|(_, s)| *s);
+        let (v, f) = (at(sandwich.victim.index)?, at(sandwich.front.index)?);
+        let (input, out, buys_x) = v.trade()?;
+        if !buys_x {
             return None;
         }
-        // The input that, on the constant-product rule, gave the victim exactly what it got.
-        let input = out * y0 / (x0 - out);
-        let (x, y) = (x0 + (fx0 - fx1), y0 - (fy1 - fy0));
-        ("constant-product", out, x * input / (y + input))
+        // The victim's trade against the pool as it stood without the front leg.
+        let clean = PoolSwap { x0: v.x0 - f.dx, y0: v.y0 - f.dy, dx: 0.0, dy: 0.0 };
+        (kind, out as i128, model.output(&clean, input, true) as i128)
     };
     let paid = -sandwich.victim.delta(&sandwich.victim_owner, &sandwich.paid);
     let kept = if got > 0 { (would_get - got) * paid / got } else { 0 };
@@ -428,7 +512,7 @@ pub async fn run(file: Option<&str>, rpc: Option<&str>, slot: Option<u64>, save:
                 );
                 println!("    sent plain (t = 1): front-running costs {} lamports in priority over the victim's; the trader keeps {} {}", group(n(&r.outbid_lamports) as u64), amount(n(&r.take_after_outbid), decimals), name(&s.paid));
             }
-            None => println!("    not priced: the pool is neither a Pump.fun curve nor a vault pair the three trades all moved"),
+            None => println!("    not priced: the pool is not a Pump.fun curve and the constant-product rule does not reproduce its trades in this block"),
         }
     }
     if let Some(path) = json {
@@ -520,6 +604,25 @@ mod tests {
         assert_eq!((s.front.index, s.victim.index, s.back.index), (0, 1, 3));
         assert_eq!((s.bought.as_str(), s.paid.as_str()), ("MEME", "SOL"));
         assert_eq!(s.take(), 50_000_000);
+    }
+
+    #[test]
+    fn a_constant_product_pool_fits_and_a_bent_one_does_not() {
+        // Three trades on a 0.25% pool, each from the reserves the one before left.
+        let (mut x, mut y) = (1_000_000_000.0f64, 50_000_000_000.0f64);
+        let mut swaps = vec![];
+        for (input, buys_x) in [(1_000_000_000.0, true), (5_000_000.0, false), (2_000_000_000.0, true)] {
+            let e: f64 = input * 0.9975;
+            let (dx, dy) = if buys_x { (-(x * e / (y + e)).floor(), input) } else { (input, -(y * e / (x + e)).floor()) };
+            swaps.push(PoolSwap { x0: x, y0: y, dx, dy });
+            (x, y) = (x + dx, y + dy);
+        }
+        let (kind, model) = fit_pool(&swaps).unwrap();
+        assert_eq!(kind, "constant-product");
+        assert!((model.fee - 0.0025).abs() < 1e-6);
+        // A trade paid out 5% more than the rule allows: the pool is not priced.
+        swaps[1].dy *= 1.05;
+        assert!(fit_pool(&swaps).is_none());
     }
 
     #[test]
