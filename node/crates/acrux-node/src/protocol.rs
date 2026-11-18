@@ -170,6 +170,8 @@ pub struct Network {
     observed_final: Arc<std::sync::Mutex<BTreeSet<u64>>>,
     /// Finalization events waiting for their cblock's state to reach the disk (`state::durable`).
     held_finals: Vec<Telemetry>,
+    /// Validator 0's cblock hash preimages (all but the outbox root) and outboxes, for the proofs.
+    cblock_preimages: BTreeMap<u64, (Vec<u8>, Vec<crate::bridge::OutboxEntry>)>,
     /// Finalized Solana bridge deposits by sequence, as the deposit reader found them.
     bridge_deposits: Arc<std::sync::Mutex<BTreeMap<u64, crate::execution::BridgeCredit>>>,
     /// Solana's `getRecentPerformanceSamples`: one sample a minute of the slots and transactions
@@ -627,6 +629,7 @@ impl Network {
             progress: Arc::new(std::sync::Mutex::new(Progress::default())),
             observed_final: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             held_finals: Vec::new(),
+            cblock_preimages: BTreeMap::new(),
             bridge_deposits: bridge_deposits.clone(),
             performance: VecDeque::new(),
             performance_mark: (Instant::now(), 0, 0),
@@ -665,6 +668,39 @@ impl Network {
             .iter()
             .map(|a| self.identities.iter().position(|x| x == a).unwrap())
             .collect()
+    }
+    /// Cblock `i`'s outbox: every cblock carries the next epoch's validator set, so any one of an
+    /// epoch certified on Solana hands its light client on, whichever slots were skipped.
+    fn outbox(&self, i: u64) -> Vec<crate::bridge::OutboxEntry> {
+        let epoch_slots = 16 * self.config.windows_per_epoch as u64;
+        let validators = self.identities.iter().zip(&self.stakes).map(|(identity, stake)| {
+            let key: [u8; 32] = bs58::decode(identity).into_vec().expect("identity is base58").try_into().expect("identity is 32 bytes");
+            (key, *stake)
+        }).collect();
+        vec![crate::bridge::OutboxEntry::ValidatorSet { epoch: i * 4 / epoch_slots + 1, validators }]
+    }
+    /// Validator 0, once cblock `c` is final: its hash preimage, outbox and the signed votes that
+    /// finalized it (Finalize, or Notar for a fast finalization), for Solana's light client.
+    async fn record_proof(&mut self, c: u64) {
+        let (Some((preimage, outbox)), Some(block)) = (self.cblock_preimages.remove(&c), self.nodes[0].executed_blocks.get(&c).copied()) else { return };
+        let votes = self.nodes[0]
+            .votes
+            .values()
+            .filter(|v| v.vote.slot == c && v.vote.hash == Some(block.hash) && matches!(v.vote.kind, consensus::VoteKind::Notar | consensus::VoteKind::Finalize))
+            .map(|v| json!({"validator": v.vote.validator, "kind": if v.vote.kind == consensus::VoteKind::Finalize { "finalize" } else { "notar" }, "signature": B64.encode(&v.signature)}))
+            .collect::<Vec<_>>();
+        let proof = json!({
+            "consensusSlot": c, "hash": hex::encode(block.hash), "preimage": B64.encode(&preimage),
+            "outboxRoot": hex::encode(crate::bridge::outbox_root(&outbox)),
+            "outbox": outbox.iter().map(|e| B64.encode(bincode::serialize(e).expect("outbox entry encodes"))).collect::<Vec<_>>(),
+            "validators": self.identities, "stakes": self.stakes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "votes": votes,
+        });
+        let mut gateway = self.gateway.write().await;
+        gateway.cblock_proofs.insert(c, proof);
+        while gateway.cblock_proofs.len() > 4096 {
+            gateway.cblock_proofs.pop_first();
+        }
     }
     /// Whether slot `s`'s blocks may carry bridge credits.
     fn bridge_open(&self, s: u64) -> bool {
@@ -895,6 +931,7 @@ impl Network {
                     progress: self.progress.clone(),
                     observed_final: self.observed_final.clone(),
                     held_finals: Vec::new(),
+                    cblock_preimages: BTreeMap::new(),
                     bridge_deposits: self.bridge_deposits.clone(),
                     performance: VecDeque::new(),
                     performance_mark: (Instant::now(), 0, 0),
@@ -1053,6 +1090,7 @@ impl Network {
                 let cblock = event.slot.unwrap() / 4;
                 if self.observed_final.lock().unwrap().insert(cblock) {
                     self.keep_finalized(cblock).await;
+                    self.record_proof(cblock).await;
                     self.final_times.push(event.at);
                 }
             }
@@ -2846,7 +2884,22 @@ impl Network {
                         )
                     })
                     .collect::<Vec<_>>();
-                let hash = crypto::hash(&encode(&(i, parent, accepted, &state))?);
+                // From the bridge's first slot the hash also commits to the cblock's outbox root,
+                // which Solana's light client proves outbox entries against.
+                let preimage = encode(&(i, parent, accepted, &state))?;
+                let hash = if self.bridge_open(i * 4) {
+                    let outbox = self.outbox(i);
+                    let hash = crypto::hash(&[preimage.as_slice(), &crate::bridge::outbox_root(&outbox)].concat());
+                    if id == 0 {
+                        self.cblock_preimages.insert(i, (preimage, outbox));
+                        while self.cblock_preimages.len() > 4096 {
+                            self.cblock_preimages.pop_first();
+                        }
+                    }
+                    hash
+                } else {
+                    crypto::hash(&preimage)
+                };
                 let block = consensus::Block {
                     id: BlockRef { slot: i, hash },
                     parent,

@@ -86,6 +86,9 @@ pub struct GatewayState {
     /// The transactions people sent, kept for days, when the net persists.
     pub kept: Option<Arc<crate::history::History>>,
     pub facts: Value,
+    /// Finalized cblocks' proofs for Solana's light client, by consensus slot: the hash's
+    /// preimage, the outbox and the signed finalizing votes.
+    pub cblock_proofs: BTreeMap<u64, Value>,
     pub parameters: Value,
     pub balances: BTreeMap<String, u64>,
     pub stream_id: String,
@@ -108,6 +111,7 @@ impl GatewayState {
             current_window: Value::Null,
             upcoming_windows: vec![],
             facts: Value::Null,
+            cblock_proofs: BTreeMap::new(),
             counters: json!({"slots":0,"finalizedCblocks":0,"skips":0,"averageCommitSpreadUs":0}),
             counter_base: (0, 0),
             kept: None,
@@ -323,6 +327,10 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
         "getSnapshot" => Ok(state.read().await.snapshot()),
         "getCurrentWindow" => Ok(state.read().await.current_window.clone()),
         "getCounters" => Ok(state.read().await.counters.clone()),
+        "getCblockProof" => match params.get("consensusSlot").and_then(Value::as_u64) {
+            Some(slot) => state.read().await.cblock_proofs.get(&slot).cloned().ok_or(("NOT_FOUND", "No proof is held for this cblock: it is not finalized under a bridge rule, or it is too old.")),
+            None => Err(("INVALID_INPUT", "Give consensusSlot.")),
+        },
         "getFacts" => match state.read().await.facts.clone() {
             Value::Null => Err(("NET_UNAVAILABLE", "The net has not measured enough slots yet.")),
             facts => Ok(facts),

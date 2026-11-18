@@ -2,7 +2,15 @@
 //! vault for their mint and writes a deposit record that Acrux's validators read once it is
 //! finalized: the Acrux address to credit, the mint and the amount the vault received. Every
 //! deposit takes the next sequence number, so a record is credited on Acrux exactly once.
+//!
+//! It also holds a light client of Acrux: the validator set with its stakes for each Acrux epoch,
+//! and the cblocks posted to it. A cblock is certified once validators holding 60% of the stake
+//! signed its Finalize vote, or 80% its Notar vote (a fast finalization); Solana's ed25519
+//! precompile checks their signatures over the bincode `Vote` in the same transaction. Every
+//! cblock carries the next epoch's validator set in its outbox, so any certified cblock of an epoch
+//! hands the light client on.
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::{hash::hashv, sysvar::instructions as ix_sysvar};
 use anchor_spl::token_interface::{transfer_checked, Mint, TokenAccount, TokenInterface, TransferChecked};
 
 declare_id!("EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5");
@@ -11,9 +19,11 @@ declare_id!("EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5");
 pub mod acrux_bridge {
     use super::*;
 
-    /// Creates the bridge's one state account, which numbers the deposits. Anyone may send it once.
-    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
-        ctx.accounts.bridge.set_inner(Bridge { deposits: 0, bump: ctx.bumps.bridge });
+    /// Creates the bridge's one state account, which numbers the deposits. Its payer becomes the
+    /// authority that seeds the first validator set; `epoch_slots` is an Acrux epoch's length.
+    pub fn initialize(ctx: Context<Initialize>, epoch_slots: u64) -> Result<()> {
+        require!(epoch_slots > 0 && epoch_slots % 4 == 0, BridgeError::BadEpoch);
+        ctx.accounts.bridge.set_inner(Bridge { deposits: 0, bump: ctx.bumps.bridge, authority: ctx.accounts.payer.key(), epoch_slots });
         Ok(())
     }
 
@@ -56,6 +66,110 @@ pub mod acrux_bridge {
         emit_cpi!(Deposited { sequence, depositor: ctx.accounts.depositor.key(), recipient, mint: ctx.accounts.mint.key(), amount: received, slot });
         Ok(())
     }
+
+    /// Seeds the light client: Acrux's validators and stakes for `epoch`, in Acrux's validator order.
+    pub fn init_validator_set(ctx: Context<InitValidatorSet>, epoch: u64, validators: Vec<Validator>) -> Result<()> {
+        require!(!validators.is_empty() && validators.len() <= MAX_VALIDATORS, BridgeError::BadSet);
+        let total = validators.iter().map(|v| v.stake).sum();
+        ctx.accounts.set.set_inner(ValidatorSet { epoch, total, validators });
+        Ok(())
+    }
+
+    /// Posts a cblock to be certified, at `["cblock", hash]`. The hash is recomputed here from the
+    /// preimage, which starts with the cblock's slot, and the outbox root, so the root is bound to
+    /// the hash the validators sign.
+    pub fn post_cblock(ctx: Context<PostCblock>, hash: [u8; 32], outbox_root: [u8; 32], preimage: Vec<u8>) -> Result<()> {
+        require!(hashv(&[&preimage, &outbox_root]).to_bytes() == hash, BridgeError::BadPreimage);
+        let slot = u64::from_le_bytes(preimage.get(..8).ok_or(BridgeError::BadPreimage)?.try_into().unwrap());
+        let epoch = slot * 4 / ctx.accounts.bridge.epoch_slots;
+        ctx.accounts.cblock.set_inner(Cblock { slot, epoch, hash, outbox_root, notar: 0, finalize: 0, certified: false });
+        Ok(())
+    }
+
+    /// Counts the votes this transaction's ed25519 instructions verified: each must be a validator
+    /// of the cblock's epoch voting Notar or Finalize on its slot and hash.
+    pub fn attest_cblock(ctx: Context<AttestCblock>) -> Result<()> {
+        let set = &ctx.accounts.set;
+        let cblock = &mut ctx.accounts.cblock;
+        let sysvar = &ctx.accounts.instructions;
+        let current = ix_sysvar::load_current_index_checked(sysvar)? as usize;
+        for index in 0..current {
+            let ix = ix_sysvar::load_instruction_at_checked(index, sysvar)?;
+            if ix.program_id != ED25519_PROGRAM {
+                continue;
+            }
+            for (key, message) in ed25519_entries(&ix.data)? {
+                let v = set.validators.iter().position(|x| x.key.to_bytes() == key).ok_or(BridgeError::BadVote)?;
+                // bincode Vote: validator (u64), slot (u64), Some (1) and the hash, kind (u32).
+                let mut signed = Vec::with_capacity(49);
+                signed.extend_from_slice(&(v as u64).to_le_bytes());
+                signed.extend_from_slice(&cblock.slot.to_le_bytes());
+                signed.push(1);
+                signed.extend_from_slice(&cblock.hash);
+                require!(message.len() == 53 && message[..49] == signed[..], BridgeError::BadVote);
+                match u32::from_le_bytes(message[49..53].try_into().unwrap()) {
+                    VOTE_NOTAR => cblock.notar |= 1 << v,
+                    VOTE_FINALIZE => cblock.finalize |= 1 << v,
+                    _ => return err!(BridgeError::BadVote),
+                }
+            }
+        }
+        let stake = |bits: u32| set.validators.iter().enumerate().filter(|(i, _)| bits >> i & 1 == 1).map(|(_, v)| v.stake as u128).sum::<u128>();
+        let total = set.total as u128;
+        if stake(cblock.finalize) * 100 >= total * 60 || stake(cblock.notar) * 100 >= total * 80 {
+            cblock.certified = true;
+        }
+        Ok(())
+    }
+
+    /// Hands the light client on to `epoch`: the validator set a certified cblock of the epoch
+    /// before carries in its outbox, proven against the outbox root.
+    pub fn hand_off(ctx: Context<HandOff>, epoch: u64, validators: Vec<Validator>, proof: Vec<ProofNode>) -> Result<()> {
+        let cblock = &ctx.accounts.cblock;
+        require!(cblock.certified && cblock.epoch + 1 == epoch, BridgeError::NotCertified);
+        require!(!validators.is_empty() && validators.len() <= MAX_VALIDATORS, BridgeError::BadSet);
+        // bincode OutboxEntry::ValidatorSet: variant (u32 0), epoch, then the (key, stake) list.
+        let mut entry = Vec::with_capacity(20 + validators.len() * 40);
+        entry.extend_from_slice(&0u32.to_le_bytes());
+        entry.extend_from_slice(&epoch.to_le_bytes());
+        entry.extend_from_slice(&(validators.len() as u64).to_le_bytes());
+        for v in &validators {
+            entry.extend_from_slice(v.key.as_ref());
+            entry.extend_from_slice(&v.stake.to_le_bytes());
+        }
+        let mut node = hashv(&[&entry]).to_bytes();
+        for step in &proof {
+            node = if step.left { hashv(&[&step.hash, &node]) } else { hashv(&[&node, &step.hash]) }.to_bytes();
+        }
+        require!(node == cblock.outbox_root, BridgeError::BadProof);
+        let total = validators.iter().map(|v| v.stake).sum();
+        ctx.accounts.next.set_inner(ValidatorSet { epoch, total, validators });
+        Ok(())
+    }
+}
+
+pub const MAX_VALIDATORS: usize = 32;
+const VOTE_NOTAR: u32 = 0;
+const VOTE_FINALIZE: u32 = 4;
+const ED25519_PROGRAM: Pubkey = pubkey!("Ed25519SigVerify111111111111111111111111111");
+
+/// The public key and message of every signature an ed25519 precompile instruction verified,
+/// each held in the instruction's own data.
+fn ed25519_entries(data: &[u8]) -> Result<Vec<([u8; 32], Vec<u8>)>> {
+    let count = *data.first().ok_or(BridgeError::BadVote)? as usize;
+    let u16_at = |o: usize| -> Result<usize> { Ok(data.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize).ok_or(BridgeError::BadVote)?) };
+    (0..count)
+        .map(|i| {
+            // Offsets: signature, its instruction, public key, its instruction, message, size, its instruction.
+            let o = 2 + i * 14;
+            for at in [o + 2, o + 6, o + 12] {
+                require!(u16_at(at)? == u16::MAX as usize, BridgeError::BadVote);
+            }
+            let (key_at, message_at, message_len) = (u16_at(o + 4)?, u16_at(o + 8)?, u16_at(o + 10)?);
+            let key: [u8; 32] = data.get(key_at..key_at + 32).ok_or(BridgeError::BadVote)?.try_into().unwrap();
+            Ok((key, data.get(message_at..message_at + message_len).ok_or(BridgeError::BadVote)?.to_vec()))
+        })
+        .collect()
 }
 
 #[account]
@@ -64,6 +178,10 @@ pub struct Bridge {
     /// Deposits made so far; the next deposit's sequence number.
     pub deposits: u64,
     pub bump: u8,
+    /// Seeds the first validator set.
+    pub authority: Pubkey,
+    /// An Acrux epoch's length in slots.
+    pub epoch_slots: u64,
 }
 
 /// One deposit, at `["deposit", sequence]`.
@@ -80,6 +198,43 @@ pub struct DepositRecord {
     /// The Solana slot the deposit landed in.
     pub slot: u64,
     pub bump: u8,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, InitSpace)]
+pub struct Validator {
+    pub key: Pubkey,
+    pub stake: u64,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct ProofNode {
+    /// Whether the sibling sits left of the running hash.
+    pub left: bool,
+    pub hash: [u8; 32],
+}
+
+/// Acrux's validators and stakes for one epoch, at `["set", epoch]`.
+#[account]
+#[derive(InitSpace)]
+pub struct ValidatorSet {
+    pub epoch: u64,
+    pub total: u64,
+    #[max_len(32)]
+    pub validators: Vec<Validator>,
+}
+
+/// A cblock posted to the light client, at `["cblock", hash]`, with the validators that voted for
+/// it as bits by their index in the set.
+#[account]
+#[derive(InitSpace)]
+pub struct Cblock {
+    pub slot: u64,
+    pub epoch: u64,
+    pub hash: [u8; 32],
+    pub outbox_root: [u8; 32],
+    pub notar: u32,
+    pub finalize: u32,
+    pub certified: bool,
 }
 
 #[event]
@@ -136,8 +291,67 @@ pub struct Deposit<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+#[instruction(epoch: u64)]
+pub struct InitValidatorSet<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(seeds = [b"bridge"], bump = bridge.bump, has_one = authority)]
+    pub bridge: Account<'info, Bridge>,
+    #[account(init, payer = authority, space = 8 + ValidatorSet::INIT_SPACE, seeds = [b"set", epoch.to_le_bytes().as_ref()], bump)]
+    pub set: Account<'info, ValidatorSet>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(hash: [u8; 32])]
+pub struct PostCblock<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(seeds = [b"bridge"], bump = bridge.bump)]
+    pub bridge: Account<'info, Bridge>,
+    #[account(init, payer = payer, space = 8 + Cblock::INIT_SPACE, seeds = [b"cblock", hash.as_ref()], bump)]
+    pub cblock: Account<'info, Cblock>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AttestCblock<'info> {
+    #[account(mut, seeds = [b"cblock", cblock.hash.as_ref()], bump)]
+    pub cblock: Account<'info, Cblock>,
+    #[account(seeds = [b"set", cblock.epoch.to_le_bytes().as_ref()], bump)]
+    pub set: Account<'info, ValidatorSet>,
+    /// CHECK: the instructions sysvar, checked by address.
+    #[account(address = ix_sysvar::ID)]
+    pub instructions: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+#[instruction(epoch: u64)]
+pub struct HandOff<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(seeds = [b"cblock", cblock.hash.as_ref()], bump)]
+    pub cblock: Account<'info, Cblock>,
+    #[account(init, payer = payer, space = 8 + ValidatorSet::INIT_SPACE, seeds = [b"set", epoch.to_le_bytes().as_ref()], bump)]
+    pub next: Account<'info, ValidatorSet>,
+    pub system_program: Program<'info, System>,
+}
+
 #[error_code]
 pub enum BridgeError {
     #[msg("A deposit moves more than nothing.")]
     ZeroAmount,
+    #[msg("An epoch is a positive number of cblocks.")]
+    BadEpoch,
+    #[msg("A validator set holds 1 to 32 validators.")]
+    BadSet,
+    #[msg("The preimage and outbox root do not hash to the cblock's hash.")]
+    BadPreimage,
+    #[msg("A signature is not a validator's Notar or Finalize vote on this cblock.")]
+    BadVote,
+    #[msg("The cblock is not certified in the epoch before the set it hands on.")]
+    NotCertified,
+    #[msg("The validator set is not in the cblock's outbox.")]
+    BadProof,
 }

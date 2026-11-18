@@ -1,6 +1,8 @@
 // acrux_bridge on the local validator: deposits lock tokens in the mint's vault and are recorded
-// in sequence for Acrux to credit. Run through tests/run.mjs.
+// in sequence for Acrux to credit, and the light client certifies cblocks signed by Acrux's
+// validators and hands their set on. Run through tests/run.mjs.
 import assert from 'node:assert/strict'
+import { createHash, generateKeyPairSync, sign } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { before, test } from 'node:test'
@@ -9,9 +11,10 @@ import {
   ExtensionType, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, createInitializeMintInstruction, createInitializeTransferFeeConfigInstruction,
   createMint, getAccount, getMintLen, getOrCreateAssociatedTokenAccount, mintTo,
 } from '@solana/spl-token'
-import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction } from '@solana/web3.js'
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SYSVAR_INSTRUCTIONS_PUBKEY, SystemProgram, Transaction, sendAndConfirmTransaction } from '@solana/web3.js'
 import { chainDir, devKeypair } from '../scripts/dev-keys.mjs'
 import { RPC_URL } from '../scripts/registry.mjs'
+import { EPOCH_SLOTS, ed25519Instruction, outboxProof, pdas, voteMessage } from '../scripts/bridge-relay.mjs'
 
 const idl = JSON.parse(readFileSync(join(chainDir, 'target/idl/acrux_bridge.json'), 'utf8'))
 const connection = new Connection(RPC_URL, 'confirmed')
@@ -40,9 +43,9 @@ before(async () => {
 })
 
 test('initialize: the bridge starts at deposit 0, once', async () => {
-  await program.methods.initialize().accounts({ payer: depositor.publicKey }).rpc()
+  await program.methods.initialize(new anchor.BN(EPOCH_SLOTS)).accounts({ payer: depositor.publicKey }).rpc()
   assert.equal((await program.account.bridge.fetch(bridge)).deposits.toNumber(), 0)
-  await assert.rejects(program.methods.initialize().accounts({ payer: depositor.publicKey }).rpc())
+  await assert.rejects(program.methods.initialize(new anchor.BN(EPOCH_SLOTS)).accounts({ payer: depositor.publicKey }).rpc())
 })
 
 test('deposit: tokens lock in the mint\'s vault and each deposit is recorded in sequence', async () => {
@@ -85,4 +88,71 @@ test('deposit: nothing, or someone else\'s tokens, is refused', async () => {
   await mintTo(connection, depositor, mint, theirs, depositor, 1_000_000n)
   await assert.rejects(deposit(1_000_000n, { from: theirs, sequence: 3 }))
   assert.equal((await program.account.bridge.fetch(bridge)).deposits.toNumber(), 3)
+})
+
+// The light client, with three validators staking 40, 30 and 30.
+const sha256 = (...parts) => createHash('sha256').update(Buffer.concat(parts)).digest()
+const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b }
+const validators = [40, 30, 30].map((stake) => {
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519')
+  return { key: Buffer.from(publicKey.export({ format: 'jwk' }).x, 'base64url'), privateKey, stake }
+})
+const asSet = (list) => list.map((v) => ({ key: new PublicKey(v.key), stake: new anchor.BN(v.stake) }))
+// bincode OutboxEntry::ValidatorSet for `epoch`.
+const setEntry = (epoch, list) => Buffer.concat([Buffer.alloc(4), u64(epoch), u64(list.length), ...list.flatMap((v) => [v.key, u64(v.stake)])])
+const { set: setOf, cblock: cblockOf } = pdas(program.programId)
+const slot = 7 // a cblock of epoch 0
+const outbox = [setEntry(1, validators), Buffer.from('another entry')]
+const root = sha256(sha256(outbox[0]), sha256(outbox[1]))
+const preimage = Buffer.concat([u64(slot), Buffer.from('the rest of the cblock')])
+const hash = sha256(preimage, root)
+const vote = (v, kind, { at = slot, on = hash } = {}) => {
+  const message = voteMessage(v, at, on, kind)
+  return { key: validators[v].key, signature: sign(null, message, validators[v].privateKey), message }
+}
+const attest = async (votes) => {
+  const ix = await program.methods.attestCblock().accountsPartial({ cblock: cblockOf(hash), set: setOf(0), instructions: SYSVAR_INSTRUCTIONS_PUBKEY }).instruction()
+  return program.provider.sendAndConfirm(new Transaction().add(ed25519Instruction(votes), ix), [])
+}
+const handOff = (epoch, list, proof) => program.methods.handOff(new anchor.BN(epoch), asSet(list), proof).accountsPartial({ payer: depositor.publicKey, cblock: cblockOf(hash) }).rpc()
+
+test('light client: only the authority seeds a validator set', async () => {
+  const stranger = Keypair.generate()
+  await sendAndConfirmTransaction(connection, new Transaction().add(SystemProgram.transfer({ fromPubkey: depositor.publicKey, toPubkey: stranger.publicKey, lamports: LAMPORTS_PER_SOL })), [depositor])
+  await assert.rejects(program.methods.initValidatorSet(new anchor.BN(0), asSet(validators)).accounts({ authority: stranger.publicKey }).signers([stranger]).rpc())
+  await program.methods.initValidatorSet(new anchor.BN(0), asSet(validators)).accounts({ authority: depositor.publicKey }).rpc()
+  assert.equal((await program.account.validatorSet.fetch(setOf(0))).total.toNumber(), 100)
+})
+
+test('light client: a cblock posts only with the preimage and root of its hash', async () => {
+  const post = (h, r, p) => program.methods.postCblock([...h], [...r], p).accountsPartial({ payer: depositor.publicKey, cblock: cblockOf(h) }).rpc()
+  await assert.rejects(post(hash, Buffer.alloc(32), preimage), (err) => err.error?.errorCode?.code === 'BadPreimage')
+  await post(hash, root, preimage)
+  const cblock = await program.account.cblock.fetch(cblockOf(hash))
+  assert.deepEqual([cblock.slot.toNumber(), cblock.epoch.toNumber(), cblock.certified], [slot, 0, false])
+})
+
+test("light client: votes that are not a validator's, or not on this cblock, are refused", async () => {
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519')
+  const message = voteMessage(0, slot, hash, 'finalize')
+  const outsider = { key: Buffer.from(publicKey.export({ format: 'jwk' }).x, 'base64url'), signature: sign(null, message, privateKey), message }
+  await assert.rejects(attest([outsider]), (err) => /0x1774/.test(String(err)))
+  await assert.rejects(attest([vote(0, 'finalize', { at: slot + 1 })]), (err) => /0x1774/.test(String(err)))
+  await assert.rejects(attest([vote(0, 'finalize', { on: Buffer.alloc(32, 1) })]), (err) => /0x1774/.test(String(err)))
+})
+
+test('light client: 60% of the stake in Finalize votes certifies, and hands the next set on', async () => {
+  await attest([vote(0, 'finalize'), vote(1, 'notar')])
+  assert.equal((await program.account.cblock.fetch(cblockOf(hash))).certified, false)
+  await assert.rejects(handOff(1, validators, outboxProof(outbox, 0)), (err) => err.error?.errorCode?.code === 'NotCertified')
+  await attest([vote(1, 'finalize')])
+  const cblock = await program.account.cblock.fetch(cblockOf(hash))
+  assert.deepEqual([cblock.certified, cblock.finalize, cblock.notar], [true, 0b011, 0b010])
+  // A set that is not the one in the outbox, or for another epoch, is refused.
+  const changed = validators.map((v, i) => ({ ...v, stake: i === 0 ? 90 : v.stake }))
+  await assert.rejects(handOff(1, changed, outboxProof(outbox, 0)), (err) => err.error?.errorCode?.code === 'BadProof')
+  await assert.rejects(handOff(2, validators, outboxProof(outbox, 0)), (err) => err.error?.errorCode?.code === 'NotCertified')
+  await handOff(1, validators, outboxProof(outbox, 0))
+  const next = await program.account.validatorSet.fetch(setOf(1))
+  assert.deepEqual([next.epoch.toNumber(), next.total.toNumber(), next.validators.length], [1, 100, 3])
 })

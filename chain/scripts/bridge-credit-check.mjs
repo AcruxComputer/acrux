@@ -54,6 +54,7 @@ try {
   const lines = `${follow.stdout}`.trim().split('\n')
   const matched = lines.filter((l) => l.includes('matches')).length
   console.log(`follower: ${matched} slots re-executed with matching state hashes; ${lines.filter((l) => /mismatch|does not/i.test(l)).length} mismatches`)
+  if (matched <= 10) console.log('follower stopped:', `${follow.stderr}`.trim().split(/\r?\n/).slice(-3).join(' | '))
   ok &&= matched > 10
   const counters = await rpc('http://127.0.0.1:4930', 'getCounters', {})
   console.log(`net: ${counters.slots} slots, ${counters.finalizedCblocks} cblocks finalized, ${counters.skips} skipped`)

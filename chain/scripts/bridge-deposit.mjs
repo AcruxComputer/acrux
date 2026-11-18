@@ -22,7 +22,7 @@ const idl = JSON.parse(readFileSync(join(chainDir, 'target/idl/acrux_bridge.json
 const program = new anchor.Program(idl, new anchor.AnchorProvider(connection, new anchor.Wallet(depositor), { commitment: 'confirmed' }))
 const pda = (...seeds) => PublicKey.findProgramAddressSync(seeds, program.programId)[0]
 const bridge = pda(Buffer.from('bridge'))
-if (!(await connection.getAccountInfo(bridge))) await program.methods.initialize().accounts({ payer: depositor.publicKey }).rpc()
+if (!(await connection.getAccountInfo(bridge))) await program.methods.initialize(new anchor.BN(1536)).accounts({ payer: depositor.publicKey }).rpc()
 
 const mint = arg('mint') ? new PublicKey(arg('mint')) : await createMint(connection, depositor, depositor.publicKey, null, 6)
 const source = (await getOrCreateAssociatedTokenAccount(connection, depositor, mint, depositor.publicKey)).address

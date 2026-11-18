@@ -77,3 +77,38 @@ async fn read_new(url: &str, program: &Pubkey, deposits: &Deposits, decimals: &m
     }
     Ok(())
 }
+
+/// What a cblock's outbox holds for Solana's light client: the validator set of the next Acrux
+/// epoch, in every cblock; withdrawals join it.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum OutboxEntry {
+    ValidatorSet { epoch: u64, validators: Vec<([u8; 32], u64)> },
+}
+
+/// The outbox's Merkle root: leaves are the SHA-256 of each entry's bincode, each level pairs
+/// left to right hashing the two together, an odd last node moves up as it is; no entries is zero.
+pub fn outbox_root(entries: &[OutboxEntry]) -> [u8; 32] {
+    let mut level = entries.iter().map(|e| crate::crypto::hash(&bincode::serialize(e).expect("outbox entry encodes"))).collect::<Vec<_>>();
+    if level.is_empty() {
+        return [0; 32];
+    }
+    while level.len() > 1 {
+        level = level.chunks(2).map(|pair| if pair.len() == 2 { crate::crypto::hash(&[pair[0], pair[1]].concat()) } else { pair[0] }).collect();
+    }
+    level[0]
+}
+
+/// The sibling hashes from leaf `index` up to the root, each with whether it sits on the left.
+pub fn outbox_proof(entries: &[OutboxEntry], mut index: usize) -> Vec<(bool, [u8; 32])> {
+    let mut level = entries.iter().map(|e| crate::crypto::hash(&bincode::serialize(e).expect("outbox entry encodes"))).collect::<Vec<_>>();
+    let mut proof = vec![];
+    while level.len() > 1 {
+        let sibling = index ^ 1;
+        if sibling < level.len() {
+            proof.push((sibling < index, level[sibling]));
+        }
+        level = level.chunks(2).map(|pair| if pair.len() == 2 { crate::crypto::hash(&[pair[0], pair[1]].concat()) } else { pair[0] }).collect();
+        index /= 2;
+    }
+    proof
+}
