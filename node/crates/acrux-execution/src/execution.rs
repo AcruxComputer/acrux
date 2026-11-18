@@ -764,6 +764,31 @@ impl SvmExecutor {
         self.bridge = Some(bridge);
     }
 
+    /// The withdrawals burned in cblock `cblock` (its four slots), in sequence, read from the bridge
+    /// program's records on Acrux: `(sequence, Solana mint, Solana recipient, amount)`.
+    pub fn withdrawals(&self, cblock: u64) -> Vec<(u64, [u8; 32], [u8; 32], u64)> {
+        let Some(bridge) = self.bridge else { return vec![] };
+        let u64_at = |d: &[u8], o: usize| d.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+        // Outbound: discriminator, withdrawals made.
+        let made = self.svm.get_account(&Pubkey::find_program_address(&[b"outbound"], &bridge).0).and_then(|a| u64_at(&a.data, 8)).unwrap_or(0);
+        let mut found = vec![];
+        // Sequences rise with slots: walk back from the newest until before this cblock.
+        for sequence in (0..made).rev() {
+            let record = Pubkey::find_program_address(&[b"withdrawal", &sequence.to_le_bytes()], &bridge).0;
+            // Withdrawal: discriminator, sequence, owner, recipient, Solana mint, amount, slot, bump.
+            let Some(d) = self.svm.get_account(&record).map(|a| a.data) else { break };
+            let (Some(amount), Some(slot)) = (u64_at(&d, 112), u64_at(&d, 120)) else { break };
+            if slot / 4 < cblock {
+                break;
+            }
+            if slot / 4 == cblock {
+                found.push((sequence, d[80..112].try_into().unwrap(), d[48..80].try_into().unwrap(), amount));
+            }
+        }
+        found.reverse();
+        found
+    }
+
     /// The next bridge sequence to credit: what the counter account holds, 0 before the first.
     pub fn next_credit(&self) -> u64 {
         self.bridge

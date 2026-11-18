@@ -2890,7 +2890,10 @@ impl Network {
                 // which Solana's light client proves outbox entries against.
                 let preimage = encode(&(i, parent, accepted, &state))?;
                 let hash = if self.bridge_open(i * 4) {
-                    let outbox = self.outbox(i);
+                    let mut outbox = self.outbox(i);
+                    outbox.extend(self.nodes[id].executor.as_ref().unwrap().withdrawals(i).into_iter().map(|(sequence, solana_mint, recipient, amount)| {
+                        crate::bridge::OutboxEntry::Withdrawal { sequence, solana_mint, recipient, amount }
+                    }));
                     let hash = crypto::hash(&[preimage.as_slice(), &crate::bridge::outbox_root(&outbox)].concat());
                     if id == 0 {
                         self.cblock_preimages.insert(i, (preimage, outbox));

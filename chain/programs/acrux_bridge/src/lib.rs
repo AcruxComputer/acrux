@@ -9,9 +9,13 @@
 //! precompile checks their signatures over the bincode `Vote` in the same transaction. Every
 //! cblock carries the next epoch's validator set in its outbox, so any certified cblock of an epoch
 //! hands the light client on.
+//!
+//! The same program runs on Acrux at the same address, where `withdraw` burns a bridged token and
+//! records the withdrawal; Acrux writes it into its cblock's outbox, and `release` on Solana pays it
+//! out of the vault once that cblock is certified, once per withdrawal.
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{hash::hashv, sysvar::instructions as ix_sysvar};
-use anchor_spl::token_interface::{transfer_checked, Mint, TokenAccount, TokenInterface, TransferChecked};
+use anchor_spl::token_interface::{burn, transfer_checked, Burn, Mint, TokenAccount, TokenInterface, TransferChecked};
 
 declare_id!("EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5");
 
@@ -122,6 +126,65 @@ pub mod acrux_bridge {
         Ok(())
     }
 
+    /// On Acrux: burns `amount` of a bridged token (the mint at `["mint", solana_mint]`) and records
+    /// the withdrawal to `recipient` on Solana at `["withdrawal", sequence]`, for the cblock's outbox.
+    pub fn withdraw(ctx: Context<Withdraw>, solana_mint: Pubkey, amount: u64, recipient: Pubkey) -> Result<()> {
+        require!(amount > 0, BridgeError::ZeroAmount);
+        burn(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Burn { mint: ctx.accounts.mint.to_account_info(), from: ctx.accounts.source.to_account_info(), authority: ctx.accounts.owner.to_account_info() },
+            ),
+            amount,
+        )?;
+        let outbound = &mut ctx.accounts.outbound;
+        outbound.bump = ctx.bumps.outbound;
+        let sequence = outbound.withdrawals;
+        outbound.withdrawals += 1;
+        ctx.accounts.record.set_inner(Withdrawal {
+            sequence,
+            owner: ctx.accounts.owner.key(),
+            recipient,
+            solana_mint,
+            amount,
+            slot: Clock::get()?.slot,
+            bump: ctx.bumps.record,
+        });
+        Ok(())
+    }
+
+    /// On Solana: pays a withdrawal out of the mint's vault to `recipient`'s token account, proven
+    /// against the outbox root of a certified cblock. Each sequence is paid once.
+    pub fn release(ctx: Context<Release>, sequence: u64, recipient: Pubkey, amount: u64, proof: Vec<ProofNode>) -> Result<()> {
+        require!(ctx.accounts.cblock.certified, BridgeError::NotCertified);
+        let mint = ctx.accounts.mint.key();
+        // bincode OutboxEntry::Withdrawal: variant (u32 1), sequence, Solana mint, recipient, amount.
+        let mut entry = Vec::with_capacity(84);
+        entry.extend_from_slice(&1u32.to_le_bytes());
+        entry.extend_from_slice(&sequence.to_le_bytes());
+        entry.extend_from_slice(mint.as_ref());
+        entry.extend_from_slice(recipient.as_ref());
+        entry.extend_from_slice(&amount.to_le_bytes());
+        require!(merkle_root(&entry, &proof) == ctx.accounts.cblock.outbox_root, BridgeError::BadProof);
+        let bump = ctx.bumps.vault;
+        transfer_checked(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                TransferChecked {
+                    from: ctx.accounts.vault.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                    to: ctx.accounts.destination.to_account_info(),
+                    authority: ctx.accounts.vault.to_account_info(),
+                },
+                &[&[b"vault", mint.as_ref(), &[bump]]],
+            ),
+            amount,
+            ctx.accounts.mint.decimals,
+        )?;
+        ctx.accounts.released.set_inner(Released { sequence, cblock: ctx.accounts.cblock.key() });
+        Ok(())
+    }
+
     /// Hands the light client on to `epoch`: the validator set a certified cblock of the epoch
     /// before carries in its outbox, proven against the outbox root.
     pub fn hand_off(ctx: Context<HandOff>, epoch: u64, validators: Vec<Validator>, proof: Vec<ProofNode>) -> Result<()> {
@@ -137,11 +200,7 @@ pub mod acrux_bridge {
             entry.extend_from_slice(v.key.as_ref());
             entry.extend_from_slice(&v.stake.to_le_bytes());
         }
-        let mut node = hashv(&[&entry]).to_bytes();
-        for step in &proof {
-            node = if step.left { hashv(&[&step.hash, &node]) } else { hashv(&[&node, &step.hash]) }.to_bytes();
-        }
-        require!(node == cblock.outbox_root, BridgeError::BadProof);
+        require!(merkle_root(&entry, &proof) == cblock.outbox_root, BridgeError::BadProof);
         let total = validators.iter().map(|v| v.stake).sum();
         ctx.accounts.next.set_inner(ValidatorSet { epoch, total, validators });
         Ok(())
@@ -152,6 +211,13 @@ pub const MAX_VALIDATORS: usize = 32;
 const VOTE_NOTAR: u32 = 0;
 const VOTE_FINALIZE: u32 = 4;
 const ED25519_PROGRAM: Pubkey = pubkey!("Ed25519SigVerify111111111111111111111111111");
+
+/// The outbox root an entry and its proof lead to: the entry's SHA-256, hashed up with each sibling.
+fn merkle_root(entry: &[u8], proof: &[ProofNode]) -> [u8; 32] {
+    proof.iter().fold(hashv(&[entry]).to_bytes(), |node, step| {
+        if step.left { hashv(&[&step.hash, &node]) } else { hashv(&[&node, &step.hash]) }.to_bytes()
+    })
+}
 
 /// The public key and message of every signature an ed25519 precompile instruction verified,
 /// each held in the instruction's own data.
@@ -198,6 +264,37 @@ pub struct DepositRecord {
     /// The Solana slot the deposit landed in.
     pub slot: u64,
     pub bump: u8,
+}
+
+/// On Acrux: the withdrawals made so far, at `["outbound"]`.
+#[account]
+#[derive(InitSpace)]
+pub struct Outbound {
+    pub withdrawals: u64,
+    pub bump: u8,
+}
+
+/// On Acrux: one withdrawal, at `["withdrawal", sequence]`.
+#[account]
+#[derive(InitSpace)]
+pub struct Withdrawal {
+    pub sequence: u64,
+    pub owner: Pubkey,
+    /// The Solana address paid out of the vault.
+    pub recipient: Pubkey,
+    pub solana_mint: Pubkey,
+    pub amount: u64,
+    /// The Acrux slot of the burn; its cblock's outbox carries the withdrawal.
+    pub slot: u64,
+    pub bump: u8,
+}
+
+/// On Solana: a withdrawal paid, at `["released", sequence]`.
+#[account]
+#[derive(InitSpace)]
+pub struct Released {
+    pub sequence: u64,
+    pub cblock: Pubkey,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, InitSpace)]
@@ -324,6 +421,48 @@ pub struct AttestCblock<'info> {
     /// CHECK: the instructions sysvar, checked by address.
     #[account(address = ix_sysvar::ID)]
     pub instructions: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+#[instruction(solana_mint: Pubkey)]
+pub struct Withdraw<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    #[account(mut, seeds = [b"mint", solana_mint.as_ref()], bump, mint::token_program = token_program)]
+    pub mint: InterfaceAccount<'info, Mint>,
+    #[account(mut, token::mint = mint, token::authority = owner, token::token_program = token_program)]
+    pub source: InterfaceAccount<'info, TokenAccount>,
+    #[account(init_if_needed, payer = owner, space = 8 + Outbound::INIT_SPACE, seeds = [b"outbound"], bump)]
+    pub outbound: Account<'info, Outbound>,
+    #[account(
+        init,
+        payer = owner,
+        space = 8 + Withdrawal::INIT_SPACE,
+        seeds = [b"withdrawal", outbound.withdrawals.to_le_bytes().as_ref()],
+        bump,
+    )]
+    pub record: Account<'info, Withdrawal>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(sequence: u64, recipient: Pubkey)]
+pub struct Release<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(seeds = [b"cblock", cblock.hash.as_ref()], bump)]
+    pub cblock: Account<'info, Cblock>,
+    #[account(mint::token_program = token_program)]
+    pub mint: InterfaceAccount<'info, Mint>,
+    #[account(mut, seeds = [b"vault", mint.key().as_ref()], bump, token::mint = mint, token::token_program = token_program)]
+    pub vault: InterfaceAccount<'info, TokenAccount>,
+    #[account(mut, token::mint = mint, token::authority = recipient, token::token_program = token_program)]
+    pub destination: InterfaceAccount<'info, TokenAccount>,
+    #[account(init, payer = payer, space = 8 + Released::INIT_SPACE, seeds = [b"released", sequence.to_le_bytes().as_ref()], bump)]
+    pub released: Account<'info, Released>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]

@@ -79,10 +79,11 @@ async fn read_new(url: &str, program: &Pubkey, deposits: &Deposits, decimals: &m
 }
 
 /// What a cblock's outbox holds for Solana's light client: the validator set of the next Acrux
-/// epoch, in every cblock; withdrawals join it.
+/// epoch, in every cblock, and the withdrawals burned in the cblock, which Solana pays out.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum OutboxEntry {
     ValidatorSet { epoch: u64, validators: Vec<([u8; 32], u64)> },
+    Withdrawal { sequence: u64, solana_mint: [u8; 32], recipient: [u8; 32], amount: u64 },
 }
 
 /// The outbox's Merkle root: leaves are the SHA-256 of each entry's bincode, each level pairs

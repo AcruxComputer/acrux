@@ -15,6 +15,7 @@ import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SYSVAR_INSTRUCTIONS_P
 import { chainDir, devKeypair } from '../scripts/dev-keys.mjs'
 import { RPC_URL } from '../scripts/registry.mjs'
 import { EPOCH_SLOTS, ed25519Instruction, outboxProof, pdas, voteMessage } from '../scripts/bridge-relay.mjs'
+import { createAssociatedTokenAccountIdempotent } from '@solana/spl-token'
 
 const idl = JSON.parse(readFileSync(join(chainDir, 'target/idl/acrux_bridge.json'), 'utf8'))
 const connection = new Connection(RPC_URL, 'confirmed')
@@ -110,8 +111,8 @@ const vote = (v, kind, { at = slot, on = hash } = {}) => {
   const message = voteMessage(v, at, on, kind)
   return { key: validators[v].key, signature: sign(null, message, validators[v].privateKey), message }
 }
-const attest = async (votes) => {
-  const ix = await program.methods.attestCblock().accountsPartial({ cblock: cblockOf(hash), set: setOf(0), instructions: SYSVAR_INSTRUCTIONS_PUBKEY }).instruction()
+const attest = async (votes, on = hash) => {
+  const ix = await program.methods.attestCblock().accountsPartial({ cblock: cblockOf(on), set: setOf(0), instructions: SYSVAR_INSTRUCTIONS_PUBKEY }).instruction()
   return program.provider.sendAndConfirm(new Transaction().add(ed25519Instruction(votes), ix), [])
 }
 const handOff = (epoch, list, proof) => program.methods.handOff(new anchor.BN(epoch), asSet(list), proof).accountsPartial({ payer: depositor.publicKey, cblock: cblockOf(hash) }).rpc()
@@ -155,4 +156,37 @@ test('light client: 60% of the stake in Finalize votes certifies, and hands the 
   await handOff(1, validators, outboxProof(outbox, 0))
   const next = await program.account.validatorSet.fetch(setOf(1))
   assert.deepEqual([next.epoch.toNumber(), next.total.toNumber(), next.validators.length], [1, 100, 3])
+})
+
+// A withdrawal burned on Acrux, in the outbox of another cblock of epoch 0.
+const payee = Keypair.generate().publicKey
+const withdrawalEntry = (sequence, amount, to = payee) => Buffer.concat([Buffer.from([1, 0, 0, 0]), u64(sequence), mint.toBuffer(), to.toBuffer(), u64(amount)])
+const releasing = () => {
+  const outbox2 = [setEntry(1, validators), withdrawalEntry(5, 400_000_000)]
+  const preimage2 = Buffer.concat([u64(slot + 4), Buffer.from('a later cblock')])
+  const root2 = sha256(sha256(outbox2[0]), sha256(outbox2[1]))
+  return { outbox2, preimage2, root2, hash2: sha256(preimage2, root2) }
+}
+const release = async (hash2, outbox2, { sequence = 5, amount = 400_000_000, to = payee } = {}) => {
+  const destination = await createAssociatedTokenAccountIdempotent(connection, depositor, mint, to, { commitment: 'confirmed' })
+  return program.methods.release(new anchor.BN(sequence), to, new anchor.BN(amount), outboxProof(outbox2, 1))
+    .accountsPartial({ payer: depositor.publicKey, cblock: cblockOf(hash2), mint, destination, tokenProgram: TOKEN_PROGRAM_ID }).rpc()
+}
+
+test('release: a withdrawal in a certified cblock is paid from the vault, once', async () => {
+  const { outbox2, preimage2, root2, hash2 } = releasing()
+  await program.methods.postCblock([...hash2], [...root2], preimage2).accountsPartial({ payer: depositor.publicKey, cblock: cblockOf(hash2) }).rpc()
+  await assert.rejects(release(hash2, outbox2), (err) => err.error?.errorCode?.code === 'NotCertified')
+  const signed = (v) => { const message = voteMessage(v, slot + 4, hash2, 'finalize'); return { key: validators[v].key, signature: sign(null, message, validators[v].privateKey), message } }
+  await attest([signed(0), signed(1)], hash2)
+  // Another amount, sequence or recipient is not in the outbox.
+  await assert.rejects(release(hash2, outbox2, { amount: 500_000_000 }), (err) => err.error?.errorCode?.code === 'BadProof')
+  await assert.rejects(release(hash2, outbox2, { sequence: 6 }), (err) => err.error?.errorCode?.code === 'BadProof')
+  const vaultBefore = (await getAccount(connection, vaultOf(mint))).amount
+  await release(hash2, outbox2)
+  const destination = await createAssociatedTokenAccountIdempotent(connection, depositor, mint, payee, { commitment: 'confirmed' })
+  assert.equal((await getAccount(connection, destination)).amount, 400_000_000n)
+  assert.equal(vaultBefore - (await getAccount(connection, vaultOf(mint))).amount, 400_000_000n)
+  await assert.rejects(release(hash2, outbox2))
+  assert.equal((await getAccount(connection, destination)).amount, 400_000_000n)
 })

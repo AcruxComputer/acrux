@@ -1,6 +1,6 @@
 [package]
 name = "acrux-crypto"
-version = "0.4.8"
+version = "0.4.9"
 edition = "2021"
 description = "Hashing, signatures, ChaCha20-Poly1305 slices and Reed-Solomon shreds with Merkle proofs."
 
