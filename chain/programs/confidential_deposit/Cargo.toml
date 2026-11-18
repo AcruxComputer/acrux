@@ -1,0 +1,25 @@
+[package]
+name = "confidential_deposit"
+version = "0.1.0"
+description = "Deposit adapter for the Acrux bridge: the bridge sees a program account as the depositor, not the user's wallet"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "confidential_deposit"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "=0.31.1", features = ["init-if-needed"] }
+anchor-spl = { version = "=0.31.1", default-features = false, features = ["token", "token_2022", "associated_token"] }
+acrux_bridge = { path = "../acrux_bridge", features = ["cpi"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }

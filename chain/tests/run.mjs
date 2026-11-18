@@ -3,7 +3,7 @@
 // registry, so it runs on a validator of its own without the Acrux Net genesis accounts, the
 // registry's among them; the other suites run with them.
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Connection } from '@solana/web3.js'
 import { chainDir } from '../scripts/dev-keys.mjs'
@@ -28,6 +28,10 @@ async function suite(files, withGenesis) {
     '--account-dir', accounts,
     // The bridge, built beside the genesis programs.
     '--bpf-program', 'EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5', join(chainDir, 'target/deploy/acrux_bridge.so'),
+    // The confidential deposit adapter, only when it was built (see docs/confidential-deposit-e2e.md).
+    ...(existsSync(join(chainDir, 'target/idl/confidential_deposit.json'))
+      ? ['--bpf-program', JSON.parse(readFileSync(join(chainDir, 'target/idl/confidential_deposit.json'), 'utf8')).address, join(chainDir, 'target/deploy/confidential_deposit.so')]
+      : []),
   ], { stdio: 'ignore' })
   let status = 1
   try {
