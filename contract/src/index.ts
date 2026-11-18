@@ -1,4 +1,5 @@
 export * from './schemas.js'
+export { ACRUX_BRIDGE_IDL } from './bridge-idl.js'
 export * from './events.js'
 export * from './rpc.js'
 export * from './client.js'

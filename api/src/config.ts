@@ -21,6 +21,12 @@ export const env = parseEnv(z.object({
   GATEWAY_INTERNAL_URL: httpUrl.default('http://127.0.0.1:4989'),
   /** The Solana cluster the Hub Registry lives on (the local validator in development). */
   SOLANA_RPC_URL: httpUrl.default('http://127.0.0.1:4990'),
+  /** The bridge program (acrux_bridge), on Solana and on Acrux; unset, /v1/bridge waits. */
+  BRIDGE_PROGRAM_ID: z.union([Address, z.literal('')]).default(''),
+  /** The first Acrux slot of the bridge rule; empty when there is none. */
+  BRIDGE_FROM_SLOT: z.union([z.literal(''), z.coerce.number().int().nonnegative()]).default(''),
+  /** Bridge reads: 60 s keeps them near five calls a minute on SOLANA_RPC_URL. */
+  BRIDGE_POLL_SECONDS: z.coerce.number().positive().default(60),
   /** Requests a second the site's Solana relay may spend on SOLANA_RPC_URL (its share of the shared key). */
   SOLANA_RELAY_RPS: z.coerce.number().positive().default(10),
   /** The node binary: Algorithm 3 for the schedule preview and the Fault Lab runner. */

@@ -4,13 +4,13 @@ import { z } from 'zod'
 import { streamSSE } from 'hono/streaming'
 import {
   Address, ApiClientError, Balance, Signature, CONTRACT_VERSION, FaucetRequest, LabRunRequest, PageQuery,
-  HubCode, SCENARIOS, TxId, createGatewayClient, errors, paginate,
+  HubCode, SCENARIOS, TxId, createGatewayClient, errors, paginate, BridgeTransfersQuery,
   type LabRun, type ProtocolEvent, type Transaction,
 } from '@acrux/contract'
 import {
   facts, faucetGrant, faucetStatus, fixtureErrors, hubs, labRuns, labRunsByState,
   makeFixtureTransaction, makeLabReplay, makeSchedulePreview, registryConfig, scenarios,
-  specMap, transactionsByState, replayRange, replaySlot,
+  specMap, transactionsByState, replayRange, replaySlot, bridgeFixture, bridgeWaitingFixture, bridgeTransfersFixture,
 } from '@acrux/contract/fixtures'
 import { createApi } from './engines/server/app.js'
 import { emptyReplayRange } from './replay.js'
@@ -54,6 +54,12 @@ export function createFixtureApi() {
     if (!settings.mint) return c.json(emptyBuyback(settings))
     if (!database) fail('CONFIGURATION_REQUIRED', 'Configure DATABASE_URL before reading buyback history.', { stage: 'read' })
     return c.json(await readBuyback(database.db, settings))
+  })
+  app.get('/v1/bridge', c => c.json(c.get('scenario') === 'empty' ? bridgeWaitingFixture : bridgeFixture))
+  app.get('/v1/bridge/transfers', c => {
+    const query = readQuery(c, BridgeTransfersQuery)
+    const rows = c.get('scenario') === 'empty' ? [] : bridgeTransfersFixture.filter(t => (!query.kind || t.kind === query.kind) && (!query.address || t.from === query.address || t.to === query.address))
+    return c.json(paginate(rows, query))
   })
   app.get('/v1/replay', c => c.json(c.get('scenario') === 'empty' ? emptyReplayRange() : replayRange))
   app.get('/v1/replay/:slot', c => {

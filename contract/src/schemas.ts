@@ -100,6 +100,58 @@ export const LabRun = z.strictObject({ id: z.string(), scenario: LabScenario, se
 export type LabRun = z.infer<typeof LabRun>
 export const LabRuns = page(LabRun)
 export const SpecMap = z.strictObject({ paper: z.string(), parameters: Parameters, entries: z.array(z.strictObject({ reference: z.string(), lines: z.string().nullable(), file: z.string(), function: z.string(), scenario: ScenarioId.nullable(), status: z.enum(['fixture', 'planned', 'implemented']) })), decisions: z.array(z.strictObject({ topic: z.string(), decision: z.string(), status: z.enum(['decided', 'configuration_required', 'fixture_only']) })) })
+/**
+ * The bridge between Solana and Acrux (`acrux_bridge`, the same program on both chains). A deposit
+ * locks tokens in the Solana mint's vault and is credited on Acrux at the mint derived from it, with
+ * the same decimals; a withdrawal burns on Acrux and is released from the vault once a certified
+ * cblock proves it. Amounts are base units.
+ */
+export const BridgeVault = z.strictObject({
+  solanaMint: Address, acruxMint: Address, decimals: z.number().int().min(0).max(255),
+  /** What the vault on Solana holds. */
+  lockedBaseUnits: U64,
+  /** The bridged mint's supply on Acrux. */
+  bridgedBaseUnits: U64,
+})
+/** The newest cblock Solana's light client certified. */
+export const BridgeCertified = z.strictObject({ consensusSlot: Count, epoch: Count, hash: Hash, outboxRoot: Hash, account: Address })
+export const Bridge = z.strictObject({
+  status: z.enum(['waiting', 'live']),
+  /** The program's address, on Solana and on Acrux. */
+  program: Address.nullable(),
+  /** The first Acrux slot of the bridge rule. */
+  fromSlot: Count.nullable(),
+  lightClient: z.strictObject({ epoch: Count.nullable(), validators: Count, latestCertified: BridgeCertified.nullable() }),
+  vaults: z.array(BridgeVault),
+  totals: z.strictObject({ deposits: Count, credited: Count, withdrawals: Count, released: Count }),
+  readAt: Timestamp.nullable(),
+})
+/**
+ * A deposit is `locked` on Solana, then `credited` on Acrux. A withdrawal is `burned` on Acrux, then
+ * `certified` once Solana's light client certified its cblock, then `released` from the vault.
+ */
+export const BridgeTransferStatus = z.enum(['locked', 'credited', 'burned', 'certified', 'released'])
+export const BridgeTransfer = z.strictObject({
+  kind: z.enum(['deposit', 'withdrawal']), sequence: Count, status: BridgeTransferStatus,
+  solanaMint: Address, acruxMint: Address, amount: U64,
+  /** The depositor on Solana, or the withdrawal's owner on Acrux. */
+  from: Address,
+  /** The Acrux recipient of a deposit, or the Solana recipient of a withdrawal. */
+  to: Address,
+  /** A deposit's Solana slot. */
+  solanaSlot: Count.nullable(),
+  /** A withdrawal's Acrux slot, and the cblock whose outbox carries it. */
+  acruxSlot: Count.nullable(), cblock: Count.nullable(),
+  /** The account on Solana that records a withdrawal's release. */
+  releaseAccount: Address.nullable(),
+})
+export const BridgeTransfers = page(BridgeTransfer)
+export const BridgeTransfersQuery = PageQuery.extend({ address: Address.optional(), kind: z.enum(['deposit', 'withdrawal']).optional() })
+export type BridgeVault = z.infer<typeof BridgeVault>
+export type Bridge = z.infer<typeof Bridge>
+export type BridgeTransferStatus = z.infer<typeof BridgeTransferStatus>
+export type BridgeTransfer = z.infer<typeof BridgeTransfer>
+export type BridgeTransfers = z.infer<typeof BridgeTransfers>
 /** Buyback amounts are base units. Totals may exceed one transaction's u64 range. */
 export const BuybackAction = z.enum(['claim', 'swap', 'burn'])
 export const BuybackRow = z.strictObject({

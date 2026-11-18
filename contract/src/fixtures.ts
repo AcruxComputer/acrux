@@ -1,7 +1,7 @@
 import type { z } from 'zod'
 import { toBase58, toBase64 } from './encoding.js'
 import { PROTOCOL_PARAMETERS, errors } from './schemas.js'
-import type { Balance, DemoPool, Evidence, Facts, FaucetPolicy, FaucetStatus, FaucetGrant, LabScenario, RegistryConfig, SchedulePreview, SpecMap } from './schemas.js'
+import type { Balance, Bridge, BridgeTransfer, DemoPool, Evidence, Facts, FaucetPolicy, FaucetStatus, FaucetGrant, LabScenario, RegistryConfig, SchedulePreview, SpecMap } from './schemas.js'
 import type { Cblock, Certificate, ExecutionSchedule, Hub, LabRun, Member, MergedTransaction, NetSnapshot, Parameters, Proposer, Slot, Transaction, Window } from './schemas.js'
 import type { ApiErrorBody } from './errors.js'
 import type { LabReplay, ProtocolEvent } from './events.js'
@@ -483,3 +483,25 @@ export const membershipFixtures = {
   leaving: { ...hubs[0]!.members[0]!, pendingLeave: true, effectiveEpoch: 43, cooldownUntilEpoch: 45 },
 }
 export { replaySlot, replayRange } from './replay-fixture.js'
+
+// The bridge as the local round trip left it: 2,500 deposited and credited, 1,000 withdrawn and
+// released, a second withdrawal certified and waiting for its release.
+const bridgeProgram = 'EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5'
+const bridgeSolanaMint = '3A5GLMkvQndVrzcTTC7gXDUnBnaTDhQFWvumfhQ7uYyT'
+const bridgeAcruxMint = 'Bu5CMp2GSnpzLGNpVvpA3mMPPftbiJRYBTpqYGSAJxsN'
+export const bridgeFixture: z.infer<typeof Bridge> = {
+  status: 'live', program: bridgeProgram, fromSlot: 0,
+  lightClient: { epoch: 1, validators: 12, latestCertified: { consensusSlot: 174, epoch: 0, hash: 'a7'.repeat(32), outboxRoot: '5c'.repeat(32), account: '7Wt8f36u8o2DdMmZaQQpdpSg8QFS6hEdTheKZqtZEgvb' } },
+  vaults: [{ solanaMint: bridgeSolanaMint, acruxMint: bridgeAcruxMint, decimals: 6, lockedBaseUnits: '1500000000', bridgedBaseUnits: '1250000000' }],
+  totals: { deposits: 1, credited: 1, withdrawals: 2, released: 1 },
+  readAt: '2026-11-18T14:30:00.000Z',
+}
+export const bridgeWaitingFixture: z.infer<typeof Bridge> = {
+  status: 'waiting', program: null, fromSlot: null, lightClient: { epoch: null, validators: 0, latestCertified: null }, vaults: [],
+  totals: { deposits: 0, credited: 0, withdrawals: 0, released: 0 }, readAt: null,
+}
+export const bridgeTransfersFixture: z.infer<typeof BridgeTransfer>[] = [
+  { kind: 'withdrawal', sequence: 1, status: 'certified', solanaMint: bridgeSolanaMint, acruxMint: bridgeAcruxMint, amount: '250000000', from: 'BanDYHQEj35pryGMkXM8Ka1WobTdZavgPG97fcgi9pay', to: 'B7N7vHRUyM6dFb34fFtYqEucL1cPu6gi4UWDfRfYGSST', solanaSlot: null, acruxSlot: 698, cblock: 174, releaseAccount: null },
+  { kind: 'withdrawal', sequence: 0, status: 'released', solanaMint: bridgeSolanaMint, acruxMint: bridgeAcruxMint, amount: '1000000000', from: 'BanDYHQEj35pryGMkXM8Ka1WobTdZavgPG97fcgi9pay', to: 'B7N7vHRUyM6dFb34fFtYqEucL1cPu6gi4UWDfRfYGSST', solanaSlot: null, acruxSlot: 672, cblock: 168, releaseAccount: '9pz8cL3ALbkqF4QHBRewTWMSWX3PuGs4uPnNNSZvMETD' },
+  { kind: 'deposit', sequence: 0, status: 'credited', solanaMint: bridgeSolanaMint, acruxMint: bridgeAcruxMint, amount: '2500000000', from: 'G9Hx9dH8tNCKdL1FogM2Qsy493Hp6SrG6re1hxkq5aD6', to: 'BanDYHQEj35pryGMkXM8Ka1WobTdZavgPG97fcgi9pay', solanaSlot: 43, acruxSlot: null, cblock: null, releaseAccount: null },
+]

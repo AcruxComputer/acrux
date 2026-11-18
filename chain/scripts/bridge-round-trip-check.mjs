@@ -3,6 +3,8 @@
 // with the same program placed on Acrux. Seeds the light client, deposits 2,500 tokens for an Acrux
 // holder, waits for the credit, withdraws 1,000 on Acrux to a Solana recipient, relays the cblock
 // of the burn and checks the payout from the vault. Stops both.
+// With ACRUX_API set (an API in node mode reading this bridge), it also waits for /v1/bridge to
+// read the release and prints it with /v1/bridge/transfers.
 // Usage (from backend/chain): node scripts/bridge-round-trip-check.mjs [acrux binary, from backend/node]
 import { spawn, spawnSync } from 'node:child_process'
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
@@ -89,6 +91,12 @@ try {
   // Relaying the same cblock again pays nothing more.
   const again = await relay(solana, proof)
   console.log(`relayed again: ${again.released.length} paid`)
+  if (process.env.ACRUX_API) {
+    const api = process.env.ACRUX_API
+    const overview = await until('/v1/bridge reading the release', 120, async () => { const b = await (await fetch(`${api}/v1/bridge`)).json(); return b.totals?.released === 1 ? b : null })
+    console.log('/v1/bridge:', JSON.stringify(overview))
+    console.log('/v1/bridge/transfers:', JSON.stringify(await (await fetch(`${api}/v1/bridge/transfers?address=${holder.publicKey.toBase58()}`)).json()))
+  }
   ok = relayed.certified && paid === 1_000_000_000n && vaultBefore - vaultAfter === 1_000_000_000n && left === '1500000000' && again.released.length === 0
 } finally {
   net.kill()
