@@ -31,7 +31,7 @@ const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); r
 const state = join(chain, '.ledger')
 rmSync(state, { recursive: true, force: true })
 mkdirSync(state, { recursive: true })
-const validator = spawn('bash', [join(chain, 'scripts/validator.sh'), state, '32', '--bpf-program', program, join(chain, 'target/deploy/acrux_bridge.so')], { stdio: 'ignore' })
+const validator = spawn('bash', [join(chain, 'scripts/validator.sh'), state, '32', '--upgradeable-program', program, join(chain, 'target/deploy/acrux_bridge.so'), devKeypair('local-authority').publicKey.toBase58()], { stdio: 'ignore' })
 const store = join(node, 'target/bridge-round-trip-check')
 rmSync(store, { recursive: true, force: true })
 mkdirSync(join(store, 'placements'), { recursive: true })
