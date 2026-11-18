@@ -3,7 +3,7 @@
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "info": {
     "title": "Acrux API",
-    "version": "0.1.11",
+    "version": "0.1.12",
     "description": "Round 1 fixture contract. Amounts are decimal integer strings. Times are relative microseconds with UTC slot wallTime."
   },
   "servers": [
@@ -84,6 +84,412 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Buyback"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/replay": {
+      "get": {
+        "operationId": "replay",
+        "summary": "The replayed mainnet range: totals and its sandwiches, newest first",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Fixture",
+            "required": false,
+            "description": "Fixture server only: a scenario, or an error code to force that error.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "normal",
+                "empty",
+                "waiting",
+                "pending",
+                "executed",
+                "finalized",
+                "skipped",
+                "sent",
+                "partly_included",
+                "failed",
+                "expired",
+                "unknown",
+                "active",
+                "inactive",
+                "pending_only",
+                "queued",
+                "running",
+                "done",
+                "failed_to_start",
+                "limit_reached",
+                "unfunded",
+                "stalled",
+                "unavailable",
+                "code_taken",
+                "crash",
+                "disagreeing_vectors",
+                "missing_attestation",
+                "equivocation",
+                "majority_lost",
+                "VALIDATION_ERROR",
+                "UNAUTHORIZED",
+                "ORIGIN_NOT_ALLOWED",
+                "NOT_FOUND",
+                "PROGRAM_UNAVAILABLE",
+                "CONFIGURATION_REQUIRED",
+                "IDEMPOTENCY_CONFLICT",
+                "TRANSACTION_EXPIRED",
+                "PAYLOAD_TOO_LARGE",
+                "UNSUPPORTED_MEDIA_TYPE",
+                "SIMULATION_FAILED",
+                "CHAIN_REFUSED",
+                "RATE_LIMITED",
+                "INTERNAL_ERROR",
+                "UPSTREAM_UNAVAILABLE",
+                "FAUCET_LIMIT",
+                "NET_STALLED",
+                "NET_UNAVAILABLE",
+                "INVALID_INPUT"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplayRange"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/replay/{slot}": {
+      "get": {
+        "operationId": "replaySlot",
+        "summary": "One replayed mainnet slot: both orders, the Acrux slots and its sandwiches repriced",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slot",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Count"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Fixture",
+            "required": false,
+            "description": "Fixture server only: a scenario, or an error code to force that error.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "normal",
+                "empty",
+                "waiting",
+                "pending",
+                "executed",
+                "finalized",
+                "skipped",
+                "sent",
+                "partly_included",
+                "failed",
+                "expired",
+                "unknown",
+                "active",
+                "inactive",
+                "pending_only",
+                "queued",
+                "running",
+                "done",
+                "failed_to_start",
+                "limit_reached",
+                "unfunded",
+                "stalled",
+                "unavailable",
+                "code_taken",
+                "crash",
+                "disagreeing_vectors",
+                "missing_attestation",
+                "equivocation",
+                "majority_lost",
+                "VALIDATION_ERROR",
+                "UNAUTHORIZED",
+                "ORIGIN_NOT_ALLOWED",
+                "NOT_FOUND",
+                "PROGRAM_UNAVAILABLE",
+                "CONFIGURATION_REQUIRED",
+                "IDEMPOTENCY_CONFLICT",
+                "TRANSACTION_EXPIRED",
+                "PAYLOAD_TOO_LARGE",
+                "UNSUPPORTED_MEDIA_TYPE",
+                "SIMULATION_FAILED",
+                "CHAIN_REFUSED",
+                "RATE_LIMITED",
+                "INTERNAL_ERROR",
+                "UPSTREAM_UNAVAILABLE",
+                "FAUCET_LIMIT",
+                "NET_STALLED",
+                "NET_UNAVAILABLE",
+                "INVALID_INPUT"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplaySlotRecord"
                 }
               }
             }
@@ -9081,6 +9487,972 @@
         ],
         "additionalProperties": false
       },
+      "ReplayAsset": {
+        "anyOf": [
+          {
+            "type": "string",
+            "const": "SOL"
+          },
+          {
+            "type": "string",
+            "minLength": 32,
+            "maxLength": 44
+          }
+        ]
+      },
+      "ReplayLeaderItem": {
+        "type": "object",
+        "properties": {
+          "signature": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 88
+          },
+          "priorityFeePerCu": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "computeLimit": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "signature",
+          "priorityFeePerCu",
+          "computeLimit"
+        ],
+        "additionalProperties": false
+      },
+      "ReplayMergedItem": {
+        "type": "object",
+        "properties": {
+          "signature": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 88
+          },
+          "priorityFeePerCu": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "acruxSlot": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "track": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4
+          },
+          "startCu": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "lengthCu": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "signature",
+          "priorityFeePerCu",
+          "acruxSlot",
+          "track",
+          "startCu",
+          "lengthCu"
+        ],
+        "additionalProperties": false
+      },
+      "ReplayRange": {
+        "type": "object",
+        "properties": {
+          "fromSlot": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "toSlot": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "slotsReplayed": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "transactions": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "acruxSlots": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "sandwichesFound": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "sandwichesPriced": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "lamportsTaken": {
+            "type": "string",
+            "maxLength": 79,
+            "pattern": "^-?(0|[1-9][0-9]*)$"
+          },
+          "lamportsKept": {
+            "type": "string",
+            "maxLength": 79,
+            "pattern": "^-?(0|[1-9][0-9]*)$"
+          },
+          "readAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sandwiches": {
+            "maxItems": 500,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "victim": {
+                  "type": "string",
+                  "minLength": 64,
+                  "maxLength": 88
+                },
+                "victimPosition": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "front": {
+                  "type": "string",
+                  "minLength": 64,
+                  "maxLength": 88
+                },
+                "frontPosition": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "back": {
+                  "type": "string",
+                  "minLength": 64,
+                  "maxLength": 88
+                },
+                "backPosition": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "trader": {
+                  "type": "string",
+                  "minLength": 32,
+                  "maxLength": 44
+                },
+                "bought": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "const": "SOL"
+                    },
+                    {
+                      "type": "string",
+                      "minLength": 32,
+                      "maxLength": 44
+                    }
+                  ]
+                },
+                "paid": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "const": "SOL"
+                    },
+                    {
+                      "type": "string",
+                      "minLength": 32,
+                      "maxLength": 44
+                    }
+                  ]
+                },
+                "vaults": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 32,
+                    "maxLength": 44
+                  }
+                },
+                "take": {
+                  "type": "string",
+                  "maxLength": 79,
+                  "pattern": "^-?(0|[1-9][0-9]*)$"
+                },
+                "repricing": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "pool": {
+                          "type": "string",
+                          "enum": [
+                            "pump-curve",
+                            "constant-product"
+                          ]
+                        },
+                        "victimGot": {
+                          "type": "string",
+                          "maxLength": 78,
+                          "pattern": "^(0|[1-9][0-9]*)$"
+                        },
+                        "victimWouldGet": {
+                          "type": "string",
+                          "maxLength": 78,
+                          "pattern": "^(0|[1-9][0-9]*)$"
+                        },
+                        "keptPaid": {
+                          "type": "string",
+                          "maxLength": 79,
+                          "pattern": "^-?(0|[1-9][0-9]*)$"
+                        },
+                        "outbidLamports": {
+                          "type": "string",
+                          "maxLength": 78,
+                          "pattern": "^(0|[1-9][0-9]*)$"
+                        },
+                        "takeAfterOutbid": {
+                          "type": "string",
+                          "maxLength": 79,
+                          "pattern": "^-?(0|[1-9][0-9]*)$"
+                        }
+                      },
+                      "required": [
+                        "pool",
+                        "victimGot",
+                        "victimWouldGet",
+                        "keptPaid",
+                        "outbidLamports",
+                        "takeAfterOutbid"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "slot": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "victim",
+                "victimPosition",
+                "front",
+                "frontPosition",
+                "back",
+                "backPosition",
+                "trader",
+                "bought",
+                "paid",
+                "vaults",
+                "take",
+                "repricing",
+                "slot"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "fromSlot",
+          "toSlot",
+          "slotsReplayed",
+          "transactions",
+          "acruxSlots",
+          "sandwichesFound",
+          "sandwichesPriced",
+          "lamportsTaken",
+          "lamportsKept",
+          "readAt",
+          "sandwiches"
+        ],
+        "additionalProperties": false
+      },
+      "ReplayRepricing": {
+        "type": "object",
+        "properties": {
+          "pool": {
+            "type": "string",
+            "enum": [
+              "pump-curve",
+              "constant-product"
+            ]
+          },
+          "victimGot": {
+            "type": "string",
+            "maxLength": 78,
+            "pattern": "^(0|[1-9][0-9]*)$"
+          },
+          "victimWouldGet": {
+            "type": "string",
+            "maxLength": 78,
+            "pattern": "^(0|[1-9][0-9]*)$"
+          },
+          "keptPaid": {
+            "type": "string",
+            "maxLength": 79,
+            "pattern": "^-?(0|[1-9][0-9]*)$"
+          },
+          "outbidLamports": {
+            "type": "string",
+            "maxLength": 78,
+            "pattern": "^(0|[1-9][0-9]*)$"
+          },
+          "takeAfterOutbid": {
+            "type": "string",
+            "maxLength": 79,
+            "pattern": "^-?(0|[1-9][0-9]*)$"
+          }
+        },
+        "required": [
+          "pool",
+          "victimGot",
+          "victimWouldGet",
+          "keptPaid",
+          "outbidLamports",
+          "takeAfterOutbid"
+        ],
+        "additionalProperties": false
+      },
+      "ReplaySandwich": {
+        "type": "object",
+        "properties": {
+          "victim": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 88
+          },
+          "victimPosition": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "front": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 88
+          },
+          "frontPosition": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "back": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 88
+          },
+          "backPosition": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "trader": {
+            "type": "string",
+            "minLength": 32,
+            "maxLength": 44
+          },
+          "bought": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "SOL"
+              },
+              {
+                "type": "string",
+                "minLength": 32,
+                "maxLength": 44
+              }
+            ]
+          },
+          "paid": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "SOL"
+              },
+              {
+                "type": "string",
+                "minLength": 32,
+                "maxLength": 44
+              }
+            ]
+          },
+          "vaults": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 32,
+              "maxLength": 44
+            }
+          },
+          "take": {
+            "type": "string",
+            "maxLength": 79,
+            "pattern": "^-?(0|[1-9][0-9]*)$"
+          },
+          "repricing": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "pool": {
+                    "type": "string",
+                    "enum": [
+                      "pump-curve",
+                      "constant-product"
+                    ]
+                  },
+                  "victimGot": {
+                    "type": "string",
+                    "maxLength": 78,
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  "victimWouldGet": {
+                    "type": "string",
+                    "maxLength": 78,
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  "keptPaid": {
+                    "type": "string",
+                    "maxLength": 79,
+                    "pattern": "^-?(0|[1-9][0-9]*)$"
+                  },
+                  "outbidLamports": {
+                    "type": "string",
+                    "maxLength": 78,
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  "takeAfterOutbid": {
+                    "type": "string",
+                    "maxLength": 79,
+                    "pattern": "^-?(0|[1-9][0-9]*)$"
+                  }
+                },
+                "required": [
+                  "pool",
+                  "victimGot",
+                  "victimWouldGet",
+                  "keptPaid",
+                  "outbidLamports",
+                  "takeAfterOutbid"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "victim",
+          "victimPosition",
+          "front",
+          "frontPosition",
+          "back",
+          "backPosition",
+          "trader",
+          "bought",
+          "paid",
+          "vaults",
+          "take",
+          "repricing"
+        ],
+        "additionalProperties": false
+      },
+      "ReplaySandwichRow": {
+        "type": "object",
+        "properties": {
+          "victim": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 88
+          },
+          "victimPosition": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "front": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 88
+          },
+          "frontPosition": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "back": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 88
+          },
+          "backPosition": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "trader": {
+            "type": "string",
+            "minLength": 32,
+            "maxLength": 44
+          },
+          "bought": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "SOL"
+              },
+              {
+                "type": "string",
+                "minLength": 32,
+                "maxLength": 44
+              }
+            ]
+          },
+          "paid": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "SOL"
+              },
+              {
+                "type": "string",
+                "minLength": 32,
+                "maxLength": 44
+              }
+            ]
+          },
+          "vaults": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 32,
+              "maxLength": 44
+            }
+          },
+          "take": {
+            "type": "string",
+            "maxLength": 79,
+            "pattern": "^-?(0|[1-9][0-9]*)$"
+          },
+          "repricing": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "pool": {
+                    "type": "string",
+                    "enum": [
+                      "pump-curve",
+                      "constant-product"
+                    ]
+                  },
+                  "victimGot": {
+                    "type": "string",
+                    "maxLength": 78,
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  "victimWouldGet": {
+                    "type": "string",
+                    "maxLength": 78,
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  "keptPaid": {
+                    "type": "string",
+                    "maxLength": 79,
+                    "pattern": "^-?(0|[1-9][0-9]*)$"
+                  },
+                  "outbidLamports": {
+                    "type": "string",
+                    "maxLength": 78,
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  "takeAfterOutbid": {
+                    "type": "string",
+                    "maxLength": 79,
+                    "pattern": "^-?(0|[1-9][0-9]*)$"
+                  }
+                },
+                "required": [
+                  "pool",
+                  "victimGot",
+                  "victimWouldGet",
+                  "keptPaid",
+                  "outbidLamports",
+                  "takeAfterOutbid"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "slot": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "victim",
+          "victimPosition",
+          "front",
+          "frontPosition",
+          "back",
+          "backPosition",
+          "trader",
+          "bought",
+          "paid",
+          "vaults",
+          "take",
+          "repricing",
+          "slot"
+        ],
+        "additionalProperties": false
+      },
+      "ReplaySlotRecord": {
+        "type": "object",
+        "properties": {
+          "slot": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "transactions": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "votesLeftOut": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "cuRequested": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "acruxSlots": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "transactions": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "cuPerTrack": {
+                  "minItems": 4,
+                  "maxItems": 4,
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  }
+                }
+              },
+              "required": [
+                "transactions",
+                "cuPerTrack"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "leaderOrder": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "signature": {
+                  "type": "string",
+                  "minLength": 64,
+                  "maxLength": 88
+                },
+                "priorityFeePerCu": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "computeLimit": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "signature",
+                "priorityFeePerCu",
+                "computeLimit"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "mergedOrder": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "signature": {
+                  "type": "string",
+                  "minLength": 64,
+                  "maxLength": 88
+                },
+                "priorityFeePerCu": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "acruxSlot": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "track": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4
+                },
+                "startCu": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "lengthCu": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "signature",
+                "priorityFeePerCu",
+                "acruxSlot",
+                "track",
+                "startCu",
+                "lengthCu"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "sandwiches": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "victim": {
+                  "type": "string",
+                  "minLength": 64,
+                  "maxLength": 88
+                },
+                "victimPosition": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "front": {
+                  "type": "string",
+                  "minLength": 64,
+                  "maxLength": 88
+                },
+                "frontPosition": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "back": {
+                  "type": "string",
+                  "minLength": 64,
+                  "maxLength": 88
+                },
+                "backPosition": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "trader": {
+                  "type": "string",
+                  "minLength": 32,
+                  "maxLength": 44
+                },
+                "bought": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "const": "SOL"
+                    },
+                    {
+                      "type": "string",
+                      "minLength": 32,
+                      "maxLength": 44
+                    }
+                  ]
+                },
+                "paid": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "const": "SOL"
+                    },
+                    {
+                      "type": "string",
+                      "minLength": 32,
+                      "maxLength": 44
+                    }
+                  ]
+                },
+                "vaults": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 32,
+                    "maxLength": 44
+                  }
+                },
+                "take": {
+                  "type": "string",
+                  "maxLength": 79,
+                  "pattern": "^-?(0|[1-9][0-9]*)$"
+                },
+                "repricing": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "pool": {
+                          "type": "string",
+                          "enum": [
+                            "pump-curve",
+                            "constant-product"
+                          ]
+                        },
+                        "victimGot": {
+                          "type": "string",
+                          "maxLength": 78,
+                          "pattern": "^(0|[1-9][0-9]*)$"
+                        },
+                        "victimWouldGet": {
+                          "type": "string",
+                          "maxLength": 78,
+                          "pattern": "^(0|[1-9][0-9]*)$"
+                        },
+                        "keptPaid": {
+                          "type": "string",
+                          "maxLength": 79,
+                          "pattern": "^-?(0|[1-9][0-9]*)$"
+                        },
+                        "outbidLamports": {
+                          "type": "string",
+                          "maxLength": 78,
+                          "pattern": "^(0|[1-9][0-9]*)$"
+                        },
+                        "takeAfterOutbid": {
+                          "type": "string",
+                          "maxLength": 79,
+                          "pattern": "^-?(0|[1-9][0-9]*)$"
+                        }
+                      },
+                      "required": [
+                        "pool",
+                        "victimGot",
+                        "victimWouldGet",
+                        "keptPaid",
+                        "outbidLamports",
+                        "takeAfterOutbid"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "victim",
+                "victimPosition",
+                "front",
+                "frontPosition",
+                "back",
+                "backPosition",
+                "trader",
+                "bought",
+                "paid",
+                "vaults",
+                "take",
+                "repricing"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "slot",
+          "transactions",
+          "votesLeftOut",
+          "cuRequested",
+          "acruxSlots",
+          "leaderOrder",
+          "mergedOrder",
+          "sandwiches"
+        ],
+        "additionalProperties": false
+      },
       "ScenarioId": {
         "type": "string",
         "enum": [
@@ -9287,6 +10659,11 @@
         "type": "string",
         "minLength": 64,
         "maxLength": 88
+      },
+      "SignedUnits": {
+        "type": "string",
+        "maxLength": 79,
+        "pattern": "^-?(0|[1-9][0-9]*)$"
       },
       "Skip": {
         "type": "object",

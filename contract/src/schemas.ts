@@ -105,6 +105,53 @@ export const BuybackRow = z.strictObject({
   id: z.string(), cycleId: z.string(), action: BuybackAction, signature: Signature,
   lamports: U64, tokenAmount: U64, createdAt: Timestamp,
 })
+/**
+ * Mainnet replay: recorded Solana mainnet blocks run through Acrux's merge and selection
+ * (`acrux replay --json`). Transactions are keyed by their base58 signature. An asset is a mint
+ * address or "SOL" (lamports and wrapped SOL); amounts are raw integer strings of that asset, signed
+ * where a trader or victim can come out behind.
+ */
+export const SignedUnits = z.string().max(79).regex(/^-?(0|[1-9][0-9]*)$/, 'Must be an integer string.')
+export const ReplayAsset = z.union([z.literal('SOL'), Address])
+export const ReplayLeaderItem = z.strictObject({ signature: Signature, priorityFeePerCu: Count, computeLimit: Count })
+export const ReplayMergedItem = z.strictObject({ signature: Signature, priorityFeePerCu: Count, acruxSlot: Count, track: z.number().int().min(1).max(4), startCu: Count, lengthCu: Count })
+export const ReplayRepricing = z.strictObject({
+  pool: z.enum(['pump-curve', 'constant-product']),
+  /** What the victim got of the asset it bought, and would have got with no front leg (sent 2-of-3). */
+  victimGot: BaseUnits, victimWouldGet: BaseUnits,
+  /** The difference valued in the asset the victim paid with, at its own price. */
+  keptPaid: SignedUnits,
+  /** Sent plain (t = 1): the cost of outbidding the victim's priority fee, and the trader's take after it. */
+  outbidLamports: BaseUnits, takeAfterOutbid: SignedUnits,
+})
+export const ReplaySandwich = z.strictObject({
+  victim: Signature, victimPosition: Count, front: Signature, frontPosition: Count, back: Signature, backPosition: Count,
+  trader: Address, bought: ReplayAsset, paid: ReplayAsset, vaults: z.array(Address),
+  /** What the two legs left the trader in the asset the victim paid with. */
+  take: SignedUnits,
+  repricing: ReplayRepricing.nullable(),
+})
+export const ReplaySlotRecord = z.strictObject({
+  slot: Count, transactions: Count, votesLeftOut: Count, cuRequested: Count,
+  acruxSlots: z.array(z.strictObject({ transactions: Count, cuPerTrack: z.array(Count).length(4) })),
+  leaderOrder: z.array(ReplayLeaderItem),
+  mergedOrder: z.array(ReplayMergedItem),
+  sandwiches: z.array(ReplaySandwich),
+})
+export const ReplaySandwichRow = ReplaySandwich.extend({ slot: Count })
+/** The replayed range with its totals; SOL-paid sandwiches sum into the lamport totals. */
+export const ReplayRange = z.strictObject({
+  fromSlot: Count.nullable(), toSlot: Count.nullable(), slotsReplayed: Count, transactions: Count, acruxSlots: Count,
+  sandwichesFound: Count, sandwichesPriced: Count, lamportsTaken: SignedUnits, lamportsKept: SignedUnits,
+  readAt: Timestamp.nullable(),
+  /** Newest first. */
+  sandwiches: z.array(ReplaySandwichRow).max(500),
+})
+export type ReplaySlotRecord = z.infer<typeof ReplaySlotRecord>
+export type ReplaySandwich = z.infer<typeof ReplaySandwich>
+export type ReplaySandwichRow = z.infer<typeof ReplaySandwichRow>
+export type ReplayRange = z.infer<typeof ReplayRange>
+
 export const Buyback = z.strictObject({
   status: z.enum(['waiting', 'live']), mint: Address.nullable(), wallet: Address,
   totals: z.strictObject({ claimedLamports: BaseUnits, swappedLamports: BaseUnits, acruxBought: BaseUnits, acruxBurned: BaseUnits }),

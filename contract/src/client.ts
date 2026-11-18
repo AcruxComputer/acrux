@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import { createHttp, type HttpOptions, type CallOptions } from './http.js'
-import { ApiError, Health, Hubs, Hub, Member, RegistryConfig, SchedulePreview, Facts, SpecMap, Transaction, FaucetRequest, FaucetGrant, FaucetStatus, LabScenario, LabRunRequest, LabRun, LabRuns, PageQuery, Buyback } from './schemas.js'
+import { ApiError, Health, Hubs, Hub, Member, RegistryConfig, SchedulePreview, Facts, SpecMap, Transaction, FaucetRequest, FaucetGrant, FaucetStatus, LabScenario, LabRunRequest, LabRun, LabRuns, PageQuery, Buyback, ReplayRange, ReplaySlotRecord } from './schemas.js'
 import { LabReplay } from './events.js'
 export function createClient(baseUrl: string, options: Omit<HttpOptions, 'apiError'> = {}) {
   const http = createHttp(baseUrl, { ...options, apiError: ApiError })
@@ -8,6 +8,8 @@ export function createClient(baseUrl: string, options: Omit<HttpOptions, 'apiErr
   return {
     health: (call?: CallOptions) => http.get('/health', Health, call),
     buyback: (call?: CallOptions) => http.get('/v1/buyback', Buyback, call),
+    replay: (call?: CallOptions) => http.get('/v1/replay', ReplayRange, call),
+    replaySlot: (slot: number, call?: CallOptions) => http.get(`/v1/replay/${slot}`, ReplaySlotRecord, call),
     hubs: (query: z.input<typeof PageQuery> = {}, call?: CallOptions) => http.get('/v1/hubs', Hubs, { ...call, query }),
     hub: (code: string, call?: CallOptions) => http.get(`/v1/hubs/${path(code)}`, Hub, call),
     registryConfig: (call?: CallOptions) => http.get('/v1/registry/config', RegistryConfig, call),

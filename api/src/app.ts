@@ -10,9 +10,10 @@ import {
 import {
   facts, faucetGrant, faucetStatus, fixtureErrors, hubs, labRuns, labRunsByState,
   makeFixtureTransaction, makeLabReplay, makeSchedulePreview, registryConfig, scenarios,
-  specMap, transactionsByState,
+  specMap, transactionsByState, replayRange, replaySlot,
 } from '@acrux/contract/fixtures'
 import { createApi } from './engines/server/app.js'
+import { emptyReplayRange } from './replay.js'
 import { ApiFailure, fail } from './engines/server/errors.js'
 import { fixtureScenario } from './engines/server/fixture.js'
 import { readJson, readParam, readQuery } from './engines/server/input.js'
@@ -53,6 +54,11 @@ export function createFixtureApi() {
     if (!settings.mint) return c.json(emptyBuyback(settings))
     if (!database) fail('CONFIGURATION_REQUIRED', 'Configure DATABASE_URL before reading buyback history.', { stage: 'read' })
     return c.json(await readBuyback(database.db, settings))
+  })
+  app.get('/v1/replay', c => c.json(c.get('scenario') === 'empty' ? emptyReplayRange() : replayRange))
+  app.get('/v1/replay/:slot', c => {
+    if (readParam(c, 'slot', z.coerce.number().int().nonnegative()) !== replaySlot.slot) fail('NOT_FOUND', 'This mainnet slot has not been replayed.')
+    return c.json(replaySlot)
   })
   app.get('/v1/hubs', c => {
     const scenario = c.get('scenario')

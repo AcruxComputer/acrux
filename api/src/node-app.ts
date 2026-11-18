@@ -20,6 +20,7 @@ import { NodeLab } from './node-lab.js'
 import { RegistryIndexer, acruxStake, hubView, memberView, regionOf, solanaStake, type Chain } from './registry.js'
 import { schedulePreview } from './schedule.js'
 import { readBuyback } from './buyback/read.js'
+import { readReplayRange } from './replay.js'
 import { createRpc } from './engines/rpc/client.js'
 import { rpcRelay } from './engines/rpc/relay.js'
 
@@ -82,6 +83,13 @@ export function createNodeApi() {
   })
   app.route('/v1/solana-rpc', rpcRelay({ rpc: solanaRelay, methods: SOLANA_RELAY_METHODS, readsPerMinute: 300, writesPerMinute: 20 }))
   app.get('/v1/buyback', async c => c.json(await readBuyback(db, { mint: env.ACRUX_MINT, wallet: env.LAUNCH_WALLET })))
+  // Mainnet replay, as scripts/replay-load.mjs recorded it with `acrux replay --json`.
+  app.get('/v1/replay', async c => c.json(await readReplayRange(db)))
+  app.get('/v1/replay/:slot', async c => {
+    const row = await db.replaySlot.findUnique({ where: { slot: BigInt(readParam(c, 'slot', z.coerce.number().int().nonnegative())) } })
+    if (!row) fail('NOT_FOUND', 'This mainnet slot has not been replayed.')
+    return c.json(row.record)
+  })
 
   // Hubs of both chains, each carrying its chain; `?chain=` narrows to one.
   app.get('/v1/hubs', async c => {

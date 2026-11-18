@@ -482,3 +482,4 @@ export const membershipFixtures = {
   moving: { ...hubs[0]!.members[0]!, pendingMove: 'TYO', effectiveEpoch: 43, cooldownUntilEpoch: 45 },
   leaving: { ...hubs[0]!.members[0]!, pendingLeave: true, effectiveEpoch: 43, cooldownUntilEpoch: 45 },
 }
+export { replaySlot, replayRange } from './replay-fixture.js'
