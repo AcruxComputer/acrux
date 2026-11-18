@@ -26,6 +26,9 @@ export function bridgeProgram(connection, wallet) {
   return new anchor.Program(idl, new anchor.AnchorProvider(connection, new anchor.Wallet(wallet), { commitment: 'confirmed' }))
 }
 
+/// The program's ProgramData account under the upgradeable loader, which `initialize` reads.
+export const upgradeData = (programId) => PublicKey.findProgramAddressSync([programId.toBuffer()], new PublicKey('BPFLoaderUpgradeab1e11111111111111111111111'))[0]
+
 export const pdas = (programId) => {
   const pda = (...seeds) => PublicKey.findProgramAddressSync(seeds, programId)[0]
   return {
@@ -98,7 +101,7 @@ const send = (program, instructions) => program.provider.sendAndConfirm(new Tran
 export async function seed(program, proof, epoch) {
   const { bridge, set } = pdas(program.programId)
   const payer = program.provider.wallet.publicKey
-  if (!(await program.provider.connection.getAccountInfo(bridge))) await program.methods.initialize(new anchor.BN(EPOCH_SLOTS)).accounts({ payer }).rpc()
+  if (!(await program.provider.connection.getAccountInfo(bridge))) await program.methods.initialize(new anchor.BN(EPOCH_SLOTS)).accounts({ payer, programData: upgradeData(program.programId) }).rpc()
   if (await program.provider.connection.getAccountInfo(set(epoch))) return
   const validators = proof.validators.map((key, i) => ({ key: new PublicKey(key), stake: new anchor.BN(proof.stakes[i]) }))
   await program.methods.initValidatorSet(new anchor.BN(epoch), validators).accounts({ authority: payer }).rpc()
@@ -167,4 +170,4 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const proof = await cblockProof(arg('acrux', 'http://127.0.0.1:4930'), Number(arg('cblock')))
   if (process.argv.includes('--seed')) await seed(program, proof, Math.floor((proof.consensusSlot * 4) / EPOCH_SLOTS))
   console.log(JSON.stringify(await relay(program, proof)))
-}
+        }

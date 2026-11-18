@@ -14,7 +14,7 @@ import {
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SYSVAR_INSTRUCTIONS_PUBKEY, SystemProgram, Transaction, sendAndConfirmTransaction } from '@solana/web3.js'
 import { chainDir, devKeypair } from '../scripts/dev-keys.mjs'
 import { RPC_URL } from '../scripts/registry.mjs'
-import { EPOCH_SLOTS, ed25519Instruction, outboxProof, pdas, voteMessage } from '../scripts/bridge-relay.mjs'
+import { EPOCH_SLOTS, ed25519Instruction, outboxProof, pdas, upgradeData, voteMessage } from '../scripts/bridge-relay.mjs'
 import { createAssociatedTokenAccountIdempotent } from '@solana/spl-token'
 
 const idl = JSON.parse(readFileSync(join(chainDir, 'target/idl/acrux_bridge.json'), 'utf8'))
@@ -44,9 +44,11 @@ before(async () => {
 })
 
 test('initialize: the bridge starts at deposit 0, once', async () => {
-  await program.methods.initialize(new anchor.BN(EPOCH_SLOTS)).accounts({ payer: depositor.publicKey }).rpc()
+  // The depositor is not the program's upgrade authority: rejected.
+  await assert.rejects(program.methods.initialize(new anchor.BN(EPOCH_SLOTS)).accounts({ payer: depositor.publicKey, programData: upgradeData(program.programId) }).rpc(), /NotUpgradeAuthority/)
+  await program.methods.initialize(new anchor.BN(EPOCH_SLOTS)).accounts({ payer: authority.publicKey, programData: upgradeData(program.programId) }).signers([authority]).rpc()
   assert.equal((await program.account.bridge.fetch(bridge)).deposits.toNumber(), 0)
-  await assert.rejects(program.methods.initialize(new anchor.BN(EPOCH_SLOTS)).accounts({ payer: depositor.publicKey }).rpc())
+  await assert.rejects(program.methods.initialize(new anchor.BN(EPOCH_SLOTS)).accounts({ payer: authority.publicKey, programData: upgradeData(program.programId) }).signers([authority]).rpc())
 })
 
 test('deposit: tokens lock in the mint\'s vault and each deposit is recorded in sequence', async () => {
@@ -121,8 +123,10 @@ test('light client: only the authority seeds a validator set', async () => {
   const stranger = Keypair.generate()
   await sendAndConfirmTransaction(connection, new Transaction().add(SystemProgram.transfer({ fromPubkey: depositor.publicKey, toPubkey: stranger.publicKey, lamports: LAMPORTS_PER_SOL })), [depositor])
   await assert.rejects(program.methods.initValidatorSet(new anchor.BN(0), asSet(validators)).accounts({ authority: stranger.publicKey }).signers([stranger]).rpc())
-  await program.methods.initValidatorSet(new anchor.BN(0), asSet(validators)).accounts({ authority: depositor.publicKey }).rpc()
+  await program.methods.initValidatorSet(new anchor.BN(0), asSet(validators)).accounts({ authority: authority.publicKey }).signers([authority]).rpc()
   assert.equal((await program.account.validatorSet.fetch(setOf(0))).total.toNumber(), 100)
+  // Seeded once: the authority is renounced and cannot seed another epoch.
+  await assert.rejects(program.methods.initValidatorSet(new anchor.BN(5), asSet(validators)).accounts({ authority: authority.publicKey }).signers([authority]).rpc())
 })
 
 test('light client: a cblock posts only with the preimage and root of its hash', async () => {
