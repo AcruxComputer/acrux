@@ -8,25 +8,28 @@ use serde_json::{json, Value};
 use redb::{Database, ReadableTable, TableDefinition};
 use solana_sdk::pubkey::Pubkey;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
     sync::{Arc, Mutex},
 };
 
 type Deposits = Arc<Mutex<BTreeMap<u64, BridgeCredit>>>;
+pub type ProofPrunes = Arc<Mutex<BTreeSet<u64>>>;
 
 const PROOFS: TableDefinition<u64, &[u8]> = TableDefinition::new("proofs");
 
 /// A bounded archive separate from the gateway's rolling window. It holds every withdrawal's
 /// proof and one cblock per bridge epoch, so a stopped relayer can also hand missed epochs on.
 /// A persistent net keeps it across restarts; the operator sizes its capacity for the downtime
-/// and withdrawal volume they support. Capacity exhaustion fails before another state checkpoint; accepted proofs are never evicted.
+/// and withdrawal volume they support. A full archive leaves new proofs in the rolling window;
+/// it never controls whether the chain can finalize another cblock.
 pub struct ProofArchive {
     pub proofs: BTreeMap<u64, Value>,
     pub epochs: BTreeMap<u64, u64>,
+    pub withdrawals: BTreeMap<u64, Vec<u64>>,
     capacity: usize,
-    epoch_slots: u64,
     db: Option<Database>,
+    full: bool,
 }
 
 impl ProofArchive {
@@ -39,7 +42,7 @@ impl ProofArchive {
             std::fs::create_dir_all(path.parent().context("bridge proof archive path")?)?;
             Ok(Database::create(path)?)
         }).transpose()?;
-        let mut archive = Self { proofs: BTreeMap::new(), epochs: BTreeMap::new(), capacity, epoch_slots, db };
+        let mut archive = Self { proofs: BTreeMap::new(), epochs: BTreeMap::new(), withdrawals: BTreeMap::new(), capacity, db, full: false };
         if let Some(db) = &archive.db {
             let w = db.begin_write()?;
             {
@@ -57,7 +60,6 @@ impl ProofArchive {
                         expired.push(slot.value());
                     }
                 }
-                anyhow::ensure!(archive.proofs.len() <= capacity, "Bridge proof archive exceeds ACRUX_BRIDGE_PROOF_MAX; increase the capacity; no saved proof was deleted");
                 for slot in expired {
                     table.remove(slot)?;
                 }
@@ -66,38 +68,76 @@ impl ProofArchive {
         }
         for slot in archive.proofs.keys() {
             archive.epochs.entry(slot * 4 / epoch_slots).or_insert(*slot);
+            archive.withdrawals.insert(*slot, withdrawal_sequences(&archive.proofs[slot])?);
         }
+        archive.check_capacity();
         Ok(archive)
     }
 
-    /// Called only for finalized cblocks. Returns whether the archive changed, and expired slots.
-    pub fn keep(&mut self, slot: u64, epoch: u64, withdrawal: bool, proof: &Value) -> Result<Option<Vec<u64>>> {
-        if !withdrawal && self.epochs.contains_key(&epoch) {
-            return Ok(None);
+    fn check_capacity(&mut self) {
+        let full = self.proofs.len() >= self.capacity;
+        if full && !self.full {
+            tracing::warn!(event = "bridge_proof_archive_full", capacity = self.capacity, held = self.proofs.len(),
+                "bridge proof archive is full; new proofs remain available in the rolling window");
         }
-        let expired = vec![];
-        anyhow::ensure!(self.proofs.len() < self.capacity || self.proofs.contains_key(&slot),
-            "Bridge proof archive is full; increase ACRUX_BRIDGE_PROOF_MAX before continuing; no saved proof was deleted");
+        self.full = full;
+    }
+
+    /// Called only for finalized cblocks. Capacity is a retention limit, never a consensus gate.
+    pub fn keep(&mut self, slot: u64, epoch: u64, withdrawal: bool, proof: &Value) -> Result<bool> {
+        if !withdrawal && self.epochs.contains_key(&epoch) {
+            return Ok(false);
+        }
+        if self.proofs.len() >= self.capacity && !self.proofs.contains_key(&slot) {
+            self.check_capacity();
+            return Ok(false);
+        }
+        let sequences = withdrawal_sequences(proof)?;
         if let Some(db) = &self.db {
             let w = db.begin_write()?;
             {
                 let mut table = w.open_table(PROOFS)?;
                 table.insert(slot, serde_json::to_vec(proof)?.as_slice())?;
-                for old in &expired { table.remove(*old)?; }
             }
             w.commit()?;
         }
         self.proofs.insert(slot, proof.clone());
-        for old in &expired {
-            self.proofs.remove(old);
-            tracing::warn!(cblock = old, capacity = self.capacity, "bridge proof archive capacity reached; oldest proof expired");
-        }
-        self.epochs.clear();
-        for held in self.proofs.keys() {
-            self.epochs.entry(held * 4 / self.epoch_slots).or_insert(*held);
-        }
-        Ok(Some(expired))
+        self.withdrawals.insert(slot, sequences);
+        self.epochs.entry(epoch).or_insert(slot);
+        self.check_capacity();
+        Ok(true)
     }
+
+    /// Only background reads agreed by both finalized RPCs can enqueue a paid proof here. An
+    /// epoch's representative remains even after payment, because it can still hand that epoch on.
+    pub fn prune_paid(&mut self, paid: &BTreeSet<u64>) -> Result<Vec<u64>> {
+        let representatives = self.epochs.values().copied().collect::<BTreeSet<_>>();
+        let remove = paid.iter().copied().filter(|slot| self.proofs.contains_key(slot) && !representatives.contains(slot)).collect::<Vec<_>>();
+        if remove.is_empty() { return Ok(remove) }
+        if let Some(db) = &self.db {
+            let w = db.begin_write()?;
+            { let mut table = w.open_table(PROOFS)?; for slot in &remove { table.remove(*slot)?; } }
+            w.commit()?;
+        }
+        for slot in &remove {
+            self.proofs.remove(slot);
+            self.withdrawals.remove(slot);
+        }
+        self.check_capacity();
+        tracing::info!(event = "bridge_proofs_pruned", count = remove.len(), held = self.proofs.len(), "paid bridge proofs pruned");
+        Ok(remove)
+    }
+}
+
+fn withdrawal_sequences(proof: &Value) -> Result<Vec<u64>> {
+    proof["outbox"].as_array().context("bridge proof outbox")?.iter().filter_map(|entry| {
+        let decode = || -> Result<OutboxEntry> { Ok(bincode::deserialize(&B64.decode(entry.as_str().context("bridge proof outbox entry")?)?)?) };
+        match decode() {
+            Ok(OutboxEntry::Withdrawal { sequence, .. }) => Some(Ok(sequence)),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }).collect()
 }
 
 /// Exactly two separately configured providers. Local checks may point both at one validator.
@@ -111,15 +151,62 @@ pub fn deposit_rpcs(value: &str) -> Result<[String; 2]> {
     Ok([urls[0].into(), urls[1].into()])
 }
 
-pub async fn read_deposits(urls: [String; 2], program: Pubkey, deposits: Deposits) {
+pub async fn read_deposits(urls: [String; 2], program: Pubkey, deposits: Deposits, gateway: Arc<tokio::sync::RwLock<crate::gateway::GatewayState>>, prunes: ProofPrunes) {
     let mut decimals = HashMap::new();
     loop {
         if read_new(&urls, &program, &deposits, &mut decimals).await.is_err() {
             // Provider errors can include keyed URLs. Neither addresses nor payloads go to logs.
             tracing::warn!("bridge deposit read failed: both RPCs must agree on finalized accounts");
         }
+        // Snapshot only sequences, not proof payloads, and leave every RPC await outside the
+        // gateway lock and the consensus actor. A failed/disputed bitmap never authorizes pruning.
+        let candidates = {
+            let state = gateway.read().await;
+            let representatives = state.epoch_cblock_proofs.values().copied().collect::<BTreeSet<_>>();
+            state.archived_withdrawals.iter().filter(|(slot, sequences)| !sequences.is_empty() && !representatives.contains(*slot))
+                .map(|(slot, sequences)| (*slot, sequences.clone())).collect::<Vec<_>>()
+        };
+        match paid_proofs(&urls, &program, &candidates).await {
+            Ok(paid) => prunes.lock().unwrap().extend(paid),
+            Err(_) => tracing::warn!("bridge release read failed: both RPCs must agree on finalized bitmaps"),
+        }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
+}
+
+const RELEASES_PER_BUCKET: u64 = 8192;
+const RELEASED_BYTES: usize = 8 + 8 + 1024;
+
+fn agreed_released(left: &Value, right: &Value, program: &Pubkey, bucket: u64) -> Result<Option<Vec<u8>>> {
+    for account in [left, right].into_iter().filter(|account| !account.is_null()) {
+        anyhow::ensure!(account["data"][1] == "base64", "released bitmap must use base64 encoding");
+    }
+    let bitmap = agree_values(left, right, Some(program))?;
+    if let Some(data) = &bitmap {
+        anyhow::ensure!(data.len() == RELEASED_BYTES && data.starts_with(&discriminator("Released")) && u64_at(data, 8)? == bucket,
+            "invalid Released bitmap layout or bucket");
+    }
+    Ok(bitmap)
+}
+
+/// A proof with several withdrawals is disposable only once every bit is finalized and agrees.
+async fn paid_proofs(urls: &[String; 2], program: &Pubkey, candidates: &[(u64, Vec<u64>)]) -> Result<BTreeSet<u64>> {
+    let buckets = candidates.iter().flat_map(|(_, sequences)| sequences.iter().map(|sequence| sequence / RELEASES_PER_BUCKET)).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+    let mut bitmaps = BTreeMap::new();
+    for batch in buckets.chunks(100) {
+        let addresses = batch.iter().map(|bucket| Pubkey::find_program_address(&[b"released", &bucket.to_le_bytes()], program).0.to_string()).collect::<Vec<_>>();
+        let params = json!([addresses, {"encoding":"base64", "commitment":"finalized"}]);
+        let (left, right) = tokio::try_join!(crate::cli::rpc(&urls[0], "getMultipleAccounts", params.clone()), crate::cli::rpc(&urls[1], "getMultipleAccounts", params))?;
+        let (left, right) = (left["value"].as_array().context("released bitmap accounts")?, right["value"].as_array().context("released bitmap accounts")?);
+        anyhow::ensure!(left.len() == batch.len() && right.len() == batch.len(), "wrong released bitmap account count");
+        for ((bucket, left), right) in batch.iter().zip(left).zip(right) {
+            bitmaps.insert(*bucket, agreed_released(left, right, program, *bucket)?);
+        }
+    }
+    Ok(candidates.iter().filter(|(_, sequences)| !sequences.is_empty() && sequences.iter().all(|sequence| {
+        let bit = (sequence % RELEASES_PER_BUCKET) as usize;
+        bitmaps[&(sequence / RELEASES_PER_BUCKET)].as_ref().is_some_and(|bitmap| bitmap[16 + bit / 8] & (1 << (bit % 8)) != 0)
+    })).map(|(slot, _)| *slot).collect())
 }
 
 fn data(value: &Value) -> Result<Option<Vec<u8>>> {
@@ -221,6 +308,60 @@ pub fn outbox_proof(entries: &[OutboxEntry], mut index: usize) -> Vec<(bool, [u8
 mod tests {
     use super::*;
     use axum::{extract::State, routing::post, Json, Router};
+
+    #[tokio::test]
+    async fn bridge_review_prunes_only_after_all_release_bits_agree_on_both_finalized_rpcs() {
+        let program = Pubkey::new_unique();
+        let proof = |slot, sequences: &[u64]| json!({"consensusSlot":slot,"epochSlots":432000,"outbox":sequences.iter().map(|sequence| {
+            B64.encode(bincode::serialize(&OutboxEntry::Withdrawal { sequence:*sequence, solana_mint:[1;32], recipient:[2;32], amount:1 }).unwrap())
+        }).collect::<Vec<_>>()});
+        let mut archive = ProofArchive { proofs:BTreeMap::new(), epochs:BTreeMap::new(), withdrawals:BTreeMap::new(), capacity:3, db:None, full:false };
+        archive.keep(7,0,true,&proof(7,&[0])).unwrap(); // epoch representative must remain after payment
+        archive.keep(8,0,true,&proof(8,&[1,8192])).unwrap();
+        archive.keep(9,0,true,&proof(9,&[2])).unwrap();
+        let candidates = vec![(8,vec![1,8192]),(9,vec![2])];
+        let bitmap = |bucket:u64, bits:&[usize]| {
+            let mut data = vec![0;RELEASED_BYTES]; data[..8].copy_from_slice(&discriminator("Released")); data[8..16].copy_from_slice(&bucket.to_le_bytes());
+            for bit in bits { data[16 + bit / 8] |= 1 << (bit % 8); }
+            json!({"owner":program.to_string(),"executable":false,"data":[B64.encode(data),"base64"]})
+        };
+        let partial = vec![bitmap(0,&[0,1]),bitmap(1,&[])];
+        let left_state = Arc::new(Mutex::new(partial.clone()));
+        let right_state = Arc::new(Mutex::new(vec![bitmap(0,&[0]),bitmap(1,&[])]));
+        async fn answer(State(accounts):State<Arc<Mutex<Vec<Value>>>>, Json(request):Json<Value>) -> Json<Value> {
+            assert_eq!(request["method"],"getMultipleAccounts");
+            assert_eq!(request["params"][1]["commitment"],"finalized");
+            Json(json!({"jsonrpc":"2.0","id":1,"result":{"value":accounts.lock().unwrap().clone()}}))
+        }
+        let left_socket = tokio::net::TcpListener::bind("127.0.0.1:5043").await.unwrap();
+        let right_socket = tokio::net::TcpListener::bind("127.0.0.1:5044").await.unwrap();
+        let left_app = Router::new().route("/",post(answer)).with_state(left_state.clone());
+        let right_app = Router::new().route("/",post(answer)).with_state(right_state.clone());
+        let left = tokio::spawn(async move { axum::serve(left_socket,left_app).await.unwrap() });
+        let right = tokio::spawn(async move { axum::serve(right_socket,right_app).await.unwrap() });
+        let urls = ["http://127.0.0.1:5043".into(),"http://127.0.0.1:5044".into()];
+        assert!(paid_proofs(&urls,&program,&candidates).await.is_err(), "one provider's paid bit cannot prune a proof");
+        *right_state.lock().unwrap() = partial.clone();
+        assert!(paid_proofs(&urls,&program,&candidates).await.unwrap().is_empty(), "every withdrawal in a proof must be paid");
+        let mut invalid = vec![];
+        let mut wrong_owner = partial.clone(); wrong_owner[0]["owner"] = Pubkey::new_unique().to_string().into(); invalid.push(wrong_owner);
+        let mut wrong_discriminator = partial.clone(); let mut bytes = B64.decode(wrong_discriminator[0]["data"][0].as_str().unwrap()).unwrap(); bytes[0] ^= 1; wrong_discriminator[0]["data"][0] = B64.encode(bytes).into(); invalid.push(wrong_discriminator);
+        let mut wrong_bucket = partial.clone(); wrong_bucket[0] = bitmap(1,&[0,1]); invalid.push(wrong_bucket);
+        let mut short = partial.clone(); short[0]["data"][0] = B64.encode([0;16]).into(); invalid.push(short);
+        for bad in invalid {
+            *left_state.lock().unwrap() = bad.clone(); *right_state.lock().unwrap() = bad;
+            assert!(paid_proofs(&urls,&program,&candidates).await.is_err(), "matching malformed bitmaps cannot prune proofs");
+        }
+        let complete = vec![bitmap(0,&[0,1]),bitmap(1,&[0])];
+        *left_state.lock().unwrap() = complete.clone(); *right_state.lock().unwrap() = complete;
+        let mut paid = paid_proofs(&urls,&program,&candidates).await.unwrap();
+        assert_eq!(paid,BTreeSet::from([8]));
+        paid.insert(7); // applying a stale candidate can never delete the epoch representative
+        assert_eq!(archive.prune_paid(&paid).unwrap(),vec![8]);
+        assert!(archive.proofs.contains_key(&7) && archive.proofs.contains_key(&9));
+        assert!(!archive.full, "pruning a fully paid proof releases archive capacity");
+        left.abort(); right.abort(); let _ = left.await; let _ = right.await;
+    }
 
     #[tokio::test]
     async fn bridge_review_two_rpcs_disagree_no_credit() {

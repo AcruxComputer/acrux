@@ -234,3 +234,21 @@ model BridgeRelayerState {
 
   @@map("bridge_relayer_states")
 }
+
+/// A pending or failed payout, with the signed cblock proof retained for later retry.
+model BridgeUnpaidWithdrawal {
+  program       String   @db.VarChar(44)
+  sequence      BigInt
+  cblock        BigInt
+  epoch         BigInt
+  reason        String?
+  attempts      Int      @default(0)
+  nextAttemptAt DateTime @map("next_attempt_at") @db.Timestamptz(3)
+  proof         Json
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@id([program, sequence])
+  @@index([program, nextAttemptAt])
+  @@map("bridge_unpaid_withdrawals")
+}

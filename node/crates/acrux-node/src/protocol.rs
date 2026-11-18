@@ -173,8 +173,9 @@ pub struct Network {
     /// Validator 0's cblock hash preimages (all but the outbox root) and outboxes, for the proofs.
     cblock_preimages: BTreeMap<u64, (Vec<u8>, Vec<crate::bridge::OutboxEntry>)>,
     bridge_proofs: Option<crate::bridge::ProofArchive>,
+    bridge_prunes: crate::bridge::ProofPrunes,
     /// Prepared and archived before the state checkpoint is saved, published after it is durable.
-    pending_bridge_proofs: BTreeMap<u64, (Value, Option<Vec<u64>>)>,
+    pending_bridge_proofs: BTreeMap<u64, (Value, bool)>,
     /// The finalized frontier whose ancestor proofs are prepared and whose checkpoint is queued.
     proof_prepared_through: Option<u64>,
     /// Finalized Solana bridge deposits by sequence, as the deposit reader found them.
@@ -491,6 +492,7 @@ impl Network {
         if let Some(archive) = &bridge_proofs {
             let mut state = gateway.write().await;
             state.archived_cblock_proofs = archive.proofs.clone();
+            state.archived_withdrawals = archive.withdrawals.clone();
             state.epoch_cblock_proofs = archive.epochs.clone();
         }
         let resumed = match &saved {
@@ -555,6 +557,7 @@ impl Network {
                     executor.set_placements(genesis.iter().flat_map(|g| g.placements.clone()).collect());
                     if let Some(bridge) = genesis.as_ref().and_then(|g| g.bridge.as_ref()) {
                         executor.set_bridge(bridge.program);
+                        executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
                     }
                     anyhow::ensure!(executor.state_hash() == saved.state.state_hash, "the saved state at cblock {} hashes to {}, not to its saved hash {}", block.slot, executor.state_hash(), saved.state.state_hash);
                     executor
@@ -565,6 +568,7 @@ impl Network {
                     executor.set_placements(genesis.iter().flat_map(|g| g.placements.clone()).collect());
                     if let Some(bridge) = genesis.as_ref().and_then(|g| g.bridge.as_ref()) {
                         executor.set_bridge(bridge.program);
+                        executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
                     }
                     executor.set_fees(crate::execution::Fees {
                         reserve_lamports: config.reserve,
@@ -674,8 +678,9 @@ impl Network {
             gateway.clone(), persistence.clone(), identities.clone(), exchange.clone(), profile.clone(),
         );
         let bridge_deposits = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let bridge_prunes = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
         if let (Some(bridge), Some(urls)) = (genesis.as_ref().and_then(|g| g.bridge.clone()), bridge_rpc_urls) {
-            tokio::spawn(crate::bridge::read_deposits(urls, bridge.program, bridge_deposits.clone()));
+            tokio::spawn(crate::bridge::read_deposits(urls, bridge.program, bridge_deposits.clone(), gateway.clone(), bridge_prunes.clone()));
         }
         Ok(Self {
             config,
@@ -715,6 +720,7 @@ impl Network {
             held_finals: Vec::new(),
             cblock_preimages: BTreeMap::new(),
             bridge_proofs,
+            bridge_prunes,
             pending_bridge_proofs: BTreeMap::new(),
             proof_prepared_through: resumed.map(|block| block.slot),
             bridge_deposits: bridge_deposits.clone(),
@@ -816,7 +822,8 @@ impl Network {
         }
         Ok(())
     }
-    /// No checkpoint may retain an ancestor's burn until that ancestor has a relayable proof.
+    /// No checkpoint may retain an ancestor's burn until its relayable proof is prepared.
+    /// Archive capacity only affects retention; it never gates this consensus checkpoint.
     /// Incoming votes wake dispatch again; held finalization events remain unpublished meanwhile.
     fn prepare_finalized_chain(&mut self, cblock: u64) -> Result<bool> {
         if !self.bridge_open(cblock * 4) { return Ok(true) }
@@ -836,20 +843,15 @@ impl Network {
         let Some((proof, archived)) = self.pending_bridge_proofs.remove(&c) else { return };
         let archive = self.bridge_proofs.as_ref().expect("bridge proof archive configured");
         let mut gateway = self.gateway.write().await;
-        if let Some(expired) = archived {
+        if archived {
             if archive.proofs.contains_key(&c) {
                 gateway.archived_cblock_proofs.insert(c, proof.clone());
+                gateway.archived_withdrawals.insert(c, archive.withdrawals[&c].clone());
             }
-            for slot in expired { gateway.archived_cblock_proofs.remove(&slot); }
-            gateway.epoch_cblock_proofs.clear();
-            let epoch_slots = proof["epochSlots"].as_u64().expect("proof epochSlots");
-            let slots = gateway.archived_cblock_proofs.keys().copied().collect::<Vec<_>>();
-            for slot in slots { gateway.epoch_cblock_proofs.entry(slot * 4 / epoch_slots).or_insert(slot); }
+            let epoch = c * 4 / proof["epochSlots"].as_u64().expect("proof epochSlots");
+            gateway.epoch_cblock_proofs.entry(epoch).or_insert(c);
         }
-        gateway.cblock_proofs.insert(c, proof);
-        while gateway.cblock_proofs.len() > 4096 {
-            gateway.cblock_proofs.pop_first();
-        }
+        gateway.keep_cblock_proof(c, proof);
     }
     /// Whether slot `s`'s blocks may carry bridge credits.
     fn bridge_open(&self, s: u64) -> bool {
@@ -1082,6 +1084,7 @@ impl Network {
                     held_finals: Vec::new(),
                     cblock_preimages: BTreeMap::new(),
                     bridge_proofs: if id == 0 { self.bridge_proofs.take() } else { None },
+                    bridge_prunes: self.bridge_prunes.clone(),
                     pending_bridge_proofs: BTreeMap::new(),
                     proof_prepared_through: self.proof_prepared_through,
                     bridge_deposits: self.bridge_deposits.clone(),
@@ -1159,6 +1162,25 @@ impl Network {
         Ok(())
     }
     async fn dispatch(&mut self, node: usize, step: Step) -> Result<()> {
+        if node == 0 && self.bridge_proofs.is_some() {
+            let paid = {
+                let mut queued = self.bridge_prunes.lock().unwrap();
+                let batch = queued.iter().take(100).copied().collect::<BTreeSet<_>>();
+                for slot in &batch { queued.remove(slot); }
+                batch
+            };
+            if let Some(archive) = &mut self.bridge_proofs {
+                let removed = archive.prune_paid(&paid)?;
+                if !removed.is_empty() {
+                    let mut gateway = self.gateway.write().await;
+                    for slot in removed {
+                        gateway.archived_cblock_proofs.remove(&slot);
+                        gateway.archived_withdrawals.remove(&slot);
+                    }
+                    gateway.epoch_cblock_proofs = archive.epochs.clone();
+                }
+            }
+        }
         if step.out.is_empty() && step.events.is_empty() && step.persist.is_empty() && self.held_finals.is_empty() {
             return Ok(());
         }

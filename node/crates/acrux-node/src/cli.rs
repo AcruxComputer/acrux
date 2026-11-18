@@ -129,6 +129,7 @@ pub async fn follow(url: &str, genesis: &str) -> Result<()> {
     executor.set_placements(genesis.placements.clone());
     if let Some(bridge) = &genesis.bridge {
         executor.set_bridge(bridge.program);
+        executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
     }
     let state: crate::execution::ExecutorSnapshot = serde_json::from_value(snapshot["executor"].clone())?;
     let start_hash = state.state_hash.clone();

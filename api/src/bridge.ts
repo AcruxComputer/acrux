@@ -12,6 +12,7 @@ export async function readBridgeRelayer(db: PrismaClient, program: string | null
   const state = await db.bridgeRelayerState.findUnique({ where: { program } })
   return state ? {
     wallet: state.wallet, lamports: state.lamports.toFixed(0),
+    unpaid: await db.bridgeUnpaidWithdrawal.count({ where: { program } }),
     lastCblock: state.lastCblock === null ? null : Number(state.lastCblock),
     lastHandedEpoch: state.lastHandedEpoch === null ? null : Number(state.lastHandedEpoch),
     lastRelayedAt: state.lastRelayedAt?.toISOString() ?? null,
@@ -148,12 +149,12 @@ export class BridgeReader {
     const acruxMint = (mint: string) => this.pda(Buffer.from('mint'), new PublicKey(mint).toBuffer()).toBase58()
     const deposits = [...this.deposits.values()].map((d): BridgeTransfer & { seenAt: number } => ({
       kind: 'deposit', sequence: d.sequence, status: d.sequence < this.credited ? 'credited' : 'locked', solanaMint: d.mint, acruxMint: acruxMint(d.mint),
-      amount: d.amount, from: d.depositor, to: d.recipient, solanaSlot: d.slot, acruxSlot: null, cblock: null, releaseAccount: null, seenAt: d.seenAt,
+      amount: d.amount, from: d.depositor, to: d.recipient, solanaSlot: d.slot, acruxSlot: null, cblock: null, releaseAccount: null, releaseError: null, seenAt: d.seenAt,
     }))
     const withdrawals = [...this.withdrawals.values()].map((w): BridgeTransfer & { seenAt: number } => ({
       kind: 'withdrawal', sequence: w.sequence, status: w.released ? 'released' : w.certified ? 'certified' : 'burned', solanaMint: w.solanaMint, acruxMint: acruxMint(w.solanaMint),
       amount: w.amount, from: w.owner, to: w.recipient, solanaSlot: null, acruxSlot: w.slot, cblock: Math.floor(w.slot / 4),
-      releaseAccount: w.released ? this.pda(Buffer.from('released'), u64(Math.floor(w.sequence / 8192))).toBase58() : null, seenAt: w.seenAt,
+      releaseAccount: w.released ? this.pda(Buffer.from('released'), u64(Math.floor(w.sequence / 8192))).toBase58() : null, releaseError: null, seenAt: w.seenAt,
     }))
     const rows = [...deposits, ...withdrawals]
       .filter(t => (!query.kind || t.kind === query.kind) && (!query.address || t.from === query.address || t.to === query.address))
@@ -161,4 +162,15 @@ export class BridgeReader {
       .map(({ seenAt, ...t }) => t)
     return paginate(rows, query)
   }
+}
+
+/** Attach durable payout failures to the existing chain read model without caching stale errors. */
+export async function readBridgeTransfers(db: PrismaClient, reader: BridgeReader, query: PageQuery & { address?: string; kind?: 'deposit' | 'withdrawal' }) {
+  const page = reader.transfers(query)
+  const sequences = page.items.filter(item => item.kind === 'withdrawal' && item.status !== 'released').map(item => BigInt(item.sequence))
+  if (!reader.program || !sequences.length) return page
+  const unpaid = await db.bridgeUnpaidWithdrawal.findMany({ where: { program: reader.program.toBase58(), sequence: { in: sequences } }, select: { sequence: true, reason: true } })
+  const errors = new Map(unpaid.map(row => [Number(row.sequence), row.reason]))
+  for (const item of page.items) if (item.kind === 'withdrawal' && item.status !== 'released') item.releaseError = errors.get(item.sequence) ?? null
+  return page
 }

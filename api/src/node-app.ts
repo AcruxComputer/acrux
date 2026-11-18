@@ -20,7 +20,7 @@ import { NodeLab } from './node-lab.js'
 import { RegistryIndexer, acruxStake, hubView, memberView, regionOf, solanaStake, type Chain } from './registry.js'
 import { schedulePreview } from './schedule.js'
 import { readBuyback } from './buyback/read.js'
-import { BridgeReader, readBridgeRelayer } from './bridge.js'
+import { BridgeReader, readBridgeRelayer, readBridgeTransfers } from './bridge.js'
 import { readReplayRange } from './replay.js'
 /** `?from=&to=`: the totals of one slot range, an epoch say. */
 const ReplayQuery = z.object({ from: z.coerce.number().int().nonnegative().optional(), to: z.coerce.number().int().nonnegative().optional() })
@@ -90,7 +90,7 @@ export function createNodeApi() {
   const bridge = new BridgeReader(env.BRIDGE_PROGRAM_ID || undefined, env.BRIDGE_FROM_SLOT === '' ? null : env.BRIDGE_FROM_SLOT, env.SOLANA_RPC_URL, env.GATEWAY_RPC_URL, env.BRIDGE_POLL_SECONDS * 1000)
   bridge.start()
   app.get('/v1/bridge', async c => c.json({ ...bridge.overview(), relayer: await readBridgeRelayer(db, bridge.program?.toBase58() ?? null) }))
-  app.get('/v1/bridge/transfers', c => c.json(bridge.transfers(readQuery(c, BridgeTransfersQuery))))
+  app.get('/v1/bridge/transfers', async c => c.json(await readBridgeTransfers(db, bridge, readQuery(c, BridgeTransfersQuery))))
   // Mainnet replay, as scripts/replay-load.mjs recorded it with `acrux replay --json`.
   app.get('/v1/replay', async c => c.json(await readReplayRange(db, readQuery(c, ReplayQuery))))
   app.get('/v1/replay/:slot', async c => {

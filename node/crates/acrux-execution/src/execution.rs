@@ -175,6 +175,17 @@ pub struct Placement {
     pub accounts: Vec<(Pubkey, Account)>,
 }
 
+/// A Solana mint's withdrawal floor, installed from the chain's bridge rule.
+#[derive(Clone, Debug)]
+pub struct MinimumWithdrawal {
+    pub mint: Pubkey,
+    pub amount: u64,
+}
+
+pub fn bridge_minimum(bridge: &Pubkey, mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"minimum", mint.as_ref()], bridge).0
+}
+
 pub trait Executor {
     fn validate_transaction(&self, bytes: &[u8], target_slot: u64) -> Result<ValidatedTx>;
     fn execute_slot(&mut self, slot: u64, items: Vec<ExecutionItem>) -> Result<SlotExecution>;
@@ -257,6 +268,8 @@ pub struct SvmExecutor {
     bridge: Option<Pubkey>,
     /// The credits the next executed slot applies, before its transactions.
     credits: Vec<BridgeCredit>,
+    /// Rule-owned minimum accounts enter committed state at the bridge activation slot.
+    bridge_minimums: Option<(u64, Vec<MinimumWithdrawal>)>,
 }
 
 impl SvmExecutor {
@@ -445,6 +458,7 @@ impl SvmExecutor {
             placements: vec![],
             bridge: None,
             credits: vec![],
+            bridge_minimums: None,
         };
         for program in [
             "ComputeBudget111111111111111111111111111111",
@@ -796,6 +810,30 @@ impl SvmExecutor {
         self.bridge = Some(bridge);
     }
 
+    pub fn set_bridge_minimums(&mut self, from_slot: u64, minimums: Vec<MinimumWithdrawal>) {
+        self.bridge_minimums = Some((from_slot, minimums));
+    }
+
+    /// Installs each configured floor before transactions, including after a rollback or a
+    /// follower's load. The program has no instruction that can change these accounts.
+    fn apply_bridge_minimums(&mut self, slot: u64) -> Result<()> {
+        let Some(bridge) = self.bridge else { return Ok(()) };
+        let Some((from_slot, minimums)) = &self.bridge_minimums else { return Ok(()) };
+        if slot < *from_slot { return Ok(()) }
+        for minimum in minimums.clone() {
+            let key = bridge_minimum(&bridge, &minimum.mint);
+            let mut data = Sha256::digest(b"account:MinimumWithdrawal")[..8].to_vec();
+            data.extend_from_slice(&minimum.amount.to_le_bytes());
+            let current = self.svm.get_account(&key);
+            let lamports = current.as_ref().map_or(0, |a| a.lamports).max(self.rent_exempt_minimum(data.len()));
+            let account = Account { lamports, data, owner: bridge, executable: false, rent_epoch: 0 };
+            if current.as_ref() != Some(&account) {
+                self.put(key, account)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The withdrawals burned in cblock `cblock` (its four slots), in sequence, read from the bridge
     /// program's records on Acrux: `(sequence, Solana mint, Solana recipient, amount)`.
     pub fn withdrawals(&self, cblock: u64) -> Vec<(u64, [u8; 32], [u8; 32], u64)> {
@@ -945,6 +983,7 @@ impl SvmExecutor {
     pub fn execute_slot(&mut self, slot: u64, items: Vec<ExecutionItem>) -> Result<SlotExecution> {
         self.set_slot_clock(slot)?;
         self.apply_placements(slot)?;
+        self.apply_bridge_minimums(slot)?;
         self.apply_credits()?;
         let mut merged = BTreeMap::<String, ExecutionItem>::new();
         for item in items {
@@ -1472,6 +1511,97 @@ mod tests {
         let record = executor.svm.get_account(&bridge_skipped_credit(&bridge, 1)).unwrap();
         assert_eq!(bincode::deserialize::<SkippedBridgeCredit>(&record.data).unwrap(), SkippedBridgeCredit { credit: overflow, reason: BridgeCreditSkipReason::BalanceOverflow });
         executor.execute_slot(2, vec![]).unwrap();
+    }
+
+    #[test]
+    fn withdrawal_below_configured_minimum_does_not_burn_or_write_a_record() {
+        use solana_sdk::instruction::{AccountMeta, Instruction};
+        let bridge = Pubkey::from_str("EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5").unwrap();
+        let programs = [GenesisProgram {
+            address: bridge.to_string(),
+            path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../chain/target/deploy/acrux_bridge.so"),
+        }];
+        let owner = Keypair::new();
+        let solana_mint = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let proposer = Pubkey::new_unique();
+        let ata_program = Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap();
+        let source = |solana_mint: &Pubkey| {
+            Pubkey::find_program_address(&[owner.pubkey().as_ref(), spl_token_id().as_ref(), bridge_mint(&bridge, solana_mint).as_ref()], &ata_program).0
+        };
+        let outbound = Pubkey::find_program_address(&[b"outbound"], &bridge).0;
+        let record = |sequence: u64| Pubkey::find_program_address(&[b"withdrawal", &sequence.to_le_bytes()], &bridge).0;
+        let minimum = bridge_minimum(&bridge, &solana_mint);
+        let mut executor = SvmExecutor::new([(owner.pubkey().to_string(), 100_000_000)], &programs).unwrap();
+        executor.set_proposers(&[(1, proposer.to_string())]).unwrap();
+        executor.set_bridge(bridge);
+        executor.set_bridge_minimums(4, vec![MinimumWithdrawal { mint: solana_mint, amount: 10 }]);
+        executor.execute_slot(3, vec![]).unwrap();
+        assert!(executor.svm.get_account(&minimum).is_none());
+        executor.set_credits(vec![BridgeCredit { sequence: 0, solana_mint: solana_mint.to_string(), decimals: 6, recipient: owner.pubkey().to_string(), amount: 100 }]);
+        executor.execute_slot(4, vec![]).unwrap();
+        let minimum_account = executor.svm.get_account(&minimum).unwrap();
+        assert_eq!(minimum_account.owner, bridge);
+        assert_eq!(&minimum_account.data[..8], &Sha256::digest(b"account:MinimumWithdrawal")[..8]);
+        assert_eq!(minimum_account.data[8..], 10u64.to_le_bytes());
+        let withdraw = |executor: &mut SvmExecutor, mint: Pubkey, amount: u64, sequence: u64, at: u64, minimum_key: Pubkey| {
+            let mut data = Sha256::digest(b"global:withdraw")[..8].to_vec();
+            data.extend_from_slice(mint.as_ref());
+            data.extend_from_slice(&amount.to_le_bytes());
+            data.extend_from_slice(recipient.as_ref());
+            let instruction = Instruction { program_id: bridge, accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(bridge_mint(&bridge, &mint), false),
+                AccountMeta::new_readonly(minimum_key, false),
+                AccountMeta::new(source(&mint), false),
+                AccountMeta::new(outbound, false),
+                AccountMeta::new(record(sequence), false),
+                AccountMeta::new_readonly(spl_token_id(), false),
+                AccountMeta::new_readonly(system_program::id(), false),
+            ], data };
+            let transaction = Transaction::new_signed_with_payer(&[instruction], Some(&owner.pubkey()), &[&owner], Hash::from_str(&executor.latest_blockhash()).unwrap());
+            let transaction = executor.validate_transaction(&bincode::serialize(&transaction).unwrap(), at).unwrap();
+            executor.execute_slot(at, vec![ExecutionItem { transaction, source_proposers: vec![1] }]).unwrap().results.remove(0)
+        };
+        let mint_before = executor.svm.get_account(&bridge_mint(&bridge, &solana_mint)).unwrap();
+        let source_before = executor.svm.get_account(&source(&solana_mint)).unwrap();
+        let failed = withdraw(&mut executor, solana_mint, 9, 0, 5, minimum);
+        assert!(!failed.success);
+        assert!(failed.logs.iter().any(|line| line.contains("BelowMinimumWithdrawal")), "{failed:?}");
+        assert_eq!(executor.svm.get_account(&bridge_mint(&bridge, &solana_mint)).unwrap(), mint_before);
+        assert_eq!(executor.svm.get_account(&source(&solana_mint)).unwrap(), source_before);
+        assert!(executor.svm.get_account(&outbound).is_none());
+        assert!(executor.svm.get_account(&record(0)).is_none());
+        let bypass = withdraw(&mut executor, solana_mint, 9, 0, 6, system_program::id());
+        assert!(!bypass.success, "a caller cannot replace the configured minimum PDA");
+        let paid = withdraw(&mut executor, solana_mint, 10, 0, 7, minimum);
+        assert!(paid.success, "{paid:?}");
+        assert_eq!(u64::from_le_bytes(executor.svm.get_account(&source(&solana_mint)).unwrap().data[64..72].try_into().unwrap()), 90);
+        assert_eq!(executor.svm.get_account(&record(0)).unwrap().data[112..120], 10u64.to_le_bytes());
+        assert_eq!(executor.svm.get_account(&minimum).unwrap(), minimum_account);
+
+        // The floor is committed account state: loading a checkpoint keeps it and its hash.
+        let checkpoint = executor.checkpoint();
+        let mut saved = executor.snapshot_meta(&checkpoint);
+        saved.accounts = checkpoint.account_changes(None).0.into_iter().map(|(key, account)| (key.to_string(), account.as_ref().clone())).collect();
+        saved.executed = checkpoint.executed_changes(None).0;
+        let mut restored = SvmExecutor::from_state(&programs, saved).unwrap();
+        restored.set_bridge(bridge);
+        restored.set_bridge_minimums(4, vec![MinimumWithdrawal { mint: solana_mint, amount: 10 }]);
+        restored.set_proposers(&[(1, proposer.to_string())]).unwrap();
+        assert_eq!(restored.svm.get_account(&minimum).unwrap(), minimum_account);
+        assert_eq!(restored.state_hash(), executor.state_hash());
+        for current in [&mut executor, &mut restored] { current.execute_slot(8, vec![]).unwrap(); }
+        assert_eq!(restored.state_hash(), executor.state_hash());
+
+        // A mint not named by the rule has no floor, even while another mint has one.
+        let unnamed = Pubkey::new_unique();
+        executor.set_credits(vec![BridgeCredit { sequence: 1, solana_mint: unnamed.to_string(), decimals: 6, recipient: owner.pubkey().to_string(), amount: 1 }]);
+        executor.execute_slot(9, vec![]).unwrap();
+        let no_floor = bridge_minimum(&bridge, &unnamed);
+        assert!(executor.svm.get_account(&no_floor).is_none());
+        let paid = withdraw(&mut executor, unnamed, 1, 1, 10, no_floor);
+        assert!(paid.success, "{paid:?}");
     }
 
     #[test]

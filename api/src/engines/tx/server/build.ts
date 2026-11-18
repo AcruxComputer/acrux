@@ -16,6 +16,8 @@ export const WALLET_GUARD_UNITS = 4_000
 
 export type BuildInput = {
   connection: Connection
+  /** A confirmed parent that this transaction depends on. */
+  minContextSlot?: number
   payer: PublicKey
   instructions: readonly TransactionInstruction[]
   lookupTables?: readonly AddressLookupTableAccount[]
@@ -58,7 +60,7 @@ export async function buildUnsignedV0(input: BuildInput): Promise<UnsignedBuild>
   // Callers' own budget instructions are replaced, never stacked.
   const instructions = input.instructions.filter((ix) => !ix.programId.equals(ComputeBudgetProgram.programId))
   await waitForLookupTables(connection, lookupTables)
-  const latest = await connection.getLatestBlockhashAndContext('confirmed')
+  const latest = await connection.getLatestBlockhashAndContext({ commitment: 'confirmed', minContextSlot: input.minContextSlot })
 
   const compile = (units: number, price: bigint) =>
     new VersionedTransaction(

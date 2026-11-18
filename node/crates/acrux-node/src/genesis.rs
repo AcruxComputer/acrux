@@ -12,7 +12,7 @@ use solana_sdk::{
     signature::Keypair,
     signer::{keypair::keypair_from_seed, Signer},
 };
-use std::{path::{Path, PathBuf}, str::FromStr};
+use std::{collections::BTreeMap, path::{Path, PathBuf}, str::FromStr};
 
 pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
@@ -107,9 +107,22 @@ pub struct BridgeConfig {
     /// The chain name whose SHA-256 prefixes votes from the bridge activation slot.
     #[serde(deserialize_with = "chain_id")]
     pub chain_id: String,
+    /// Minimum withdrawal base units per Solana mint. An unnamed mint has no minimum.
+    #[serde(default, deserialize_with = "minimum_withdrawals")]
+    pub min_withdrawal: BTreeMap<Pubkey, u64>,
 }
 impl BridgeConfig {
     pub fn chain_tag(&self) -> [u8; 32] { crate::crypto::hash(self.chain_id.as_bytes()) }
+}
+fn minimum_withdrawals<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<BTreeMap<Pubkey, u64>, D::Error> {
+    BTreeMap::<String, String>::deserialize(d)?.into_iter().map(|(mint, amount)| {
+        if amount.is_empty() || !amount.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(serde::de::Error::custom("minWithdrawal amounts must be unsigned decimal u64 strings"));
+        }
+        let mint = Pubkey::from_str(&mint).map_err(serde::de::Error::custom)?;
+        let amount = amount.parse::<u64>().map_err(serde::de::Error::custom)?;
+        Ok((mint, amount))
+    }).collect()
 }
 fn bridge_epoch_slots() -> u64 { 432_000 }
 fn chain_id<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {

@@ -95,6 +95,7 @@ pub struct GatewayState {
     pub cblock_proofs: BTreeMap<u64, Value>,
     /// Withdrawal proofs and one representative per bridge epoch, outside the rolling window.
     pub archived_cblock_proofs: BTreeMap<u64, Value>,
+    pub archived_withdrawals: BTreeMap<u64, Vec<u64>>,
     pub epoch_cblock_proofs: BTreeMap<u64, u64>,
     pub parameters: Value,
     pub balances: BTreeMap<String, u64>,
@@ -107,6 +108,10 @@ pub struct GatewayState {
 }
 
 impl GatewayState {
+    pub fn keep_cblock_proof(&mut self, slot: u64, proof: Value) {
+        self.cblock_proofs.insert(slot, proof);
+        while self.cblock_proofs.len() > 4096 { self.cblock_proofs.pop_first(); }
+    }
     pub fn new(commands: mpsc::Sender<GatewayCommand>) -> Self {
         let (events, _) = broadcast::channel(8192);
         Self {
@@ -120,6 +125,7 @@ impl GatewayState {
             facts: Value::Null,
             cblock_proofs: BTreeMap::new(),
             archived_cblock_proofs: BTreeMap::new(),
+            archived_withdrawals: BTreeMap::new(),
             epoch_cblock_proofs: BTreeMap::new(),
             counters: json!({"slots":0,"finalizedCblocks":0,"skips":0,"averageCommitSpreadUs":0}),
             counter_base: (0, 0),
@@ -347,7 +353,12 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
                 let proof = if let Some(slot) = slot {
                     state.cblock_proofs.get(&slot).or_else(|| state.archived_cblock_proofs.get(&slot))
                 } else if let Some(epoch) = epoch {
-                    state.epoch_cblock_proofs.get(&epoch).and_then(|slot| state.archived_cblock_proofs.get(slot))
+                    state.epoch_cblock_proofs.get(&epoch).and_then(|slot| state.archived_cblock_proofs.get(slot)).or_else(|| {
+                        state.cblock_proofs.iter().find_map(|(slot, proof)| {
+                            let epoch_slots = proof["epochSlots"].as_u64().filter(|length| *length > 0)?;
+                            (slot * 4 / epoch_slots == epoch).then_some(proof)
+                        })
+                    })
                 } else {
                     state.cblock_proofs.last_key_value().into_iter().chain(state.archived_cblock_proofs.last_key_value()).max_by_key(|(slot, _)| *slot).map(|(_, proof)| proof)
                 };
@@ -1174,29 +1185,39 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn bridge_review_withdrawal_proof_survives_capacity_and_restart() {
+    async fn bridge_review_full_archive_continues_serving_new_proofs_and_preserves_saved_proofs() {
         use crate::bridge::ProofArchive;
         let dir = std::path::Path::new("target").join(format!("bridge-review-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bridge-proofs.redb");
         let previous = std::env::var_os("ACRUX_BRIDGE_PROOF_MAX");
         std::env::set_var("ACRUX_BRIDGE_PROOF_MAX", "1");
-        let proof = json!({"consensusSlot":7,"epochSlots":432000,"hash":"withdrawal-proof"});
+        let outbox = |sequence| vec![base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bincode::serialize(&crate::bridge::OutboxEntry::Withdrawal {
+            sequence, solana_mint: [1;32], recipient: [2;32], amount: 10,
+        }).unwrap())];
+        let proof = json!({"consensusSlot":7,"epochSlots":432000,"hash":"saved-proof","outbox":outbox(0)});
+        let newer = json!({"consensusSlot":108000,"epochSlots":432000,"hash":"rolling-proof","outbox":outbox(1)});
         {
             let mut archive = ProofArchive::open(Some(&path),432000,Some(7)).unwrap();
-            archive.keep(7,0,true,&proof).unwrap();
-            assert!(archive.keep(8,0,true,&json!({"epochSlots":432000})).is_err(), "capacity must never evict an unpaid withdrawal proof");
+            assert!(archive.keep(7,0,true,&proof).unwrap());
+            assert!(!archive.keep(108000,1,true,&newer).unwrap(), "capacity must skip storage without stopping finalization or evicting saved proofs");
         }
         let archive = ProofArchive::open(Some(&path),432000,Some(7)).unwrap();
         if let Some(value) = previous { std::env::set_var("ACRUX_BRIDGE_PROOF_MAX",value); } else { std::env::remove_var("ACRUX_BRIDGE_PROOF_MAX"); }
         let (commands, _) = mpsc::channel(1);
         let mut state = GatewayState::new(commands);
         state.archived_cblock_proofs = archive.proofs.clone();
+        state.archived_withdrawals = archive.withdrawals.clone();
         state.epoch_cblock_proofs = archive.epochs.clone();
-        let response = rpc_one(Arc::new(RwLock::new(state)), "127.0.0.1".parse().unwrap(), json!({"jsonrpc":"2.0","id":1,"method":"getCblockProof","params":{"consensusSlot":7}})).await;
-        let bytes = axum::body::to_bytes(response.into_body(), 10000).await.unwrap();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["result"],proof);
+        // This is the same unconditional rolling publication used by protocol::record_proof.
+        state.keep_cblock_proof(108000, newer.clone());
+        let state = Arc::new(RwLock::new(state));
+        for (params, expected) in [(json!({"consensusSlot":7}), proof), (json!({"consensusSlot":108000}), newer.clone()), (json!({"epoch":1}), newer)] {
+            let response = rpc_one(state.clone(), "127.0.0.1".parse().unwrap(), json!({"jsonrpc":"2.0","id":1,"method":"getCblockProof","params":params})).await;
+            let bytes = axum::body::to_bytes(response.into_body(), 10000).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["result"], expected);
+        }
         drop(archive);
         std::fs::remove_dir_all(dir).unwrap();
     }

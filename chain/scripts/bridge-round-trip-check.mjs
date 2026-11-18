@@ -83,7 +83,7 @@ try {
   const made = (await acruxConnection.getAccountInfo(outbound)) ? (await onAcrux.account.outbound.fetch(outbound)).withdrawals.toNumber() : 0
   const withdrawal = PublicKey.findProgramAddressSync([Buffer.from('withdrawal'), u64(made)], onAcrux.programId)[0]
   const burned = await onAcrux.methods.withdraw(solanaMint, new anchor.BN(1_000_000_000), recipient)
-    .accountsPartial({ owner: holder.publicKey, mint: bridgedMint, source: new PublicKey(credited.pubkey), record: withdrawal, tokenProgram: TOKEN_PROGRAM_ID }).rpc()
+    .accountsPartial({ owner: holder.publicKey, mint: bridgedMint, minimum: PublicKey.findProgramAddressSync([Buffer.from('minimum'), solanaMint.toBuffer()], onAcrux.programId)[0], source: new PublicKey(credited.pubkey), record: withdrawal, tokenProgram: TOKEN_PROGRAM_ID }).rpc()
   const w = await onAcrux.account.withdrawal.fetch(withdrawal)
   const cblock = Math.floor(w.slot.toNumber() / 4)
   const left = (await rpc(gateway, 'getTokenAccountBalance', [credited.pubkey])).value.amount

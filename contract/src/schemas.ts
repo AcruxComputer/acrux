@@ -116,7 +116,7 @@ export const BridgeVault = z.strictObject({
 /** The newest cblock Solana's light client certified. */
 export const BridgeCertified = z.strictObject({ consensusSlot: Count, epoch: Count, hash: Hash, outboxRoot: Hash, account: Address })
 export const BridgeRelayer = z.strictObject({
-  wallet: Address, lamports: U64, lastCblock: Count.nullable(), lastHandedEpoch: Count.nullable(), lastRelayedAt: Timestamp.nullable(),
+  wallet: Address, lamports: U64, unpaid: Count, lastCblock: Count.nullable(), lastHandedEpoch: Count.nullable(), lastRelayedAt: Timestamp.nullable(),
 })
 export const Bridge = z.strictObject({
   status: z.enum(['waiting', 'live']),
@@ -148,6 +148,8 @@ export const BridgeTransfer = z.strictObject({
   acruxSlot: Count.nullable(), cblock: Count.nullable(),
   /** The bitmap account on Solana containing this withdrawal's released bit. */
   releaseAccount: Address.nullable(),
+  /** Last failed payout reason while the withdrawal remains unpaid. */
+  releaseError: z.string().nullable(),
 })
 export const BridgeTransfers = page(BridgeTransfer)
 export const BridgeTransfersQuery = PageQuery.extend({ address: Address.optional(), kind: z.enum(['deposit', 'withdrawal']).optional() })

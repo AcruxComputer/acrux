@@ -973,6 +973,29 @@ export const ACRUX_BRIDGE_IDL = {
      }
     },
     {
+     "name": "minimum",
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         109,
+         105,
+         110,
+         105,
+         109,
+         117,
+         109
+        ]
+       },
+       {
+        "kind": "arg",
+        "path": "solana_mint"
+       }
+      ]
+     }
+    },
+    {
      "name": "source",
      "writable": true
     },
@@ -1230,6 +1253,16 @@ export const ACRUX_BRIDGE_IDL = {
    "code": 6011,
    "name": "AlreadyReleased",
    "msg": "This withdrawal has already been released."
+  },
+  {
+   "code": 6012,
+   "name": "InvalidMinimum",
+   "msg": "The withdrawal minimum account is invalid."
+  },
+  {
+   "code": 6013,
+   "name": "BelowMinimumWithdrawal",
+   "msg": "The withdrawal amount is below this mint's configured minimum."
   }
  ],
  "types": [

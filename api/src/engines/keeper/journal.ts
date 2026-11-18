@@ -3,7 +3,7 @@
 // follows the same signature instead of signing anew, and an action is rebuilt only after its
 // transaction provably expired. A missing status never authorizes a replacement.
 
-import type { AddressLookupTableAccount, Connection, Keypair, TransactionInstruction } from '@solana/web3.js'
+import { SendTransactionError, type AddressLookupTableAccount, type Connection, type Keypair, type TransactionInstruction } from '@solana/web3.js'
 import { buildUnsignedV0, type UnsignedBuild } from '../tx/server/build.js'
 import { signatureOf } from '../tx/server/ed25519.js'
 import { failureFromLogs, type ErrorRegistry } from '../tx/server/failure.js'
@@ -35,6 +35,8 @@ export type JournalOptions = {
   connection: Connection
   store: KeeperTxStore
   signer: Keypair
+  /** Latest confirmed dependency; its account state must be visible during the build. */
+  minContextSlot?: () => number
   lookupTables?: () => Promise<AddressLookupTableAccount[]>
   microLamports?: () => Promise<bigint>
   /** extra instructions every keeper transaction carries (a Sender tip) */
@@ -56,8 +58,14 @@ export function createJournal(options: JournalOptions) {
   const own = () => {
     if (!isLeader()) throw new Error('KEEPER_NOT_LEADER')
   }
-  const send = (bytes: Uint8Array) =>
-    options.broadcast ? options.broadcast(bytes) : connection.sendRawTransaction(bytes, { skipPreflight: true, maxRetries: 0 })
+  const send = (bytes: Uint8Array, contextSlot: number) =>
+    options.broadcast ? options.broadcast(bytes) : connection.sendRawTransaction(bytes, {
+      // web3.js 1.98 forces processed when skipPreflight is true. Confirmed dependencies
+      // (notably a newly certified cblock used by hand_off) must use the confirmed bank.
+      skipPreflight: !options.minContextSlot,
+      ...(options.minContextSlot ? { preflightCommitment: 'confirmed' as const, minContextSlot: contextSlot } : {}),
+      maxRetries: 0,
+    })
 
   /** Follows the journaled transaction; throws on failure or expiry, 'pending' when still unseen. */
   async function follow(key: string): Promise<FollowResult> {
@@ -93,7 +101,16 @@ export function createJournal(options: JournalOptions) {
         } else if (Date.now() >= nextSend) {
           own()
           nextSend = Date.now() + REBROADCAST_MS
-          await send(Uint8Array.from(bytes)).catch(() => {}) // ambiguity is read, not retried blindly
+          try {
+            await send(Uint8Array.from(bytes), row.contextSlot)
+          } catch (error) {
+            if (error instanceof SendTransactionError && error.message.startsWith('Simulation failed')) {
+              // Surface a deterministic preflight refusal, but retain the original bytes: an
+              // earlier broadcast may still exist. Only status or proven expiry can retire it.
+              throw failureFromLogs('send', error.logs, options.registry, error.message)
+            }
+            // Transport ambiguity is read on the next poll, never replaced with new bytes.
+          }
         }
       }
       await pause(1_000)
@@ -106,19 +123,14 @@ export function createJournal(options: JournalOptions) {
    * simulate, journal, then send.
    */
   async function execute(key: string, instructions: () => Promise<TransactionInstruction[]> | TransactionInstruction[], prepared?: UnsignedBuild): Promise<FollowResult> {
-    let existing = await store.get(key)
+    const existing = await store.get(key)
     if (existing?.state === 'confirmed') return 'confirmed'
-    // A confirmed chain failure cannot later spend. The scheduler has already backed the
-    // action off; its next attempt may safely replace those bytes under the same action key.
-    if (existing?.state === 'failed') {
-      await store.update(key, { state: 'expired' })
-      existing = { ...existing, state: 'expired' }
-    }
     if (!existing || existing.state === 'expired') {
       own()
       const [tables, price] = await Promise.all([options.lookupTables?.() ?? [], options.microLamports?.() ?? 0n])
       const build = prepared ?? await buildUnsignedV0({
         connection,
+        minContextSlot: options.minContextSlot?.(),
         payer: signer.publicKey,
         instructions: [...(await instructions()), ...(options.extra?.(signer) ?? [])],
         lookupTables: tables,
@@ -127,7 +139,7 @@ export function createJournal(options: JournalOptions) {
         registry: options.registry,
       })
       build.transaction.sign([signer])
-      const { value } = await connection.simulateTransaction(build.transaction, { sigVerify: true, commitment: 'confirmed' })
+      const { value } = await connection.simulateTransaction(build.transaction, { sigVerify: true, commitment: 'confirmed', ...(options.minContextSlot ? { minContextSlot: build.contextSlot } : {}) })
       if (value.err) throw failureFromLogs('simulation', value.logs, options.registry)
       own()
       const row: KeeperTxRow = {

@@ -143,6 +143,17 @@ pub mod acrux_bridge {
     /// the withdrawal to `recipient` on Solana at `["withdrawal", sequence]`, for the cblock's outbox.
     pub fn withdraw(ctx: Context<Withdraw>, solana_mint: Pubkey, amount: u64, recipient: Pubkey) -> Result<()> {
         require!(amount > 0, BridgeError::ZeroAmount);
+        let configured = &ctx.accounts.minimum;
+        require!(!configured.executable, BridgeError::InvalidMinimum);
+        let minimum = if configured.owner == &anchor_lang::system_program::ID && configured.data_is_empty() {
+            0
+        } else {
+            require_keys_eq!(*configured.owner, crate::ID, BridgeError::InvalidMinimum);
+            let data = configured.try_borrow_data()?;
+            require!(data.len() == 16 && data[..8] == MinimumWithdrawal::DISCRIMINATOR[..], BridgeError::InvalidMinimum);
+            u64::from_le_bytes(data[8..16].try_into().unwrap())
+        };
+        require!(amount >= minimum, BridgeError::BelowMinimumWithdrawal);
         burn(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -315,6 +326,14 @@ pub struct DepositRecord {
 pub struct Outbound {
     pub withdrawals: u64,
     pub bump: u8,
+}
+
+/// Acrux's rule installs this account before transactions at the bridge activation slot.
+/// There is no program instruction that changes it.
+#[account]
+#[derive(InitSpace)]
+pub struct MinimumWithdrawal {
+    pub amount: u64,
 }
 
 /// On Acrux: one withdrawal, at `["withdrawal", sequence]`.
@@ -498,6 +517,9 @@ pub struct Withdraw<'info> {
     pub owner: Signer<'info>,
     #[account(mut, seeds = [b"mint", solana_mint.as_ref()], bump, mint::token_program = token_program)]
     pub mint: InterfaceAccount<'info, Mint>,
+    /// CHECK: the exact per-mint PDA is mandatory; the handler validates its owner and data.
+    #[account(seeds = [b"minimum", solana_mint.as_ref()], bump)]
+    pub minimum: UncheckedAccount<'info>,
     #[account(mut, token::mint = mint, token::authority = owner, token::token_program = token_program)]
     pub source: InterfaceAccount<'info, TokenAccount>,
     #[account(init_if_needed, payer = owner, space = 8 + Outbound::INIT_SPACE, seeds = [b"outbound"], bump)]
@@ -589,4 +611,8 @@ pub enum BridgeError {
     BadChainId,
     #[msg("This withdrawal has already been released.")]
     AlreadyReleased,
+    #[msg("The withdrawal minimum account is invalid.")]
+    InvalidMinimum,
+    #[msg("The withdrawal amount is below this mint's configured minimum.")]
+    BelowMinimumWithdrawal,
 }
