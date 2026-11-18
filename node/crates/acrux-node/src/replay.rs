@@ -5,6 +5,7 @@
 use crate::selection::{select_with_fees, sort_transactions, Candidate, Selection, TRACKS, TRACK_CAPACITY_CU};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 
 const COMPUTE_BUDGET: &str = "ComputeBudget111111111111111111111111111111";
 const VOTE: &str = "Vote111111111111111111111111111111111111111";
@@ -98,6 +99,158 @@ fn group(n: u64) -> String {
     out
 }
 
+const WSOL: &str = "So11111111111111111111111111111111111111112";
+
+/// What one transaction moved: each owner's net change per asset across the token accounts it
+/// owns (the signer's lamports counted as SOL), and every token account whose balance changed,
+/// with its owner. Wrapped SOL counts as SOL.
+#[derive(Clone, Debug)]
+pub struct Flow {
+    pub index: usize,
+    pub signature: String,
+    pub signer: String,
+    /// Raw units per asset ("SOL" for lamports and wrapped SOL), per owner.
+    pub holdings: BTreeMap<String, BTreeMap<String, i128>>,
+    pub decimals: BTreeMap<String, u8>,
+    /// Changed token accounts and their owners.
+    pub changed: BTreeMap<String, String>,
+}
+
+impl Flow {
+    fn delta(&self, owner: &str, asset: &str) -> i128 {
+        self.holdings.get(owner).and_then(|h| h.get(asset)).copied().unwrap_or(0)
+    }
+    /// The changed accounts that belong to neither of these owners: the pools'.
+    fn pool(&self, others: &[&str]) -> BTreeSet<String> {
+        self.changed.iter().filter(|(_, owner)| !others.contains(&owner.as_str())).map(|(account, _)| account.clone()).collect()
+    }
+}
+
+/// Every successful non-vote transaction's flow, in the leader's order.
+pub fn flows(block: &Value) -> Vec<Flow> {
+    let mut out = vec![];
+    for (index, entry) in block["transactions"].as_array().into_iter().flatten().enumerate() {
+        let meta = &entry["meta"];
+        if !meta["err"].is_null() {
+            continue;
+        }
+        let message = &entry["transaction"]["message"];
+        let mut keys = message["accountKeys"].as_array().cloned().unwrap_or_default();
+        keys.extend(meta["loadedAddresses"]["writable"].as_array().cloned().unwrap_or_default());
+        keys.extend(meta["loadedAddresses"]["readonly"].as_array().cloned().unwrap_or_default());
+        let keys = keys.iter().map(|k| k.as_str().unwrap_or_default().to_owned()).collect::<Vec<_>>();
+        if keys.iter().any(|k| k == VOTE) {
+            continue;
+        }
+        let Some(signer) = keys.first().cloned() else { continue };
+        let asset = |mint: &str| if mint == WSOL { "SOL".to_owned() } else { mint.to_owned() };
+        let mut holdings = BTreeMap::<String, BTreeMap<String, i128>>::new();
+        let mut decimals = BTreeMap::from([("SOL".to_owned(), 9u8)]);
+        let mut changed = BTreeMap::new();
+        // Each token account's mint, owner, and balance before and after, by its index.
+        let mut balances = BTreeMap::<u64, (String, String, i128, i128)>::new();
+        for (after, list) in [(false, &meta["preTokenBalances"]), (true, &meta["postTokenBalances"])] {
+            for b in list.as_array().into_iter().flatten() {
+                let Some(i) = b["accountIndex"].as_u64() else { continue };
+                let raw = b["uiTokenAmount"]["amount"].as_str().and_then(|a| a.parse::<i128>().ok()).unwrap_or(0);
+                let mint = b["mint"].as_str().unwrap_or_default().to_owned();
+                decimals.insert(asset(&mint), b["uiTokenAmount"]["decimals"].as_u64().unwrap_or(0) as u8);
+                let e = balances.entry(i).or_insert((mint, b["owner"].as_str().unwrap_or_default().to_owned(), 0, 0));
+                if after { e.3 = raw } else { e.2 = raw }
+            }
+        }
+        for (i, (mint, owner, before, after)) in balances {
+            if after == before {
+                continue;
+            }
+            *holdings.entry(owner.clone()).or_default().entry(asset(&mint)).or_default() += after - before;
+            if let Some(account) = keys.get(i as usize) {
+                changed.insert(account.clone(), owner);
+            }
+        }
+        // The signer's lamports with the fee given back: a swap paid or paid out in native SOL.
+        let lamports = meta["postBalances"][0].as_i64().unwrap_or(0) as i128 - meta["preBalances"][0].as_i64().unwrap_or(0) as i128 + meta["fee"].as_i64().unwrap_or(0) as i128;
+        *holdings.entry(signer.clone()).or_default().entry("SOL".into()).or_default() += lamports;
+        for h in holdings.values_mut() {
+            h.retain(|_, d| *d != 0);
+        }
+        holdings.retain(|_, h| !h.is_empty());
+        out.push(Flow { index, signature: entry["transaction"]["signatures"][0].as_str().unwrap_or_default().to_owned(), signer, holdings, decimals, changed });
+    }
+    out
+}
+
+/// Three transactions on one pool in one block: a front leg in which a trader buys what the
+/// victim buys, the victim, and a back leg in which the same trader sells it back. The trader is
+/// the owner of the accounts that hold the front leg's tokens, whoever signs; the victim signs its own.
+#[derive(Clone, Debug)]
+pub struct Sandwich {
+    pub front: Flow,
+    pub victim: Flow,
+    pub back: Flow,
+    pub trader: String,
+    pub victim_owner: String,
+    /// The asset the victim bought and the one it paid with.
+    pub bought: String,
+    pub paid: String,
+    pub vaults: Vec<String>,
+}
+
+impl Sandwich {
+    /// What the two legs left the trader in the asset the victim paid with, raw units.
+    pub fn take(&self) -> i128 {
+        self.front.delta(&self.trader, &self.paid) + self.back.delta(&self.trader, &self.paid)
+    }
+}
+
+pub fn sandwiches(flows: &[Flow]) -> Vec<Sandwich> {
+    let mut found: Vec<Sandwich> = vec![];
+    for (f, front) in flows.iter().enumerate() {
+        for (trader, held) in &front.holdings {
+            let bought = held.iter().filter(|(_, d)| **d > 0).map(|(a, _)| a.clone()).collect::<Vec<_>>();
+            let paid = held.iter().filter(|(_, d)| **d < 0).map(|(a, _)| a.clone()).collect::<Vec<_>>();
+            for back in &flows[f + 1..] {
+                for x in &bought {
+                    for y in &paid {
+                        // The back leg sells what the front leg bought (the same amount, within 2%),
+                        // for more of what it paid with than the front leg spent.
+                        let (got, sold) = (front.delta(trader, x), -back.delta(trader, x));
+                        if !(sold * 100 >= got * 98 && sold * 100 <= got * 102 && back.delta(trader, y) > 0 && front.delta(trader, y) + back.delta(trader, y) > 0) {
+                            continue;
+                        }
+                        let pool = front.pool(&[trader]).intersection(&back.pool(&[trader])).cloned().collect::<BTreeSet<_>>();
+                        if pool.is_empty() {
+                            continue;
+                        }
+                        // A pool's own authority also gains and loses both assets; it is told
+                        // apart by the victim's trade moving its accounts, which a trader's it never does.
+                        for victim in flows.iter().filter(|v| v.index > front.index && v.index < back.index && !v.changed.values().any(|o| o == trader)) {
+                            for (owner, _) in victim.holdings.iter().filter(|(o, _)| **o == victim.signer && *o != trader) {
+                                if !(victim.delta(owner, x) > 0 && victim.delta(owner, y) < 0) {
+                                    continue;
+                                }
+                                let shared = victim.pool(&[owner, trader]).intersection(&pool).cloned().collect::<Vec<_>>();
+                                if shared.is_empty() || found.iter().any(|s| s.victim.signature == victim.signature) {
+                                    continue;
+                                }
+                                found.push(Sandwich { front: front.clone(), victim: victim.clone(), back: back.clone(), trader: trader.clone(), victim_owner: owner.clone(), bought: x.clone(), paid: y.clone(), vaults: shared });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+fn amount(raw: i128, decimals: u8) -> String {
+    let scale = 10i128.pow(decimals as u32);
+    let fraction = format!("{:0width$}", raw.abs() % scale, width = decimals as usize);
+    let fraction = fraction.trim_end_matches('0');
+    format!("{}{}{}{}", if raw < 0 { "-" } else { "" }, group((raw.abs() / scale) as u64), if fraction.is_empty() { "" } else { "." }, fraction)
+}
+
 /// Reads the block, places it and prints both orders: the leader's, and Acrux's merged order
 /// with each transaction's Acrux slot, track and start.
 pub async fn run(file: Option<&str>, rpc: Option<&str>, slot: Option<u64>, save: Option<&str>, rows: usize) -> Result<()> {
@@ -157,6 +310,16 @@ pub async fn run(file: Option<&str>, rpc: Option<&str>, slot: Option<u64>, save:
     }
     println!();
     println!("The block took {} Acrux slots of {} tracks × {} CU.", slots.len(), TRACKS, group(TRACK_CAPACITY_CU));
+    let found = sandwiches(&flows(&block));
+    println!();
+    println!("Sandwiches: {}", found.len());
+    for s in &found {
+        let name = |asset: &str| if asset == "SOL" { "SOL".to_owned() } else { short(asset) };
+        let decimals = s.victim.decimals.get(&s.paid).copied().unwrap_or(0);
+        println!("  victim {} at {} bought {} with {}", s.victim.signature, s.victim.index + 1, name(&s.bought), name(&s.paid));
+        println!("    front {} at {}, back {} at {}, trader {}", s.front.signature, s.front.index + 1, s.back.signature, s.back.index + 1, s.trader);
+        println!("    pool vaults {}; the two legs left the trader {} {}", s.vaults.iter().map(|v| short(v)).collect::<Vec<_>>().join(", "), amount(s.take(), decimals), name(&s.paid));
+    }
     Ok(())
 }
 
@@ -194,6 +357,39 @@ mod tests {
         // No limit set: 200,000 for each of its two instructions.
         assert_eq!(candidates[1].compute_limit, 400_000);
         assert_eq!(candidates[1].writable_accounts, vec!["payer3", "other"]);
+    }
+
+    /// A swap by `owner` against the pool vaults named, which belong to "pool".
+    fn swap(index: usize, owner: &str, deltas: &[(&str, i128)], vaults: &[&str]) -> Flow {
+        let mut changed = vaults.iter().map(|v| (v.to_string(), "pool".to_owned())).collect::<BTreeMap<_, _>>();
+        changed.insert(format!("{owner}-account"), owner.into());
+        Flow {
+            index,
+            signature: format!("sig{index}"),
+            signer: owner.into(),
+            holdings: BTreeMap::from([(owner.to_owned(), deltas.iter().map(|(a, d)| (a.to_string(), *d)).collect())]),
+            decimals: BTreeMap::from([("SOL".to_owned(), 9)]),
+            changed,
+        }
+    }
+
+    #[test]
+    fn a_sandwich_is_found_and_a_plain_round_trip_is_not() {
+        let flows = vec![
+            swap(0, "bot", &[("SOL", -1_000_000_000), ("MEME", 5_000)], &["vaultSOL", "vaultMEME"]),
+            swap(1, "alice", &[("SOL", -2_000_000_000), ("MEME", 9_000)], &["vaultSOL", "vaultMEME"]),
+            swap(2, "carol", &[("SOL", -1_000), ("OTHER", 7)], &["otherVault"]),
+            swap(3, "bot", &[("SOL", 1_050_000_000), ("MEME", -5_000)], &["vaultSOL", "vaultMEME"]),
+            // A buy and a sell by one signer with no one between them on that pool: no sandwich.
+            swap(4, "dave", &[("SOL", -10), ("X", 1)], &["vaultX"]),
+            swap(5, "dave", &[("SOL", 9), ("X", -1)], &["vaultX"]),
+        ];
+        let found = sandwiches(&flows);
+        assert_eq!(found.len(), 1);
+        let s = &found[0];
+        assert_eq!((s.front.index, s.victim.index, s.back.index), (0, 1, 3));
+        assert_eq!((s.bought.as_str(), s.paid.as_str()), ("MEME", "SOL"));
+        assert_eq!(s.take(), 50_000_000);
     }
 
     #[test]
