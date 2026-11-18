@@ -22,12 +22,13 @@
     "e2e": "npm run build && node test/e2e.mjs"
   },
   "dependencies": {
+    "@acrux/contract": "https://acrux.computer/downloads/acrux-contract-0.1.10.tgz",
     "@noble/ciphers": "2.4.0",
     "@noble/curves": "2.4.0",
-    "@noble/hashes": "2.4.0",
-    "@acrux/contract": "https://acrux.computer/downloads/acrux-contract-0.1.10.tgz"
+    "@noble/hashes": "2.4.0"
   },
   "devDependencies": {
+    "@solana/spl-token": "0.4.14",
     "@solana/web3.js": "1.99.0",
     "@types/node": "^22.0.0",
     "typescript": "^5.9.3"
