@@ -2,7 +2,7 @@
 
 This page states the privacy properties of Acrux as the code implements them, so users and
 integrators can tell the guarantees from the limits. It is based on reading the repository at
-`198f622`. File references are given so each statement can be checked. It makes no claim about
+`1349b98` (node 0.4.9). File references are given so each statement can be checked. It makes no claim about
 anything deployed that the repository does not show.
 
 Short version: Acrux encrypts transactions until their order is fixed, to protect against
@@ -60,5 +60,38 @@ ordered. This holds only if fewer than `t` of the chosen receivers collude.
    scheduler needs.
 5. Longer term: a relayer or batching for bridge deposits, and confidential balances if the goal is
    anonymity rather than front-running protection.
+
+## Zero-knowledge proofs: what Acrux uses today, what it does not
+
+**Today: none.** The repository contains no zero-knowledge proof system (no SNARK, STARK, Bulletproof
+or similar) in the node, the SDK or the Solana programs. What can look like proof checking is not ZK:
+
+- **Bridge withdrawals** (`chain/programs/acrux_bridge/src/lib.rs`, `withdraw` and `release`). On Acrux,
+  `withdraw` burns the token and records a numbered withdrawal. A cblock's outbox root commits to it.
+  On Solana, `release` checks that the cblock is certified, rebuilds the withdrawal entry, and checks
+  a **SHA-256 Merkle inclusion proof** against the cblock's `outbox_root`. It then pays from the vault
+  once per sequence.
+- **Light client.** A cblock is certified when validators holding 60% of the stake signed its Finalize
+  vote (80% for Notar), checked through Solana's ed25519 precompile. This is signature-threshold
+  verification, so it reveals everything it proves. The trust assumption is the validator set, not a
+  cryptographic proof of execution.
+- **Threshold encryption** (above) is symmetric encryption plus secret sharing. It is not ZK.
+
+**Gaps.** There are no private balances, no private transfers, no shielded state, and no proof that
+hides sender, recipient or amount. A withdrawal's recipient and amount are public in the outbox.
+
+## Possible adoption path
+
+Each step says whether it can be built now or depends on something outside this repository.
+These are suggestions, not commitments, and none of them is implemented here.
+
+| Step | What | Can start now? |
+| --- | --- | --- |
+| 1 | Confidential deposit adapter: the bridge's depositor becomes a program account instead of the user's wallet. A draft is in #2. It does not hide amount, timing or the transaction, and it is not ZK. | Yes. Needs an on-chain test run. |
+| 2 | Private balances on the Solana side through an external ZK system. Helius's Solana Privacy Rings (open-source `helius-labs/zolana`) describe a Default Ring with private asset and amount but public sender and recipient, and an anonymous ring that hides sender and recipient too. Per their public docs the anonymous ring has not shipped yet, and Helius's target was Q4 2026. Check https://www.helius.dev/docs/privacy for the current status before relying on it. I have not verified which proof system it uses or how it would compose with the bridge. | Partly. The confidential level can be evaluated now. The anonymous level waits for the external release. |
+| 3 | Beyond that: ZK compression for state, and proof aggregation so the bridge verifies one proof rather than many signatures. These are open design questions here: nothing in the code needs them yet, and the cost on Solana would have to be measured. | No. Design work first. |
+
+The order matters: step 1 removes the wallet from bridge records at small cost, step 2 is what would
+make amounts private, and step 3 is optimization that only makes sense once something needs it.
 
 Corrections welcome. If any statement above does not match the code, please say so and I will fix it.
