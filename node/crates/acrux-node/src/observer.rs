@@ -119,6 +119,7 @@ impl Observer {
                             && event.kind == "cblock.finalized"
                             && finalized.insert(slot / 4)
                         {
+                            g.finalized_cblock = Some(g.finalized_cblock.map_or(slot / 4, |held| held.max(slot / 4)));
                             let certificate = g
                                 .slots
                                 .get(&(slot / 4 * 4))

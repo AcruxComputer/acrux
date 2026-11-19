@@ -197,6 +197,7 @@ pub struct ExecutorCheckpoint {
     accounts: BTreeMap<Pubkey, Arc<Account>>,
     account_hashes: BTreeMap<Pubkey, [u8; 32]>,
     accumulator: [u8; 32],
+    total_lamports: u128,
     executed: BTreeMap<String, u64>,
     recent: VecDeque<(Hash, u64)>,
     inclusion_used: BTreeMap<(u64, Pubkey, u8), u64>,
@@ -251,6 +252,8 @@ pub struct SvmExecutor {
     accounts: BTreeMap<Pubkey, Arc<Account>>,
     account_hashes: BTreeMap<Pubkey, [u8; 32]>,
     accumulator: [u8; 32],
+    /// Derived from the committed accounts; it is not part of the state hash or disk format.
+    total_lamports: u128,
     proposers: BTreeMap<u8, Pubkey>,
     inclusion_used: BTreeMap<(u64, Pubkey, u8), u64>,
     /// Executed transaction ids, each with the slot of the blockhash it referenced; an id is kept
@@ -278,6 +281,7 @@ impl SvmExecutor {
             accounts: self.accounts.clone(),
             account_hashes: self.account_hashes.clone(),
             accumulator: self.accumulator,
+            total_lamports: self.total_lamports,
             executed: self.executed.clone(),
             recent: self.recent.clone(),
             inclusion_used: self.inclusion_used.clone(),
@@ -392,6 +396,7 @@ impl SvmExecutor {
         self.accounts = checkpoint.accounts;
         self.account_hashes = checkpoint.account_hashes;
         self.accumulator = checkpoint.accumulator;
+        self.total_lamports = checkpoint.total_lamports;
         self.executed = checkpoint.executed;
         self.recent = checkpoint.recent;
         self.inclusion_used = checkpoint.inclusion_used;
@@ -448,6 +453,7 @@ impl SvmExecutor {
             accounts: BTreeMap::new(),
             account_hashes: BTreeMap::new(),
             accumulator: [0; 32],
+            total_lamports: 0,
             proposers: BTreeMap::new(),
             inclusion_used: BTreeMap::new(),
             executed: BTreeMap::new(),
@@ -1271,12 +1277,17 @@ impl SvmExecutor {
             }
             add256(&mut self.accumulator, &hash);
             self.account_hashes.insert(key, hash);
-            self.accounts.insert(key, Arc::new(account));
+            self.total_lamports += account.lamports as u128;
+            if let Some(old) = self.accounts.insert(key, Arc::new(account)) {
+                self.total_lamports -= old.lamports as u128;
+            }
         } else {
             if let Some(old) = self.account_hashes.remove(&key) {
                 subtract256(&mut self.accumulator, &old);
             }
-            self.accounts.remove(&key);
+            if let Some(old) = self.accounts.remove(&key) {
+                self.total_lamports -= old.lamports as u128;
+            }
         }
     }
     /// Every account the given program owns, for `getProgramAccounts`.
@@ -1289,6 +1300,9 @@ impl SvmExecutor {
     }
     pub fn account_count(&self) -> usize {
         self.accounts.len()
+    }
+    pub fn total_lamports(&self) -> Result<u64> {
+        self.total_lamports.try_into().context("The total account lamports exceed u64")
     }
     pub fn state_hash(&self) -> String {
         hex::encode(self.accumulator)

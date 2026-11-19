@@ -1,9 +1,9 @@
-import { ACRUX_BRIDGE_IDL } from '@acrux/contract'
+import { ACRUX_BRIDGE_IDL, BRIDGE_RECIPIENT_TOKEN_ACCOUNT_MISSING } from '@acrux/contract'
 import { BorshAccountsCoder, Program, type Idl } from '@coral-xyz/anchor'
 import BN from 'bn.js'
 import type { Prisma, PrismaClient } from '@prisma/client'
-import { Connection, PublicKey, SystemProgram, SYSVAR_INSTRUCTIONS_PUBKEY, type AccountInfo, type Keypair, type TransactionInstruction } from '@solana/web3.js'
-import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, createAssociatedTokenAccountIdempotentInstruction, getAssociatedTokenAddressSync, unpackMint } from '@solana/spl-token'
+import { Connection, PublicKey, SystemProgram, SYSVAR_INSTRUCTIONS_PUBKEY, VersionedTransaction, type AccountInfo, type Keypair, type TransactionInstruction } from '@solana/web3.js'
+import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync, unpackAccount, unpackMint } from '@solana/spl-token'
 import { createJournal, type KeeperTxRow } from '../engines/keeper/journal.js'
 import { prismaKeeperStore } from '../engines/keeper/prisma-store.js'
 import type { BridgeRelayerConfig } from './config.js'
@@ -14,6 +14,7 @@ import { attestationBatches, pendingFinalityStore } from './transactions.js'
 export const reason = (error: unknown) => error instanceof Error ? `${error.name}: ${error.message.replace(/https?:\/\/\S+/g, '<url>')}` : 'Error'
 const RPC_MS = 10_000
 const CONFIRM_MS = 30_000
+const RETIRED_ACCOUNT_CREATION = 'The previous recipient-account creation transaction is retired. Waiting for its blockhash to expire.'
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
 /** HTTP-only connections: every request is aborted; confirmation uses the keeper journal's bounded poll. */
@@ -36,7 +37,13 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
   const coder = new BorshAccountsCoder(idl), program = new Program(idl, { connection: solana })
   let solanaConfirmedSlot = 0, solanaFinalizedSlot = 0
   const store = prismaKeeperStore(db)
-  const journal = createJournal({ connection: solana, signer, store: pendingFinalityStore(store), isLeader, followMs: CONFIRM_MS, minContextSlot: () => solanaConfirmedSlot })
+  const journal = createJournal({
+    connection: solana, signer, store: pendingFinalityStore(store), isLeader, followMs: CONFIRM_MS, minContextSlot: () => solanaConfirmedSlot,
+    beforeBroadcast: bytes => {
+      const message = VersionedTransaction.deserialize(bytes).message
+      if (message.compiledInstructions.some(instruction => message.staticAccountKeys[instruction.programIdIndex]?.equals(ASSOCIATED_TOKEN_PROGRAM_ID))) throw new Error(RETIRED_ACCOUNT_CREATION)
+    },
+  })
   const pda = (...seeds: Buffer[]) => PublicKey.findProgramAddressSync(seeds, config.program)[0]
   const setPda = (epoch: number) => pda(Buffer.from('set'), u64(epoch))
   const releasedPda = (sequence: number) => pda(Buffer.from('released'), u64(Math.floor(sequence / 8192)))
@@ -55,12 +62,16 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
     const info = await connection.getAccountInfo(address, config)
     return info ? decode<T>(name, info) : null
   }
+  type ReleasedBucket = { bucket: BN; bits: number[] }
+  async function releasedBucket(bucket: number) {
+    const state = await account<ReleasedBucket>(solana, pda(Buffer.from('released'), u64(bucket)), 'Released', 'finalized')
+    if (state && exact(state.bucket, 'released bucket') !== bucket) throw new Error('Released bucket differs.')
+    return state
+  }
   async function isReleased(sequence: number) {
-    const state = await account<{ bucket: BN; bits: number[] }>(solana, releasedPda(sequence), 'Released', 'finalized')
-    if (!state) return false
-    if (exact(state.bucket, 'released bucket') !== Math.floor(sequence / 8192)) throw new Error('Released bucket differs.')
+    const state = await releasedBucket(Math.floor(sequence / 8192))
     const bit = sequence % 8192
-    return !!(state.bits[Math.floor(bit / 8)] & (1 << (bit % 8)))
+    return !!state && !!(state.bits[Math.floor(bit / 8)] & (1 << (bit % 8)))
   }
   async function programAccounts<T>(name: string, commitment: Finality = 'confirmed') {
     const accounts = await solana.getProgramAccounts(config.program, { commitment, minContextSlot: commitment === 'confirmed' ? solanaConfirmedSlot : solanaFinalizedSlot, filters: [{ memcmp: { offset: 0, bytes: coder.accountDiscriminator(name).toString('base64'), encoding: 'base64' } }] })
@@ -79,6 +90,18 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
     const parsed = readProof(body.result, epochSlots, chainId)
     if ('consensusSlot' in params && parsed.consensusSlot !== params.consensusSlot || 'epoch' in params && Math.floor(parsed.consensusSlot * 4 / epochSlots) !== params.epoch) throw new Error('Gateway returned another cblock or epoch.')
     return parsed
+  }
+  async function acknowledgeSavedCursor(nextWithdrawalSequence: number) {
+    own()
+    const response = await fetch(new URL('/internal/bridge-saved', config.gatewayInternalUrl), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ program: programName, nextWithdrawalSequence: String(nextWithdrawalSequence) }), signal: AbortSignal.timeout(RPC_MS),
+    })
+    if (!response.ok) throw new Error('Reporting the saved bridge cursor failed.')
+    const body = await response.json() as { program?: unknown; nextWithdrawalSequence?: unknown }
+    if (body.program !== programName || typeof body.nextWithdrawalSequence !== 'string' || !/^(0|[1-9]\d*)$/.test(body.nextWithdrawalSequence)
+      || BigInt(body.nextWithdrawalSequence) > 18_446_744_073_709_551_615n || BigInt(body.nextWithdrawalSequence) < BigInt(nextWithdrawalSequence)) throw new Error('The node returned an invalid saved bridge cursor.')
+    log({ event: 'bridge_saved_cursor_reported', nextWithdrawalSequence })
   }
   const unpaidKey = (sequence: number) => ({ program_sequence: { program: programName, sequence: BigInt(sequence) } })
   function savedProof(proof: Proof): Prisma.InputJsonObject {
@@ -99,28 +122,20 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
   }
   async function forgetUnpaid(sequence: number) {
     own()
+    const key = `bridge:${programName}:release:${sequence}`
+    if ((await store.get(key))?.state === 'signed') await store.update(key, { state: 'confirmed' })
     await db.bridgeUnpaidWithdrawal.deleteMany({ where: { program: programName, sequence: BigInt(sequence) } })
   }
   async function deferRelease(proof: Proof, sequence: number, error: unknown) {
     own()
     const unpaid = await rememberUnpaid(proof, sequence)
     const attempts = unpaid.attempts + 1
-    const nextAttemptAt = new Date(Date.now() + (attempts === 1 ? 2 : attempts === 2 ? 5 : 60) * 60_000)
-    const failure = reason(error)
+    const missing = error instanceof Error && error.message === BRIDGE_RECIPIENT_TOKEN_ACCOUNT_MISSING
+    const retired = error instanceof Error && error.message === RETIRED_ACCOUNT_CREATION
+    const nextAttemptAt = new Date(Date.now() + (missing || retired ? 1 : attempts === 1 ? 2 : attempts === 2 ? 5 : 60) * 60_000)
+    const failure = missing ? BRIDGE_RECIPIENT_TOKEN_ACCOUNT_MISSING : reason(error)
     await db.bridgeUnpaidWithdrawal.update({ where: unpaidKey(sequence), data: { reason: failure, attempts, nextAttemptAt } })
     log({ event: 'bridge_release_deferred', sequence, cblock: proof.consensusSlot, epoch: Math.floor(proof.consensusSlot * 4 / epochSlots), attempts, nextAttemptAt: nextAttemptAt.toISOString(), error: failure })
-  }
-  async function withdrawalProof(sequence: number) {
-    const unpaid = await db.bridgeUnpaidWithdrawal.findUnique({ where: unpaidKey(sequence) })
-    if (unpaid) return readProof(unpaid.proof, epochSlots, chainId)
-    // Rows signed by the preceding version predate the unpaid queue; their Acrux record and
-    // retained gateway proof supply the same durable retry material before they are followed.
-    const withdrawal = await account<Withdrawal>(acrux, pda(Buffer.from('withdrawal'), u64(sequence)), 'Withdrawal', 'finalized')
-    if (!withdrawal || exact(withdrawal.sequence, 'withdrawal sequence') !== sequence) throw new Error('Acrux withdrawal record is missing or inconsistent.')
-    const found = await proof({ consensusSlot: Math.floor(exact(withdrawal.slot, 'withdrawal slot') / 4) })
-    if (!found.entries.some(entry => entry.kind === 'withdrawal' && entry.sequence === sequence && entry.mint.equals(withdrawal.solana_mint) && entry.recipient.equals(withdrawal.recipient) && entry.amount.eq(withdrawal.amount))) throw new Error('Gateway outbox does not match the burned withdrawal.')
-    await rememberUnpaid(found, sequence)
-    return found
   }
   /** Journal confirmation is enough to chain instructions; only finalized receipts retire bytes. */
   async function receipt(row: Pick<KeeperTxRow, 'key' | 'signature'>, commitment: Finality) {
@@ -219,18 +234,45 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
     await report({ lastCblock: BigInt(proof.consensusSlot) })
     return cblock
   }
-  async function release(proof: Proof, entry: Extract<Entry, { kind: 'withdrawal' }>, index: number, cblock: PublicKey) {
+  // A validated mint's token-program owner is stable. Share its first lookup across entries;
+  // a failed RPC or invalid account is never cached, so a later scheduled attempt can check it.
+  const mintPrograms = new Map<string, Promise<PublicKey>>()
+  async function mintTokenProgram(mint: PublicKey) {
+    const key = mint.toBase58()
+    let pending = mintPrograms.get(key)
+    if (!pending) {
+      pending = (async () => {
+        const info = await solana.getAccountInfo(mint, { commitment: 'confirmed', minContextSlot: solanaConfirmedSlot })
+        if (!info || info.executable || ![TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID].some(id => id.equals(info.owner)) || !unpackMint(mint, info, info.owner).isInitialized) throw new Error('Withdrawal mint is not an initialized SPL token mint.')
+        return info.owner
+      })()
+      mintPrograms.set(key, pending)
+    }
+    try { return await pending }
+    catch (error) {
+      if (mintPrograms.get(key) === pending) mintPrograms.delete(key)
+      throw error
+    }
+  }
+  type RecipientTokenAccount = { destination: PublicKey; tokenProgram: PublicKey }
+  async function recipientTokenAccount(entry: Extract<Entry, { kind: 'withdrawal' }>): Promise<RecipientTokenAccount> {
+    const tokenProgram = await mintTokenProgram(entry.mint)
+    const destination = getAssociatedTokenAddressSync(entry.mint, entry.recipient, true, tokenProgram)
+    const info = await solana.getAccountInfo(destination, { commitment: 'confirmed', minContextSlot: solanaConfirmedSlot })
+    if (!info || info.owner.equals(SystemProgram.programId) && info.data.length === 0) throw new Error(BRIDGE_RECIPIENT_TOKEN_ACCOUNT_MISSING)
+    if (info.executable) throw new Error('Recipient token account is executable.')
+    const account = unpackAccount(destination, info, tokenProgram)
+    if (!account.owner.equals(entry.recipient) || !account.mint.equals(entry.mint) || !account.isInitialized) throw new Error('Recipient token account belongs to another owner or mint, or is not initialized.')
+    return { destination, tokenProgram }
+  }
+  async function release(proof: Proof, entry: Extract<Entry, { kind: 'withdrawal' }>, index: number, cblock: PublicKey, { destination, tokenProgram }: RecipientTokenAccount) {
     const unpaid = await rememberUnpaid(proof, entry.sequence)
     if (unpaid.nextAttemptAt.getTime() > Date.now()) return
     try {
       if (await isReleased(entry.sequence)) { await forgetUnpaid(entry.sequence); return }
-      const mintInfo = await solana.getAccountInfo(entry.mint, { commitment: 'confirmed', minContextSlot: solanaConfirmedSlot })
-      if (!mintInfo || ![TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID].some(id => id.equals(mintInfo.owner))) throw new Error('Withdrawal mint is not an SPL token mint.')
-      unpackMint(entry.mint, mintInfo, mintInfo.owner)
-      const tokenProgram = mintInfo.owner
-      const destination = getAssociatedTokenAddressSync(entry.mint, entry.recipient, true, tokenProgram)
+      // The destination was checked before certifying the cblock or following old bytes.
+      // The journal also prevents retired account-creation bytes from being rebroadcast.
       await action('bridge_released', `release:${entry.sequence}`, { sequence: entry.sequence, cblock: proof.consensusSlot, amount: entry.amount.toString() }, async () => [
-        createAssociatedTokenAccountIdempotentInstruction(signer.publicKey, destination, entry.recipient, entry.mint, tokenProgram),
         await program.methods.release(new BN(entry.sequence), entry.recipient, entry.amount, outboxProof(proof.outbox, index)).accountsStrict({ payer: signer.publicKey, cblock, mint: entry.mint, vault: pda(Buffer.from('vault'), entry.mint.toBuffer()), destination, released: releasedPda(entry.sequence), tokenProgram, systemProgram: SystemProgram.programId }).instruction(),
       ], async () => isReleased(entry.sequence), 'finalized')
       await forgetUnpaid(entry.sequence)
@@ -240,21 +282,39 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
       await deferRelease(proof, entry.sequence, error)
     }
   }
-  async function relay(proof: Proof, handoffEpoch?: number) {
+  async function handOff(proof: Proof, epoch: number) {
     const cblock = await certify(proof)
-    // Each release has its own durable outcome and retry date; an unpayable recipient cannot
-    // reject another payout sharing this proof or prevent the validator set from handing on.
-    const results = await Promise.allSettled(proof.entries.map(async (entry, index) => {
-      if (entry.kind === 'set') {
-        if (entry.epoch !== handoffEpoch || await account<ValidatorSet>(solana, setPda(entry.epoch), 'ValidatorSet')) return
-        await action('bridge_handed_on', `handoff:${entry.epoch}`, { epoch: entry.epoch, cblock: proof.consensusSlot }, async () => [await program.methods.handOff(new BN(entry.epoch), entry.validators, outboxProof(proof.outbox, index)).accountsStrict({ payer: signer.publicKey, cblock, next: setPda(entry.epoch), systemProgram: SystemProgram.programId }).instruction()], async commitment => !!await account<ValidatorSet>(solana, setPda(entry.epoch), 'ValidatorSet', commitment))
-      } else {
-        await release(proof, entry, index, cblock)
+    const index = proof.entries.findIndex(entry => entry.kind === 'set' && entry.epoch === epoch)
+    const entry = proof.entries[index]
+    if (!entry || entry.kind !== 'set') throw new Error('Gateway outbox does not contain the next validator epoch.')
+    if (await account<ValidatorSet>(solana, setPda(epoch), 'ValidatorSet')) return
+    await action('bridge_handed_on', `handoff:${epoch}`, { epoch, cblock: proof.consensusSlot }, async () => [await program.methods.handOff(new BN(epoch), entry.validators, outboxProof(proof.outbox, index)).accountsStrict({ payer: signer.publicKey, cblock, next: setPda(epoch), systemProgram: SystemProgram.programId }).instruction()], async commitment => !!await account<ValidatorSet>(solana, setPda(epoch), 'ValidatorSet', commitment))
+  }
+  type PayoutGroup = { proof: Proof; entries: { entry: Extract<Entry, { kind: 'withdrawal' }>; index: number }[] }
+  async function paySelected(groups: Map<string, PayoutGroup>) {
+    const results = await Promise.allSettled([...groups.values()].map(async group => {
+      // Missing or unusable destinations are parked before any cblock rent or signatures.
+      const checked = await Promise.allSettled(group.entries.map(async target => {
+        try { return { ...target, account: await recipientTokenAccount(target.entry) } }
+        catch (error) { await deferRelease(group.proof, target.entry.sequence, error); return null }
+      }))
+      const eligible: { entry: Extract<Entry, { kind: 'withdrawal' }>; index: number; account: RecipientTokenAccount }[] = []
+      for (const result of checked) {
+        if (result.status === 'rejected') throw result.reason
+        if (result.value) eligible.push(result.value)
       }
+      if (!eligible.length) return
+      let cblock: PublicKey
+      try { cblock = await certify(group.proof) }
+      catch (error) {
+        const deferred = await Promise.allSettled(eligible.map(({ entry }) => deferRelease(group.proof, entry.sequence, error)))
+        for (const result of deferred) if (result.status === 'rejected') throw result.reason
+        return
+      }
+      const releases = await Promise.allSettled(eligible.map(({ entry, index, account }) => release(group.proof, entry, index, cblock, account)))
+      for (const result of releases) if (result.status === 'rejected') throw result.reason
     }))
     for (const result of results) if (result.status === 'rejected') throw result.reason
-    // Cleanup runs after the complete scan, with every unpaid and not-yet-finalized withdrawal
-    // accounted for, rather than closing the cblock while another payout still needs it.
   }
   async function closeCblock(cblock: PublicKey, slot: number) {
     await action('bridge_account_closed', `close-cblock:${cblock.toBase58()}`, { account: cblock.toBase58(), kind: 'cblock', cblock: slot }, async () => [await program.methods.closeCblock().accountsStrict({ payer: signer.publicKey, cblock }).instruction()], async commitment => !await account<Cblock>(solana, cblock, 'Cblock', commitment))
@@ -267,52 +327,6 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
     chainId = Buffer.from(state.chain_id)
     if (!epochSlots || epochSlots % 4) throw new Error('Invalid bridge epoch length.')
     await report()
-    // Reconcile this task's signed bytes before account guards can skip an action that landed
-    // during a restart. Never resume the buyback journal under the bridge's separate lease.
-    const pending = await db.keeperTransaction.findMany({ where: { state: 'signed', key: { startsWith: `bridge:${programName}:` } }, orderBy: { createdAt: 'asc' } })
-    const resumed = await Promise.allSettled(pending.map(async row => {
-      const kind = row.key.split(':')[2]
-      const event = ({ post: 'bridge_cblock_posted', attest: 'bridge_attested', handoff: 'bridge_handed_on', release: 'bridge_released', 'close-cblock': 'bridge_account_closed', 'close-set': 'bridge_account_closed' } as Record<string, string>)[kind]
-      const commitment = kind === 'release' ? 'finalized' : 'confirmed'
-      const sequence = kind === 'release' ? Number(row.key.split(':')[3]) : null
-      let retained: Proof | null = null
-      try {
-        if (sequence !== null) {
-          // The archive may already have pruned a paid withdrawal. Its permanent finalized bit
-          // retires this never-reused release key without needing that old proof or receipt.
-          if (await isReleased(sequence)) {
-            own()
-            await store.update(row.key, { state: 'confirmed' })
-            await forgetUnpaid(sequence)
-            log({ event, sequence, actionKey: row.key, signature: row.signature, commitment: 'finalized', resumed: true })
-            return
-          }
-          const unpaid = await db.bridgeUnpaidWithdrawal.findUnique({ where: unpaidKey(sequence) })
-          if (unpaid && unpaid.nextAttemptAt.getTime() > Date.now()) return
-          retained = await withdrawalProof(sequence)
-        }
-        if (await journal.follow(row.key) !== 'confirmed') throw new Error('Bridge transaction confirmation deadline exceeded.')
-        await receipt(row, commitment)
-        if (sequence !== null) {
-          if (!await isReleased(sequence)) throw new Error('Finalized release bit is missing.')
-          await forgetUnpaid(sequence)
-        }
-        log({ event, actionKey: row.key, signature: row.signature, commitment, resumed: true })
-      } catch (error) {
-        log({ event: `${event}_failed`, actionKey: row.key, error: reason(error) })
-        if (sequence === null) throw error
-        if (!retained) {
-          const unpaid = await db.bridgeUnpaidWithdrawal.findUnique({ where: unpaidKey(sequence) })
-          if (unpaid) retained = readProof(unpaid.proof, epochSlots, chainId)
-        }
-        if (retained) await deferRelease(retained, sequence, error)
-        // A legacy row may lack retry material while RPC is unavailable. Keep its signed bytes;
-        // failure to recover that one proof must not prevent other pending payouts resuming.
-        return
-      }
-      await report({ lastRelayedAt: new Date() })
-    }))
-    for (const result of resumed) if (result.status === 'rejected') throw result.reason
     const latest = await proof({ latest: true })
     const finalizedSlot = latest.consensusSlot * 4 + 3, currentEpoch = Math.floor(finalizedSlot / epochSlots)
     let sets = await programAccounts<ValidatorSet>('ValidatorSet')
@@ -320,80 +334,187 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
     if (!sets.length) throw new Error('Seed the bridge validator set before starting the relayer.')
     let newestEpoch = Math.max(...sets.map(set => exact(set.value.epoch, 'validator epoch')))
     while (newestEpoch < currentEpoch) {
-      await relay(await proof({ epoch: newestEpoch }), newestEpoch + 1)
+      await handOff(await proof({ epoch: newestEpoch }), newestEpoch + 1)
       newestEpoch++
     }
-    // Read the counter after the finalized frontier. Accounts are monotonic on Acrux; records
-    // newer than that frontier are left for the next tick and forbid old-set cleanup this tick.
     const outbound = await account<{ withdrawals: BN }>(acrux, pda(Buffer.from('outbound')), 'Outbound', 'finalized')
     const count = outbound ? exact(outbound.withdrawals, 'withdrawal count') : 0
     const row = await db.bridgeRelayerState.findUniqueOrThrow({ where: { program: programName } })
     let next = exact(row.nextWithdrawalSequence, 'withdrawal cursor')
+    let saved = exact(row.savedWithdrawalSequence, 'saved withdrawal cursor')
+    if (saved > count || next > count) throw new Error('Acrux withdrawal count is behind the persisted bridge cursors.')
+    // The save pass advances by whole cblocks, independently of the much smaller pay budget.
+    // Batch record reads and retain only the current batch while a large backlog is scanned.
+    let recordStart = -1
+    let records: (Withdrawal | null)[] = []
+    const withdrawalRecord = async (sequence: number): Promise<Withdrawal> => {
+      if (sequence < recordStart || sequence >= recordStart + records.length) {
+        recordStart = sequence
+        const sequences = Array.from({ length: Math.min(100, count - sequence) }, (_, index) => sequence + index)
+        const found = await acrux.getMultipleAccountsInfo(sequences.map(value => pda(Buffer.from('withdrawal'), u64(value))), 'finalized')
+        records = found.map(info => info ? decode<Withdrawal>('Withdrawal', info) : null)
+      }
+      const withdrawal = records[sequence - recordStart]
+      if (!withdrawal || exact(withdrawal.sequence, 'withdrawal sequence') !== sequence) throw new Error('Acrux withdrawal record is missing or inconsistent.')
+      return withdrawal
+    }
+    const historicReleases = new Map<number, ReleasedBucket | null>()
+    const alreadyPaid = async (sequence: number) => {
+      const bucket = Math.floor(sequence / 8192)
+      if (!historicReleases.has(bucket)) historicReleases.set(bucket, await releasedBucket(bucket))
+      const bitmap = historicReleases.get(bucket)
+      const bit = sequence % 8192
+      return !!bitmap && !!(bitmap.bits[Math.floor(bit / 8)] & (1 << (bit % 8)))
+    }
+    let visitedCblocks = 0
+    let visited: number | null = null
+    while (saved < count) {
+      const withdrawal = await withdrawalRecord(saved)
+      const slot = exact(withdrawal.slot, 'withdrawal slot')
+      if (slot > finalizedSlot) break
+      const cblock = Math.floor(slot / 4)
+      if (cblock !== visited) {
+        if (visitedCblocks >= config.maxSavedCblocksPerCycle) break
+        visitedCblocks++
+        visited = cblock
+      }
+      if (saved < next && await alreadyPaid(saved)) {
+        // Before this cursor existed, finalized payments could have their gateway proof pruned.
+        // Such records need no copy; all still-unpaid records below the cursor must have one.
+        let through = saved + 1
+        while (through < next && through < count) {
+          const following = await withdrawalRecord(through)
+          if (Math.floor(exact(following.slot, 'withdrawal slot') / 4) !== cblock || !await alreadyPaid(through)) break
+          through++
+        }
+        own()
+        await db.bridgeRelayerState.update({ where: { program: programName }, data: { savedWithdrawalSequence: BigInt(through) } })
+        saved = through
+        continue
+      }
+      const key = { program_cblock: { program: programName, cblock: BigInt(cblock) } }
+      const existing = await db.bridgeSavedCblockProof.findUnique({ where: key })
+      const parked = !existing && saved < next ? await db.bridgeUnpaidWithdrawal.findUnique({ where: unpaidKey(saved) }) : null
+      const retained = existing ? readProof(existing.proof, epochSlots, chainId) : parked ? readProof(parked.proof, epochSlots, chainId) : await proof({ consensusSlot: cblock })
+      const entries = retained.entries.filter((entry): entry is Extract<Entry, { kind: 'withdrawal' }> => entry.kind === 'withdrawal').sort((a, b) => a.sequence - b.sequence)
+      const first = entries.find(entry => entry.sequence === saved)
+      if (retained.consensusSlot !== cblock || !first || !first.mint.equals(withdrawal.solana_mint) || !first.recipient.equals(withdrawal.recipient) || !first.amount.eq(withdrawal.amount)) throw new Error('Gateway outbox does not match the burned withdrawal.')
+      let through = saved
+      for (const entry of entries.filter(entry => entry.sequence >= saved)) {
+        if (entry.sequence !== through || entry.sequence >= count) throw new Error('Withdrawal proof sequences are not contiguous with the saved cursor.')
+        through++
+      }
+      own()
+      await db.$transaction(async tx => {
+        await tx.bridgeSavedCblockProof.upsert({ where: key, create: { program: programName, cblock: BigInt(cblock), proof: savedProof(retained) }, update: {} })
+        own()
+        await tx.bridgeRelayerState.update({ where: { program: programName }, data: { savedWithdrawalSequence: BigInt(through) } })
+      })
+      saved = through
+      log({ event: 'bridge_proof_saved', cblock, nextWithdrawalSequence: saved })
+    }
+    // Read the committed value back. Node restarts forget their in-memory report, so repeat it
+    // every cycle, even when no new proof was saved. Never acknowledge an uncommitted copy.
+    const committed = await db.bridgeRelayerState.findUniqueOrThrow({ where: { program: programName } })
+    await acknowledgeSavedCursor(exact(committed.savedWithdrawalSequence, 'saved withdrawal cursor'))
+    // New payment work has its own sequence-position budget; already-paid records consume it.
     let unscannedCblock: number | null = null
     let unscannedEpoch: number | null = null
-    while (next < count) {
-      const withdrawal = await account<Withdrawal>(acrux, pda(Buffer.from('withdrawal'), u64(next)), 'Withdrawal', 'finalized')
-      if (!withdrawal || exact(withdrawal.sequence, 'withdrawal sequence') !== next) throw new Error('Acrux withdrawal record is missing or inconsistent.')
-      if (exact(withdrawal.slot, 'withdrawal slot') > finalizedSlot) {
-        unscannedCblock = Math.floor(exact(withdrawal.slot, 'withdrawal slot') / 4)
-        unscannedEpoch = Math.floor(exact(withdrawal.slot, 'withdrawal slot') / epochSlots)
-        break
-      }
+    const fresh = new Map<string, PayoutGroup>()
+    const proofCache = new Map<number, Proof>()
+    let scanned = 0
+    while (next < saved && scanned < config.maxNewWithdrawalsPerCycle) {
+      const withdrawal = await withdrawalRecord(next)
+      if (exact(withdrawal.slot, 'withdrawal slot') > finalizedSlot) break
       if (!await isReleased(next)) {
-        const cblock = Math.floor(exact(withdrawal.slot, 'withdrawal slot') / 4)
         const retained = await db.bridgeUnpaidWithdrawal.findUnique({ where: unpaidKey(next) })
-        const burnProof = retained ? readProof(retained.proof, epochSlots, chainId) : await proof({ consensusSlot: cblock })
-        if (!burnProof.entries.some(entry => entry.kind === 'withdrawal' && entry.sequence === next && entry.mint.equals(withdrawal.solana_mint) && entry.recipient.equals(withdrawal.recipient) && entry.amount.eq(withdrawal.amount))) throw new Error('Gateway outbox does not match the burned withdrawal.')
-        await relay(burnProof)
+        if (!retained || retained.nextAttemptAt.getTime() <= Date.now()) {
+          const cblock = Math.floor(exact(withdrawal.slot, 'withdrawal slot') / 4)
+          let burnProof = proofCache.get(cblock)
+          if (!burnProof) {
+            const stored = await db.bridgeSavedCblockProof.findUnique({ where: { program_cblock: { program: programName, cblock: BigInt(cblock) } } })
+            if (!stored) throw new Error('A saved withdrawal proof is missing from Postgres.')
+            burnProof = readProof(stored.proof, epochSlots, chainId)
+            proofCache.set(cblock, burnProof)
+          }
+          const index = burnProof.entries.findIndex(entry => entry.kind === 'withdrawal' && entry.sequence === next && entry.mint.equals(withdrawal.solana_mint) && entry.recipient.equals(withdrawal.recipient) && entry.amount.eq(withdrawal.amount))
+          const entry = burnProof.entries[index]
+          if (!entry || entry.kind !== 'withdrawal' || burnProof.consensusSlot !== cblock) throw new Error('Gateway outbox does not match the burned withdrawal.')
+          // Save the proof before moving the scan cursor. A restart then finds this exact target
+          // in the due queue; neighbors in the proof never bypass either payout budget.
+          await rememberUnpaid(burnProof, next)
+          let group = fresh.get(burnProof.hash)
+          if (!group) { group = { proof: burnProof, entries: [] }; fresh.set(burnProof.hash, group) }
+          group.entries.push({ entry, index })
+        }
       } else {
         await forgetUnpaid(next)
       }
       next++
+      scanned++
       await report({ nextWithdrawalSequence: BigInt(next) })
     }
-    // Retries use the saved proof even after the gateway's rolling proof has disappeared.
-    const due = await db.bridgeUnpaidWithdrawal.findMany({ where: { program: programName, nextAttemptAt: { lte: new Date() } }, orderBy: { sequence: 'asc' } })
-    const retries = new Map<string, { proof: Proof; entries: { entry: Extract<Entry, { kind: 'withdrawal' }>; index: number }[] }>()
-    for (const unpaid of due) {
+    if (next < count) {
+      // One frontier read protects the unscanned suffix when the batch budget is exhausted.
+      const withdrawal = await withdrawalRecord(next)
+      unscannedCblock = Math.floor(exact(withdrawal.slot, 'withdrawal slot') / 4)
+      unscannedEpoch = Math.floor(exact(withdrawal.slot, 'withdrawal slot') / epochSlots)
+    }
+    await paySelected(fresh)
+    // Oldest due dates win, with the sequence providing a stable tie-break. Signed releases are
+    // reconciled only as selected new/due targets, so pending journal rows cannot bypass the cap.
+    // Rows waiting for a recipient's token account have a budget of their own, so many of them
+    // never push back the retry of any other unpaid withdrawal.
+    const now = new Date(), order = [{ nextAttemptAt: 'asc' as const }, { sequence: 'asc' as const }]
+    const due = [...await db.bridgeUnpaidWithdrawal.findMany({
+      where: { program: programName, nextAttemptAt: { lte: now }, OR: [{ reason: null }, { reason: { not: BRIDGE_RECIPIENT_TOKEN_ACCOUNT_MISSING } }] },
+      orderBy: order, take: config.maxRetryWithdrawalsPerCycle,
+    }), ...await db.bridgeUnpaidWithdrawal.findMany({
+      where: { program: programName, nextAttemptAt: { lte: now }, reason: BRIDGE_RECIPIENT_TOKEN_ACCOUNT_MISSING },
+      orderBy: order, take: config.maxAccountRetryWithdrawalsPerCycle,
+    })]
+    const retries = new Map<string, PayoutGroup>()
+    const selected = await Promise.allSettled(due.map(async unpaid => {
       const sequence = exact(unpaid.sequence, 'unpaid withdrawal sequence')
       const retained = readProof(unpaid.proof, epochSlots, chainId)
       const index = retained.entries.findIndex(entry => entry.kind === 'withdrawal' && entry.sequence === sequence)
       const entry = retained.entries[index]
       if (!entry || entry.kind !== 'withdrawal' || retained.consensusSlot !== exact(unpaid.cblock, 'unpaid cblock')) throw new Error('Saved withdrawal proof is inconsistent.')
-      let group = retries.get(retained.hash)
-      if (!group) {
-        group = { proof: retained, entries: [] }
-        retries.set(retained.hash, group)
+      try {
+        if (await isReleased(sequence)) { await forgetUnpaid(sequence); return null }
+        return { proof: retained, entry, index }
+      } catch (error) {
+        await deferRelease(retained, sequence, error)
+        return null
       }
+    }))
+    for (const result of selected) {
+      if (result.status === 'rejected') throw result.reason
+      if (!result.value) continue
+      const { proof: retained, entry, index } = result.value
+      let group = retries.get(retained.hash)
+      if (!group) { group = { proof: retained, entries: [] }; retries.set(retained.hash, group) }
       group.entries.push({ entry, index })
     }
-    const retried = await Promise.allSettled([...retries.values()].map(async group => {
-      const checked = await Promise.allSettled(group.entries.map(async item => {
-        try {
-          if (await isReleased(item.entry.sequence)) { await forgetUnpaid(item.entry.sequence); return null }
-          return item
-        } catch (error) {
-          await deferRelease(group.proof, item.entry.sequence, error)
-          return null
-        }
-      }))
-      const entries: typeof group.entries = []
-      for (const check of checked) {
-        if (check.status === 'rejected') throw check.reason
-        if (check.value) entries.push(check.value)
+    await paySelected(retries)
+    // Retire only a bounded number of intermediate receipts, after all payout phases. Actions
+    // required by a handoff recover their own original bytes before this housekeeping runs.
+    const pending = await db.keeperTransaction.findMany({
+      where: { state: 'signed', key: { startsWith: `bridge:${programName}:` }, NOT: { key: { startsWith: `bridge:${programName}:release:` } } },
+      orderBy: [{ createdAt: 'asc' }, { key: 'asc' }], take: config.maxRetryWithdrawalsPerCycle,
+    })
+    const resumed = await Promise.allSettled(pending.map(async row => {
+      const event = ({ post: 'bridge_cblock_posted', attest: 'bridge_attested', handoff: 'bridge_handed_on', 'close-cblock': 'bridge_account_closed', 'close-set': 'bridge_account_closed' } as Record<string, string>)[row.key.split(':')[2]]
+      try {
+        if (await journal.follow(row.key) !== 'confirmed') throw new Error('Bridge transaction confirmation deadline exceeded.')
+        await receipt(row, 'confirmed')
+        log({ event, actionKey: row.key, signature: row.signature, commitment: 'confirmed', resumed: true })
+      } catch (error) {
+        log({ event: `${event}_failed`, actionKey: row.key, error: reason(error) })
+        throw error
       }
-      if (!entries.length) return
-      let cblock: PublicKey
-      try { cblock = await certify(group.proof) }
-      catch (error) {
-        const deferred = await Promise.allSettled(entries.map(({ entry }) => deferRelease(group.proof, entry.sequence, error)))
-        for (const result of deferred) if (result.status === 'rejected') throw result.reason
-        return
-      }
-      const released = await Promise.allSettled(entries.map(({ entry, index }) => release(group.proof, entry, index, cblock)))
-      for (const result of released) if (result.status === 'rejected') throw result.reason
     }))
-    for (const result of retried) if (result.status === 'rejected') throw result.reason
+    for (const result of resumed) if (result.status === 'rejected') throw result.reason
     // Keep only the accounts needed by recorded unpaid or not-yet-scanned withdrawals. A failed
     // release in an old epoch must not stop unrelated cblocks and validator sets returning rent.
     const unpaid = await db.bridgeUnpaidWithdrawal.findMany({ where: { program: programName }, select: { cblock: true, epoch: true } })

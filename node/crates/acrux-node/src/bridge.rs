@@ -18,18 +18,32 @@ pub type ProofPrunes = Arc<Mutex<BTreeSet<u64>>>;
 
 const PROOFS: TableDefinition<u64, &[u8]> = TableDefinition::new("proofs");
 
-/// A bounded archive separate from the gateway's rolling window. It holds every withdrawal's
-/// proof and one cblock per bridge epoch, so a stopped relayer can also hand missed epochs on.
-/// A persistent net keeps it across restarts; the operator sizes its capacity for the downtime
-/// and withdrawal volume they support. A full archive leaves new proofs in the rolling window;
-/// it never controls whether the chain can finalize another cblock.
+/// Shared readers decode one archived proof per request. The archive's page cache is bounded;
+/// parsed proof payloads live only in the gateway's 4096-cblock rolling window.
+pub struct ProofArchiveStore(Database);
+
+impl ProofArchiveStore {
+    pub fn get(&self, slot: u64) -> Result<Option<Value>> {
+        let read = self.0.begin_read()?;
+        let table = read.open_table(PROOFS)?;
+        let proof = table.get(slot)?;
+        proof.map(|proof| serde_json::from_slice(proof.value()).map_err(Into::into)).transpose()
+    }
+}
+
+/// The durable archive is separate from the gateway's rolling window. Required proofs are always
+/// stored, including above its shedding level. Epoch representatives never expire; an unpaid
+/// withdrawal proof can be shed only after the relayer has durably saved every sequence in it,
+/// its slot-based grace period has passed, and the archive remains above its shedding level.
 pub struct ProofArchive {
-    pub proofs: BTreeMap<u64, Value>,
+    pub store: Arc<ProofArchiveStore>,
     pub epochs: BTreeMap<u64, u64>,
+    /// All archived slots, including representatives with no withdrawals.
     pub withdrawals: BTreeMap<u64, Vec<u64>>,
     capacity: usize,
-    db: Option<Database>,
-    full: bool,
+    grace_slots: u64,
+    warned_above_level: bool,
+    shed_since_log: usize,
 }
 
 impl ProofArchive {
@@ -38,13 +52,21 @@ impl ProofArchive {
             .context("ACRUX_BRIDGE_PROOF_MAX is required when the bridge is enabled")?
             .parse().context("ACRUX_BRIDGE_PROOF_MAX must be a positive integer")?;
         anyhow::ensure!(capacity > 0, "ACRUX_BRIDGE_PROOF_MAX must be a positive integer");
-        let db = path.map(|path| -> Result<Database> {
-            std::fs::create_dir_all(path.parent().context("bridge proof archive path")?)?;
-            Ok(Database::create(path)?)
-        }).transpose()?;
-        let mut archive = Self { proofs: BTreeMap::new(), epochs: BTreeMap::new(), withdrawals: BTreeMap::new(), capacity, db, full: false };
-        if let Some(db) = &archive.db {
-            let w = db.begin_write()?;
+        let grace_slots: u64 = std::env::var("ACRUX_BRIDGE_PROOF_GRACE_SLOTS").unwrap_or_else(|_| "1728000".into())
+            .parse().context("ACRUX_BRIDGE_PROOF_GRACE_SLOTS must be a positive integer")?;
+        anyhow::ensure!(grace_slots > 0, "ACRUX_BRIDGE_PROOF_GRACE_SLOTS must be a positive integer");
+        Self::load(path, epoch_slots, finalized_through, capacity, grace_slots)
+    }
+
+    fn load(path: Option<&Path>, epoch_slots: u64, finalized_through: Option<u64>, capacity: usize, grace_slots: u64) -> Result<Self> {
+        let path = path.context("a bridge rule requires a persistent store for its proof archive")?;
+        let mut builder = Database::builder();
+        builder.set_cache_size(64 * 1024 * 1024);
+        std::fs::create_dir_all(path.parent().context("bridge proof archive path")?)?;
+        let db = builder.create(path)?;
+        let mut archive = Self { store: Arc::new(ProofArchiveStore(db)), epochs: BTreeMap::new(), withdrawals: BTreeMap::new(), capacity, grace_slots, warned_above_level: false, shed_since_log: 0 };
+        {
+            let w = archive.store.0.begin_write()?;
             {
                 let mut table = w.open_table(PROOFS)?;
                 let mut expired = vec![];
@@ -53,7 +75,8 @@ impl ProofArchive {
                     let proof: Value = serde_json::from_slice(proof.value())?;
                     anyhow::ensure!(proof["epochSlots"].as_u64() == Some(epoch_slots), "saved bridge proofs use a different epochSlots");
                     if finalized_through.is_some_and(|cblock| slot.value() <= cblock) {
-                        archive.proofs.insert(slot.value(), proof);
+                        archive.epochs.entry(slot.value() * 4 / epoch_slots).or_insert(slot.value());
+                        archive.withdrawals.insert(slot.value(), withdrawal_sequences(&proof)?);
                     } else {
                         // A crash can leave a prepared proof ahead of the state checkpoint.
                         // It was never published and must not survive that checkpoint's rollback.
@@ -66,66 +89,80 @@ impl ProofArchive {
             }
             w.commit()?;
         }
-        for slot in archive.proofs.keys() {
-            archive.epochs.entry(slot * 4 / epoch_slots).or_insert(*slot);
-            archive.withdrawals.insert(*slot, withdrawal_sequences(&archive.proofs[slot])?);
-        }
         archive.check_capacity();
         Ok(archive)
     }
 
     fn check_capacity(&mut self) {
-        let full = self.proofs.len() >= self.capacity;
-        if full && !self.full {
-            tracing::warn!(event = "bridge_proof_archive_full", capacity = self.capacity, held = self.proofs.len(),
-                "bridge proof archive is full; new proofs remain available in the rolling window");
+        if self.withdrawals.len() > self.capacity && !self.warned_above_level {
+            tracing::warn!(event = "bridge_proof_archive_full", capacity = self.capacity, held = self.withdrawals.len(),
+                "bridge proof archive is above its shedding level; fresh withdrawals and epoch representatives remain durable");
+            self.warned_above_level = true;
         }
-        self.full = full;
     }
 
-    /// Called only for finalized cblocks. Capacity is a retention limit, never a consensus gate.
+    /// Called only for finalized cblocks. New withdrawals and first proofs of epochs are always
+    /// durable before their checkpoint, irrespective of the shedding level.
     pub fn keep(&mut self, slot: u64, epoch: u64, withdrawal: bool, proof: &Value) -> Result<bool> {
         if !withdrawal && self.epochs.contains_key(&epoch) {
             return Ok(false);
         }
-        if self.proofs.len() >= self.capacity && !self.proofs.contains_key(&slot) {
-            self.check_capacity();
-            return Ok(false);
-        }
         let sequences = withdrawal_sequences(proof)?;
-        if let Some(db) = &self.db {
-            let w = db.begin_write()?;
-            {
-                let mut table = w.open_table(PROOFS)?;
-                table.insert(slot, serde_json::to_vec(proof)?.as_slice())?;
-            }
-            w.commit()?;
+        let w = self.store.0.begin_write()?;
+        {
+            let mut table = w.open_table(PROOFS)?;
+            table.insert(slot, serde_json::to_vec(proof)?.as_slice())?;
         }
-        self.proofs.insert(slot, proof.clone());
+        w.commit()?;
         self.withdrawals.insert(slot, sequences);
         self.epochs.entry(epoch).or_insert(slot);
         self.check_capacity();
         Ok(true)
     }
 
+    /// Shed oldest unpaid non-representatives only after the durable chain has advanced past the
+    /// grace period, and only after every sequence is below the relayer's durable save cursor.
+    /// A restart clears the acknowledgement: no age shedding resumes before the next report.
+    pub fn shed_stale(&mut self, finalized_through: u64, saved_cursor: Option<u64>) -> Result<Vec<u64>> {
+        let Some(saved_cursor) = saved_cursor else { return Ok(vec![]) };
+        let excess = self.withdrawals.len().saturating_sub(self.capacity);
+        if excess == 0 { return Ok(vec![]) }
+        let representatives = self.epochs.values().copied().collect::<BTreeSet<_>>();
+        let remove = self.withdrawals.iter()
+            .take_while(|(slot, _)| finalized_through.saturating_sub(**slot).saturating_mul(4) > self.grace_slots)
+            .filter(|(slot, sequences)| !sequences.is_empty() && sequences.iter().all(|sequence| *sequence < saved_cursor) && !representatives.contains(*slot))
+            .take(excess.min(100)).map(|(slot, _)| *slot).collect::<Vec<_>>();
+        self.remove(&remove)?;
+        self.shed_since_log += remove.len();
+        if self.shed_since_log >= 1024 {
+            tracing::warn!(event = "bridge_proofs_shed", count = self.shed_since_log, held = self.withdrawals.len(), grace_slots = self.grace_slots,
+                finalized_cblock = finalized_through, saved_cursor, "old saved bridge proofs shed above the retention level");
+            self.shed_since_log = 0;
+        }
+        Ok(remove)
+    }
+
     /// Only background reads agreed by both finalized RPCs can enqueue a paid proof here. An
     /// epoch's representative remains even after payment, because it can still hand that epoch on.
     pub fn prune_paid(&mut self, paid: &BTreeSet<u64>) -> Result<Vec<u64>> {
         let representatives = self.epochs.values().copied().collect::<BTreeSet<_>>();
-        let remove = paid.iter().copied().filter(|slot| self.proofs.contains_key(slot) && !representatives.contains(slot)).collect::<Vec<_>>();
+        let remove = paid.iter().copied().filter(|slot| self.withdrawals.contains_key(slot) && !representatives.contains(slot)).collect::<Vec<_>>();
         if remove.is_empty() { return Ok(remove) }
-        if let Some(db) = &self.db {
-            let w = db.begin_write()?;
-            { let mut table = w.open_table(PROOFS)?; for slot in &remove { table.remove(*slot)?; } }
-            w.commit()?;
-        }
-        for slot in &remove {
-            self.proofs.remove(slot);
+        self.remove(&remove)?;
+        tracing::info!(event = "bridge_proofs_pruned", count = remove.len(), held = self.withdrawals.len(), "paid bridge proofs pruned");
+        Ok(remove)
+    }
+
+    fn remove(&mut self, remove: &[u64]) -> Result<()> {
+        if remove.is_empty() { return Ok(()) }
+        let w = self.store.0.begin_write()?;
+        { let mut table = w.open_table(PROOFS)?; for slot in remove { table.remove(*slot)?; } }
+        w.commit()?;
+        for slot in remove {
             self.withdrawals.remove(slot);
         }
         self.check_capacity();
-        tracing::info!(event = "bridge_proofs_pruned", count = remove.len(), held = self.proofs.len(), "paid bridge proofs pruned");
-        Ok(remove)
+        Ok(())
     }
 }
 
@@ -309,13 +346,106 @@ mod tests {
     use super::*;
     use axum::{extract::State, routing::post, Json, Router};
 
+    fn stored_proof(slot: u64, epoch_slots: u64, sequence: Option<u64>) -> Value {
+        let mut outbox = vec![OutboxEntry::ValidatorSet { epoch:slot * 4 / epoch_slots + 1, validators:vec![([1;32],1)] }];
+        if let Some(sequence) = sequence { outbox.push(OutboxEntry::Withdrawal { sequence, solana_mint:[2;32], recipient:[3;32], amount:1 }); }
+        json!({"consensusSlot":slot,"epochSlots":epoch_slots,"chainId":"archive-check","outbox":outbox.iter().map(|entry| B64.encode(bincode::serialize(entry).unwrap())).collect::<Vec<_>>()})
+    }
+
+    fn archive_path() -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::current_dir().unwrap().join("target").join(format!("bridge-review-{}",rand::random::<u64>()));
+        let path = dir.join("bridge-proofs.redb");
+        (dir,path)
+    }
+
+    #[test]
+    fn bridge_review_full_archive_keeps_new_epoch_representatives_after_restart() {
+        let (dir,path) = archive_path();
+        let next = stored_proof(108000,432000,None);
+        {
+            let mut archive = ProofArchive::load(Some(&path),432000,None,1,1728000).unwrap();
+            assert!(archive.keep(7,0,false,&stored_proof(7,432000,None)).unwrap());
+            assert!(archive.keep(108000,1,false,&next).unwrap());
+            assert!(archive.shed_stale(2_000_000,Some(u64::MAX)).unwrap().is_empty(), "representatives never become shedding candidates");
+        }
+        let archive = ProofArchive::load(Some(&path),432000,Some(2_000_000),1,1728000).unwrap();
+        assert_eq!(archive.epochs.get(&1),Some(&108000));
+        assert_eq!(archive.store.get(108000).unwrap(),Some(next));
+        drop(archive); std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bridge_review_full_archive_keeps_fresh_withdrawals_after_restart() {
+        let (dir,path) = archive_path();
+        let fresh = stored_proof(8,432000,Some(1));
+        {
+            let mut archive = ProofArchive::load(Some(&path),432000,None,1,1728000).unwrap();
+            archive.keep(7,0,false,&stored_proof(7,432000,None)).unwrap();
+            assert!(archive.keep(8,0,true,&fresh).unwrap());
+            assert!(archive.shed_stale(10,Some(u64::MAX)).unwrap().is_empty());
+        }
+        let archive = ProofArchive::load(Some(&path),432000,Some(10),1,1728000).unwrap();
+        assert_eq!(archive.store.get(8).unwrap(),Some(fresh));
+        assert_eq!(archive.withdrawals.get(&8),Some(&vec![1]));
+        drop(archive); std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bridge_review_above_level_sheds_only_old_unpaid_nonrepresentatives() {
+        let (dir,path) = archive_path();
+        {
+            let mut archive = ProofArchive::load(Some(&path),80,None,2,40).unwrap();
+            for (slot, sequence) in [(1,None),(2,Some(2)),(3,Some(3)),(10,Some(10)),(15,Some(15)),(20,None)] {
+                archive.keep(slot,slot * 4 / 80,sequence.is_some(),&stored_proof(slot,80,sequence)).unwrap();
+            }
+            assert_eq!(archive.shed_stale(20,Some(u64::MAX)).unwrap(),vec![2,3], "oldest unpaid proofs are shed first");
+            assert!(archive.withdrawals.contains_key(&10), "the exact grace boundary is still protected");
+            assert!(archive.withdrawals.contains_key(&15), "young overflow must remain durable");
+            assert_eq!(archive.shed_stale(21,Some(u64::MAX)).unwrap(),vec![10]);
+            assert!(archive.shed_stale(21,Some(u64::MAX)).unwrap().is_empty());
+            assert_eq!(archive.withdrawals.len(),3, "representatives and fresh proofs may exceed the soft level");
+        }
+        let archive = ProofArchive::load(Some(&path),80,Some(21),2,40).unwrap();
+        assert_eq!(archive.withdrawals.keys().copied().collect::<Vec<_>>(),vec![1,15,20]);
+        assert_eq!(archive.epochs.values().copied().collect::<Vec<_>>(),vec![1,20]);
+        drop(archive); std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bridge_review_age_shedding_requires_every_withdrawal_below_saved_cursor() {
+        let (dir,path) = archive_path();
+        {
+            let mut archive = ProofArchive::load(Some(&path),4000,None,1,4).unwrap();
+            archive.keep(1,0,false,&stored_proof(1,4000,None)).unwrap();
+            let mut multi = stored_proof(2,4000,Some(0));
+            multi["outbox"].as_array_mut().unwrap().push(json!(B64.encode(bincode::serialize(&OutboxEntry::Withdrawal {
+                sequence:2, solana_mint:[2;32], recipient:[3;32], amount:1,
+            }).unwrap())));
+            archive.keep(2,0,true,&multi).unwrap();
+            archive.keep(3,0,true,&stored_proof(3,4000,Some(1))).unwrap();
+            archive.keep(4,0,true,&stored_proof(4,4000,Some(3))).unwrap();
+        }
+        let mut archive = ProofArchive::load(Some(&path),4000,Some(100),1,4).unwrap();
+        assert!(archive.shed_stale(100,None).unwrap().is_empty(), "a restart has no acknowledgement and cannot shed old proofs");
+        assert!(archive.shed_stale(100,Some(0)).unwrap().is_empty());
+        assert_eq!(archive.shed_stale(100,Some(2)).unwrap(),vec![3]);
+        assert!(archive.store.get(2).unwrap().is_some(), "one saved sequence cannot shed a proof that also carries an unsaved sequence");
+        assert_eq!(archive.shed_stale(100,Some(3)).unwrap(),vec![2]);
+        assert!(archive.store.get(4).unwrap().is_some(), "the cursor itself is the next unsaved sequence");
+        assert_eq!(archive.shed_stale(100,Some(4)).unwrap(),vec![4]);
+        assert_eq!(archive.withdrawals.keys().copied().collect::<Vec<_>>(),vec![1]);
+        assert!(archive.store.get(1).unwrap().is_some(), "the epoch representative is never shed");
+        drop(archive); std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn bridge_review_prunes_only_after_all_release_bits_agree_on_both_finalized_rpcs() {
         let program = Pubkey::new_unique();
         let proof = |slot, sequences: &[u64]| json!({"consensusSlot":slot,"epochSlots":432000,"outbox":sequences.iter().map(|sequence| {
             B64.encode(bincode::serialize(&OutboxEntry::Withdrawal { sequence:*sequence, solana_mint:[1;32], recipient:[2;32], amount:1 }).unwrap())
         }).collect::<Vec<_>>()});
-        let mut archive = ProofArchive { proofs:BTreeMap::new(), epochs:BTreeMap::new(), withdrawals:BTreeMap::new(), capacity:3, db:None, full:false };
+        let (dir,path) = archive_path();
+        let mut archive = ProofArchive::load(Some(&path),432000,None,3,1728000).unwrap();
         archive.keep(7,0,true,&proof(7,&[0])).unwrap(); // epoch representative must remain after payment
         archive.keep(8,0,true,&proof(8,&[1,8192])).unwrap();
         archive.keep(9,0,true,&proof(9,&[2])).unwrap();
@@ -358,9 +488,10 @@ mod tests {
         assert_eq!(paid,BTreeSet::from([8]));
         paid.insert(7); // applying a stale candidate can never delete the epoch representative
         assert_eq!(archive.prune_paid(&paid).unwrap(),vec![8]);
-        assert!(archive.proofs.contains_key(&7) && archive.proofs.contains_key(&9));
-        assert!(!archive.full, "pruning a fully paid proof releases archive capacity");
+        assert!(archive.withdrawals.contains_key(&7) && archive.withdrawals.contains_key(&9));
+        assert!(archive.withdrawals.len() <= archive.capacity, "pruning a fully paid proof releases archive capacity");
         left.abort(); right.abort(); let _ = left.await; let _ = right.await;
+        drop(archive); std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

@@ -171,34 +171,65 @@ export function createNodeApi() {
     return c.json({ address, policy: policy(), remainingForKey: left.key, remainingForIp: left.ip,
       resetsAt: frees?.toISOString() ?? null, eligible: left.key > 0 && left.ip > 0 && canPay, availableLamports })
   })
+  // Each grant request holds its slot for up to 10 s, so requests are limited before any counting.
+  const faucetWindows = createWindows(60_000)
+  // The node builds a grant from its address, amount and the current blockhash, so two grants to one
+  // address submitted in one slot are the same transaction. Grants to an address run one at a time.
+  const payouts = new Map<string, Promise<unknown>>()
+  const oneAtATime = <T>(address: string, pay: () => Promise<T>): Promise<T> => {
+    const run = (payouts.get(address) ?? Promise.resolve()).catch(() => {}).then(pay)
+    payouts.set(address, run)
+    return run.finally(() => { if (payouts.get(address) === run) payouts.delete(address) })
+  }
   app.post('/v1/faucet', async c => {
-    const { address } = await readJson(c, FaucetRequest), ip = clientIp(c), left = await remaining(address, ip)
-    if (!left.key || !left.ip) {
-      const frees = await freesAt(address, ip, left)
+    const { address } = await readJson(c, FaucetRequest), ip = clientIp(c)
+    const limited = faucetWindows(ip, 'faucet', 20)
+    if (limited !== null) fail('RATE_LIMITED', 'Too many faucet requests from this address; try again in a minute.', { retryable: true, retryAfterSeconds: limited, stage: 'validation' })
+    // The grant's row is written before the grant is paid, under a lock on its IP and key, so
+    // parallel requests count each other. IP before key everywhere, so the locks never deadlock.
+    const reserved = await db.$transaction(async tx => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`faucet-ip:${ipHash(ip)}`}))`
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`faucet-key:${address}`}))`
+      const since = window()
+      const [forKey, forIp] = await Promise.all([
+        tx.faucetGrant.count({ where: { address, grantedAt: { gte: since } } }),
+        tx.faucetGrant.count({ where: { ipHash: ipHash(ip), grantedAt: { gte: since } } }),
+      ])
+      if (forKey >= env.FAUCET_PER_KEY_LIMIT! || forIp >= env.FAUCET_PER_IP_LIMIT!) return null
+      return tx.faucetGrant.create({ data: { address, ipHash: ipHash(ip), amountLamports: env.FAUCET_GRANT_LAMPORTS! } })
+    })
+    if (!reserved) {
+      const frees = await freesAt(address, ip, await remaining(address, ip))
       const retryAfterSeconds = Math.max(1, Math.ceil(((frees?.getTime() ?? Date.now()) - Date.now()) / 1000))
       fail('FAUCET_LIMIT', 'The faucet limit for this key or IP has been reached.', { retryable: true, retryAfterSeconds, stage: 'send' })
     }
-    let response: Response
-    try { response = await fetch(new URL('/internal/faucet', env.GATEWAY_INTERNAL_URL), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address, amountLamports: env.FAUCET_GRANT_LAMPORTS }) }) }
-    catch { fail('NET_UNAVAILABLE', 'Acrux Net is unavailable.', { retryable: true, stage: 'send' }) }
-    if (!response.ok) {
-      const refused = await response.json().catch(() => null) as { error?: { code?: string } } | null
-      if (refused?.error?.code === 'FAUCET_EMPTY') fail('FAUCET_EMPTY', 'The faucet cannot pay this grant.', { retryable: false, stage: 'send' })
-      fail('NET_UNAVAILABLE', 'Acrux Net could not submit this grant.', { retryable: true, stage: 'send' })
-    }
-    const grant = z.strictObject({ transactionId: TxId, signature: Signature, balance: Balance }).parse(await response.json())
-    // The answer follows the grant's execution: granted only once it ran, with the balance after it.
-    let state: string | undefined
-    for (const started = Date.now(); Date.now() - started < 10_000; await new Promise(r => setTimeout(r, 200))) {
-      state = (await net('getTransaction', { id: grant.transactionId }).catch(() => null) as { state?: string } | null)?.state
-      if (state === 'executed' || state === 'finalized' || state === 'failed' || state === 'expired') break
-    }
-    if (state === 'failed' || state === 'expired') fail('GRANT_FAILED', 'The grant transaction failed on Acrux Net.', { retryable: true, stage: 'confirmation' })
-    if (state !== 'executed' && state !== 'finalized') fail('NET_UNAVAILABLE', 'The grant did not execute within 10 seconds.', { retryable: true, stage: 'confirmation' })
+    // A grant that was never paid gives its place back; one that may still execute keeps it.
+    const release = () => db.faucetGrant.delete({ where: { id: reserved.id } })
+    const grant = await oneAtATime(address, async () => {
+      let response: Response
+      try { response = await fetch(new URL('/internal/faucet', env.GATEWAY_INTERNAL_URL), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address, amountLamports: env.FAUCET_GRANT_LAMPORTS }) }) }
+      catch { await release(); fail('NET_UNAVAILABLE', 'Acrux Net is unavailable.', { retryable: true, stage: 'send' }) }
+      if (!response.ok) {
+        await release()
+        const refused = await response.json().catch(() => null) as { error?: { code?: string } } | null
+        if (refused?.error?.code === 'FAUCET_EMPTY') fail('FAUCET_EMPTY', 'The faucet cannot pay this grant.', { retryable: false, stage: 'send' })
+        fail('NET_UNAVAILABLE', 'Acrux Net could not submit this grant.', { retryable: true, stage: 'send' })
+      }
+      const grant = z.strictObject({ transactionId: TxId, signature: Signature, balance: Balance }).parse(await response.json())
+      await db.faucetGrant.update({ where: { id: reserved.id }, data: { transactionId: grant.transactionId } })
+      // The answer follows the grant's execution: granted only once it ran, with the balance after it.
+      let state: string | undefined
+      for (const started = Date.now(); Date.now() - started < 10_000; await new Promise(r => setTimeout(r, 200))) {
+        state = (await net('getTransaction', { id: grant.transactionId }).catch(() => null) as { state?: string } | null)?.state
+        if (state === 'executed' || state === 'finalized' || state === 'failed' || state === 'expired') break
+      }
+      if (state === 'failed' || state === 'expired') { await release(); fail('GRANT_FAILED', 'The grant transaction failed on Acrux Net.', { retryable: true, stage: 'confirmation' }) }
+      if (state !== 'executed' && state !== 'finalized') fail('NET_UNAVAILABLE', 'The grant did not execute within 10 seconds.', { retryable: true, stage: 'confirmation' })
+      return grant
+    })
     const balance = await net('getBalance', { address }).catch(() => grant.balance)
-    const row = await db.faucetGrant.create({ data: { address, ipHash: ipHash(ip), amountLamports: env.FAUCET_GRANT_LAMPORTS!, transactionId: grant.transactionId } })
-    return c.json({ id: row.id, transactionId: grant.transactionId, address, amountLamports: env.FAUCET_GRANT_LAMPORTS!,
-      signature: grant.signature, balance, grantedAt: row.grantedAt.toISOString() })
+    return c.json({ id: reserved.id, transactionId: grant.transactionId, address, amountLamports: env.FAUCET_GRANT_LAMPORTS!,
+      signature: grant.signature, balance, grantedAt: reserved.grantedAt.toISOString() })
   })
 
   app.get('/v1/lab/scenarios', c => c.json(scenarios))

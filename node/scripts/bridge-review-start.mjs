@@ -30,7 +30,7 @@ try {
   assert.ok(Object.hasOwn(net.environment, 'ACRUX_BRIDGE'), 'net must receive the bridge rule path')
   assert.ok(Object.hasOwn(net.environment, 'ACRUX_BRIDGE_RPC'), 'net must receive both deposit providers')
   assert.equal(String(net.environment.ACRUX_BRIDGE_PROOF_MAX), '100000')
-  assert.ok(net.volumes.some(volume => volume.target === '/etc/acrux/bridge.json' && volume.read_only), 'only the rule is mounted into net, read-only')
+  assert.ok(net.volumes.some(volume => volume.target === '/etc/acrux/bridge' && volume.read_only), 'only the rule folder is mounted into net, read-only')
   console.log('PASS host deposits: rule, both-provider setting, archive capacity and rule mount reach net')
 } finally {
   rmSync(dir, { recursive: true, force: true })

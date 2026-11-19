@@ -20,9 +20,27 @@ From the first cblock whose initial slot reaches `fromSlot`, consensus votes sig
 
 The optional `minWithdrawal` object maps each Solana mint address to its minimum withdrawal amount as a decimal u64 string in base units. The executor applies that rule from `fromSlot`; mints absent from the map have no minimum. Keep the same bridge rule on every validator and follower.
 
-Set `ACRUX_BRIDGE_PROOF_MAX` when enabling the bridge; it has no default. It bounds archived cblocks shared by withdrawal proofs and one representative per bridge epoch, separately from the rolling 4,096-cblock window. Size it for the withdrawal volume and relayer downtime to support. A full archive logs `bridge_proof_archive_full` once on entering that state and continues finalizing and serving new proofs through the rolling window. It preserves saved proofs, including when a lowered capacity is below their existing count. New proofs that cannot be archived have only the rolling window's lifetime and do not survive a restart.
+Set `ACRUX_BRIDGE_PROOF_MAX` when enabling the bridge; it has no node default
+(host examples use 100,000). It is a soft shedding level, never an insertion cap.
+Every withdrawal proof and one representative per bridge epoch are stored above
+it too, separately from the rolling 4,096-cblock window. Representatives are
+permanent and uncapped. `ACRUX_BRIDGE_PROOF_GRACE_SLOTS` defaults to 1,728,000
+slots (24 hours at 50 ms). After durable publication, excess non-representative
+withdrawal proofs older than that age are shed oldest first, at most 100 per
+dispatch, down toward the level, only when every withdrawal in the proof is
+below the keeper's reported saved cursor. With no report, nothing is age-shed. Age follows finalized Acrux slots rather than
+wall time. Young proofs and representatives can keep the archive above the level.
+`bridge_proof_archive_full` logs once on entering that state; execution and
+proof inserts continue.
 
-A persistent net keeps the archive in `bridge-proofs.redb` beside `state.redb`. The background Solana reader prunes a withdrawal proof only after every withdrawal it contains is paid according to matching finalized release bitmaps from both configured RPCs. It validates each bitmap's owner, discriminator, bucket, length and bytes. One representative per epoch remains for handoffs after its withdrawals are paid. RPC reads run outside the consensus actor, which applies queued deletions in bounded batches.
+Bridging requires a persistent node store. The archive in `bridge-proofs.redb`
+keeps proof payloads on disk with a 64 MiB redb page cache; node and gateway memory
+hold only slot/epoch/withdrawal indexes, beside the 4,096 rolling proofs.
+The private port accepts `POST /internal/bridge-saved` with `{program,
+nextWithdrawalSequence}` (a decimal u64 string). It checks the program and accepts
+only monotonic acknowledgements; reports are volatile, so a restart waits for
+the keeper to report its Postgres cursor again. Shedding logs aggregate at
+1,024 removed proofs instead of logging every dispatch. The background Solana reader prunes a withdrawal proof only after every withdrawal it contains is paid according to matching finalized release bitmaps from both configured RPCs. It validates each bitmap's owner, discriminator, bucket, length and bytes. One representative per epoch remains for handoffs after its withdrawals are paid. The age-based policy can shed old unpaid non-representatives; the keeper retains its attempted withdrawal proofs separately in Postgres. RPC reads run outside the consensus actor, which applies queued deletions in bounded batches.
 
 Proofs become readable only after their execution state is durable. A finalized descendant also commits its ancestors: validators supply missing Finalize votes for those finalized ancestors, and the node waits for each ancestor's own relayable quorum and prepares its proof before saving the descendant's state. Archive capacity never decides consensus acceptance.
 
@@ -82,7 +100,57 @@ The node runs at high process priority with raised thread priority, so other wor
 
 ## Gateway
 
-JSON-RPC on `--gateway-port`: `getSnapshot`, `getSlot`, `getRecentSlots`, `getCurrentWindow`, `getSchedule`, `getCounters`, `getFacts`, `getTransaction`, `getLatestBlockhash`, `getBalance`, `getDemoPool`, `getQuote`, `submitTransaction`, `submitFragment`; for followers, `getExecutionSnapshot` (the state at the latest finalized cblock) `getSlotBlocks` (a slot's encrypted blocks and attestations, for the last 256 slots) and `getSlotRange` (`{from, count}`, up to 64 consecutive slots, each with its view and blocks, so a follower far from the gateway pays one round trip for many slots). The event stream on `--ws-port`. Shapes are `@acrux/contract`'s; the event catalogue is in [../README.md](../README.md).
+JSON-RPC on `--gateway-port`: `getSnapshot`, `getSlot`, `getRecentSlots`, `getCurrentWindow`, `getSchedule`, `getCounters`, `getFacts`, `getTransaction`, `getLatestBlockhash`, `getBalance`, `getDemoPool`, `getQuote`, `submitTransaction`, `submitFragment`. The event stream is on `--ws-port`. Explorer shapes are `@acrux/contract`'s; the event catalogue is in [../README.md](../README.md).
+
+Followers use a separate, smaller read path:
+
+- `getFinalizedCblock {}` returns `{consensusSlot}`, the newest durable finalized
+  consensus slot, or `null` in that field before any cblock is available.
+- `getExecutionSnapshot {}` returns the executed state and threshold cache at a
+  finalized anchor. Its anchor metadata accompanies the same checkpoint, so a
+  follower can validate the loaded state without racing a later slot lookup.
+- `getFollowerPage {from, count}` returns up to 256 consecutive slots with only
+  their replay/checking metadata and encrypted blocks. It includes state hashes,
+  agreed sets, window proposer identities, cblock parents and certificate summaries;
+  signed attestations appear once with the blocks. The response is
+  `{finalized: {consensusSlot}, slots: [{slot, view, blocks}]}`. Missing history
+  is represented by unavailable slot data, so the follower can re-anchor.
+- `getSlotBlocks {slot}` serves retained encrypted blocks and attestations.
+  Gateway node 0 retains 2,400 slots, about two minutes at 50 ms. Metrics expose
+  `acrux_follower_retained_slots` and `acrux_follower_retained_block_bytes`; the
+  latter counts retained replay buffers, excluding allocator/map overhead.
+- `getSlotRange {from, count}` keeps its existing explorer shape and 64-slot limit.
+
+`acrux node follow <url> --genesis <path>` reuses an HTTP connection, polls the
+small finalized-head call and re-executes compact pages. It still checks signed
+attestations, agreement, decrypted commitments, transactions, certificates and
+state hashes. If required blocks have expired, it prints a re-anchor line,
+loads a fresh execution snapshot and continues. Verification failures remain
+fatal; re-anchoring does not substitute for checking a mismatched state.
+
+The Solana array-parameter surface also serves `getSupply`: a context and value
+with `total`, `circulating`, `nonCirculating` and `nonCirculatingAccounts`.
+Total is the executor's lamport supply; all of it is circulating in the current
+state model, with zero non-circulating lamports and an empty account list.
+
+The F7 check is `node node/scripts/follow-far-check.mjs` from `backend/` after a
+release build. It checks the usual local net ports before using them, starts its
+own net there and a proxy on 5056 with 145 ms delay in each direction, then runs
+the real CLI follower for at least five minutes. It checks web3 supply decoding,
+compares legacy/compact wire bytes, measures retained buffers and total process
+RSS, and verifies re-anchoring after an injected availability gap. It stops only
+its own children and proxy and removes its unique test store under `node/target`.
+
+Measured locally on 2026-11-19 with 50 generated transactions/s and a 290 ms
+round-trip proxy: 4,656 checked slots over 304.6 seconds, no healthy-run resets,
+0-32 slots of sampled lag, then one successful forced re-anchor. The same 64-slot
+range used 30,435 bytes/slot in the explorer response and 10,184 bytes/slot in
+the follower response (66.5% less); small head replies averaged 55 bytes. The
+two-minute retained block allocations ended at 212 MiB, with a highest sampled
+value of 226 MiB, excluding map/allocator overhead. Entire 12-validator net RSS
+ended at 1.27 GiB;
+that is not a gateway-only memory figure. Payloads and memory depend on traffic.
+
 
 - A submission targets a slot up to 64 ahead. One that arrives after its target has started (a client far from the gateway, a wallet that took its time to sign) is admitted for 1,024 slots more and goes to the proposers then due, in the same roles. Its fee payer must hold the inclusion fee of every copy it sends, within its per-window rate; the gateway refuses it otherwise.
 - A proposer carries only copies whose payer can pay their inclusion fee and whose blockhash is still valid. A validator charges a slot's copies in block order and drops any its payer can no longer pay, so a submitted transaction never makes an honest block invalid. A transaction whose blockhash ages out before it executes fails with no fee. One carried in a slot that was skipped goes out again two windows later, to the proposer then in its role, until it executes or its blockhash expires.
@@ -90,7 +158,7 @@ JSON-RPC on `--gateway-port`: `getSnapshot`, `getSlot`, `getRecentSlots`, `getCu
 - `getFacts` is the last ten minutes of the net, measured on the node clock: pacing within windows, handover per hub link with that link's floor, commit spread, attestation arrival relative to the block, cblock finalization.
 - A threshold transaction's fragments, key shares and header signature are byte for byte what `acrux-execution/src/threshold.rs` decodes; `@acrux/sdk` and `seal_for_receivers` produce them.
 
-**Solana's JSON-RPC** on the same endpoint, in Solana's shapes, so the `solana` CLI, web3.js and wallets work against it with only the URL changed: a request with array params is Solana's, and a batch (a JSON array of requests, up to 100) is answered in order. Every browser origin may call it unless `ACRUX_CORS_ORIGINS` names a list (`*` opens it). `ACRUX_LOG_RPC=1` writes one line per Solana call (method and encoding) to stderr, to see what a wallet asks. Methods: `getHealth`, `getVersion`, `getGenesisHash` (the genesis state's hash), `getSlot`, `getBlockHeight`, `getEpochInfo`, `getLatestBlockhash`, `isBlockhashValid`, `getBalance`, `getAccountInfo`, `getMultipleAccounts` (up to 100) and `getProgramAccounts` (`base64`, `base58`, or `jsonParsed`, which parses SPL Token and Token-2022 accounts and mints and gives other accounts as base64), `getTokenAccountsByOwner` (by `mint` or `programId`; both token programs when the filter names neither), `getTokenAccountBalance`, `getTokenSupply`, `getMinimumBalanceForRentExemption`, `getFeeForMessage` (base fee, priority fee and three inclusion fees, as `sendTransaction` sends), `getRecentPrioritizationFees`, `getVoteAccounts`, `simulateTransaction` (`sigVerify`, `replaceRecentBlockhash`), `sendTransaction` (base58 or base64; simulated first unless `skipPreflight`, then sent to the next slots' three proposers; a resend of the same signed transaction answers its signature and, until it executes, goes out again), `getSignatureStatuses` (up to 256 signatures; `processed` once executed, `finalized` once its cblock is: an executed transaction can still go with a skipped cblock, so it is never reported `confirmed` before it is final), `getTransaction` (`json`, `jsonParsed`, `base64` or `base58`; `finalized` by default, `confirmed` on request; `blockTime` is when the slot executed; `preBalances`, `postBalances`, `preTokenBalances` and `postTokenBalances` for the message's accounts; `jsonParsed` parses System, SPL Token, Token-2022, Associated Token Account and Memo instructions and gives the rest, Compute Budget included as on Solana, with program, accounts and data), `getBlockTime` and `getSignaturesForAddress` (newest first, `limit`, `before`, `until`). Acrux's own `getTransaction` also takes `{signature}` in place of `{id}`.
+**Solana's JSON-RPC** on the same endpoint, in Solana's shapes, so the `solana` CLI, web3.js and wallets work against it with only the URL changed: a request with array params is Solana's, and a batch (a JSON array of requests, up to 100) is answered in order. Every browser origin may call it unless `ACRUX_CORS_ORIGINS` names a list (`*` opens it). `ACRUX_LOG_RPC=1` writes one line per Solana call (method and encoding) to stderr, to see what a wallet asks. Methods: `getHealth`, `getVersion`, `getGenesisHash` (the genesis state's hash), `getSlot`, `getBlockHeight`, `getEpochInfo`, `getLatestBlockhash`, `isBlockhashValid`, `getBalance`, `getSupply`, `getAccountInfo`, `getMultipleAccounts` (up to 100) and `getProgramAccounts` (`base64`, `base58`, or `jsonParsed`, which parses SPL Token and Token-2022 accounts and mints and gives other accounts as base64), `getTokenAccountsByOwner` (by `mint` or `programId`; both token programs when the filter names neither), `getTokenAccountBalance`, `getTokenSupply`, `getMinimumBalanceForRentExemption`, `getFeeForMessage` (base fee, priority fee and three inclusion fees, as `sendTransaction` sends), `getRecentPrioritizationFees`, `getVoteAccounts`, `simulateTransaction` (`sigVerify`, `replaceRecentBlockhash`), `sendTransaction` (base58 or base64; simulated first unless `skipPreflight`, then sent to the next slots' three proposers; a resend of the same signed transaction answers its signature and, until it executes, goes out again), `getSignatureStatuses` (up to 256 signatures; `processed` once executed, `finalized` once its cblock is: an executed transaction can still go with a skipped cblock, so it is never reported `confirmed` before it is final), `getTransaction` (`json`, `jsonParsed`, `base64` or `base58`; `finalized` by default, `confirmed` on request; `blockTime` is when the slot executed; `preBalances`, `postBalances`, `preTokenBalances` and `postTokenBalances` for the message's accounts; `jsonParsed` parses System, SPL Token, Token-2022, Associated Token Account and Memo instructions and gives the rest, Compute Budget included as on Solana, with program, accounts and data), `getBlockTime` and `getSignaturesForAddress` (newest first, `limit`, `before`, `until`). Acrux's own `getTransaction` also takes `{signature}` in place of `{id}`.
 
 **Kept transactions.** A transaction anyone sends, the built-in traffic and the faucet's credits aside, is kept in `history.redb` once its cblock finalizes: its signature, slot, accounts, logs, fee, balances, result and finalization, with its Acrux record. `getTransaction` in both shapes, `getSignatureStatuses` and `getSignaturesForAddress` answer from it once the gateway's own records of the last 20 minutes have moved on, across restarts. It keeps `ACRUX_KEEP_DAYS` (7) days and at most `ACRUX_KEEP_MAX` (200,000) transactions, the oldest going first; each takes about 6.8 KB, so the most it holds is about 1.4 GB. A slot's own detail stays for the 20 minutes, and an older one is answered as such. `getOutsideUse` (`{hours}`, 24 by default, up to 168) gives the transactions kept and their distinct fee payers for each UTC hour, and `/metrics` the current hour's as `acrux_outside_transactions_hour` and `acrux_outside_fee_payers_hour`. Programs come with the genesis (`--program ADDRESS=PATH`, or the genesis file's `programs`).
 

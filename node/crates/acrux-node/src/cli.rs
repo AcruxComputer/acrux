@@ -118,82 +118,144 @@ pub async fn send(url: &str, keypair_path: &str, to: &str, lamports: u64, n: u8,
 /// commitment, merges and re-executes them on its own SVM (Algorithm 4, the fees, the threshold
 /// fragments), and compares the state hash with the net's and with its finalization certificate.
 pub async fn follow(url: &str, genesis: &str) -> Result<()> {
-    let snapshot = rpc(url, "getExecutionSnapshot", json!({})).await?;
+    // Reuse the HTTP/TLS connection. Reconnecting for every page costs extra round trips on a
+    // remote link even after the explorer views have been removed from the follower payload.
+    let client = reqwest::Client::new();
     let genesis = crate::genesis::Genesis::load(std::path::Path::new(genesis))?;
-    let programs = genesis
-        .programs
-        .iter()
-        .map(|(address, path)| crate::execution::GenesisProgram { address: address.clone(), path: path.clone() })
-        .collect::<Vec<_>>();
-    let mut executor = crate::execution::SvmExecutor::new(Vec::<(String, u64)>::new(), &programs)?;
+    let programs = genesis.programs.iter().map(|(address, path)| crate::execution::GenesisProgram {
+        address: address.clone(), path: path.clone(),
+    }).collect::<Vec<_>>();
+    let snapshot = follower_rpc(&client, url, "getExecutionSnapshot", json!({})).await?;
+    let (mut replay, mut last, start_hash) = load_follow_snapshot(snapshot, &genesis, &programs)?;
+    println!("from cblock {last}: {} accounts loaded, state {} matches", replay.executor.account_count(), &start_hash[..12]);
+    let mut head = follower_rpc(&client, url, "getFinalizedCblock", json!({})).await?;
+    let mut checked = 0u64;
+    loop {
+        let finalized = head.get("consensusSlot").context("finalized consensusSlot")?;
+        let top = if finalized.is_null() { None } else { Some(finalized.as_u64().context("finalized consensusSlot")?) };
+        let Some(top) = top.filter(|top| *top > last) else {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            head = follower_rpc(&client, url, "getFinalizedCblock", json!({})).await?;
+            continue;
+        };
+        let mut fetched = std::collections::BTreeMap::new();
+        let mut chain = vec![];
+        let mut at = top;
+        let mut missing = None;
+        // Walk the accepted chain backward in pages, rather than transferring every skipped
+        // window between the snapshot and the tip. Each page includes the latest finalized head,
+        // which avoids another head poll while catching up.
+        loop {
+            let first = at * 4;
+            if !fetched.contains_key(&first) {
+                let through = first + 4;
+                let from = through.saturating_sub(256).max(last * 4 + 4);
+                let count = through - from;
+                let mut page = follower_rpc(&client, url, "getFollowerPage", json!({"from": from, "count": count})).await?;
+                let slots = page["slots"].as_array_mut().context("follower slots")?;
+                if slots.is_empty() { missing = Some(first); break }
+                ensure!(slots.len() <= count as usize, "follower page exceeds its requested range");
+                for (index, entry) in std::mem::take(slots).into_iter().enumerate() {
+                    let slot = entry["slot"].as_u64().context("follower slot")?;
+                    ensure!(slot == from + index as u64, "follower page is not contiguous");
+                    fetched.insert(slot, entry);
+                }
+                let newest = page["finalized"]["consensusSlot"].as_u64().context("follower finalized consensusSlot")?;
+                ensure!(newest >= top, "the finalized follower head moved backward");
+                head = page["finalized"].clone();
+            }
+            let Some(entry) = fetched.get(&first).filter(|entry| !entry["view"].is_null()) else {
+                missing = Some(first);
+                break;
+            };
+            let cblock = &entry["view"]["cblock"];
+            ensure!(cblock["consensusSlot"].as_u64() == Some(at), "slot {first} names another cblock");
+            let parent = cblock["parent"]["consensusSlot"].as_u64().context("cblock without a parent")?;
+            ensure!(parent < at && parent >= last, "cblock {top} does not extend cblock {last}");
+            chain.push(at);
+            if parent == last { break }
+            at = parent;
+        }
+        // Null data in a skipped/noncanonical part of a page is harmless. Require blocks only
+        // for the ancestors that the finalized tip actually commits.
+        if missing.is_none() {
+            missing = chain.iter().flat_map(|c| c * 4..c * 4 + 4).find(|slot| {
+                fetched.get(slot).is_none_or(|entry| entry["view"].is_null() || entry["blocks"].is_null())
+            });
+        }
+        if let Some(slot) = missing {
+            let snapshot = follower_rpc(&client, url, "getExecutionSnapshot", json!({})).await?;
+            let loaded = load_follow_snapshot(snapshot, &genesis, &programs)?;
+            ensure!(loaded.1 >= last, "the fresh snapshot is behind the already checked chain");
+            (replay, last) = (loaded.0, loaded.1);
+            println!("re-anchored at cblock {last}: history unavailable at slot {slot}, {} accounts loaded, state {} matches", replay.executor.account_count(), &loaded.2[..12]);
+            head = follower_rpc(&client, url, "getFinalizedCblock", json!({})).await?;
+            continue;
+        }
+        for c in chain.into_iter().rev() {
+            for s in c * 4..c * 4 + 4 {
+                let entry = fetched.get(&s).with_context(|| format!("slot {s} was not fetched"))?;
+                let view = &entry["view"];
+                let blocks = &entry["blocks"];
+                check_slot(view, &blocks["attestations"]).with_context(|| format!("slot {s}"))?;
+                let recipients = view["window"]["proposers"].as_array().context("proposers")?.iter()
+                    .map(|p| Ok((p["index"].as_u64().context("proposer index")? as u8, p["identity"].as_str().context("proposer identity")?.to_owned())))
+                    .collect::<Result<Vec<_>>>()?;
+                let state = replay.apply(s, &recipients, blocks).with_context(|| format!("re-executing slot {s}"))?;
+                ensure!(view["stateHash"].as_str() == Some(state.as_str()), "slot {s}: re-executed state {} differs from the net's {}", &state[..12], view["stateHash"]);
+                checked += 1;
+                println!("slot {s} re-executed  agreed {}  state {} matches  checked {checked}", view["agreedSet"], &state[..12]);
+            }
+            last = c;
+        }
+    }
+}
+
+/// A follower runs for as long as its operator leaves it: a call that times out, loses its body or
+/// is rate limited is sent again after a pause that grows to 5 s, with one line per outage. If the
+/// outage outlasts the gateway's block window, the next page shows the gap and the follower
+/// re-anchors. An answer the net gives as an error is returned as one.
+async fn follower_rpc(client: &reqwest::Client, url: &str, method: &str, params: Value) -> Result<Value> {
+    let request = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+    let mut pause = Duration::from_millis(250);
+    let mut failing = false;
+    loop {
+        let attempt = async {
+            let response = client.post(url).json(&request).timeout(Duration::from_secs(10)).send().await?;
+            anyhow::Ok(response.json::<Value>().await?)
+        };
+        let failure = match attempt.await {
+            Ok(mut body) => match body.get("error") {
+                Some(error) if error["data"]["error"]["code"] != "RATE_LIMITED" => bail!("{method}: {}", error["message"].as_str().unwrap_or(&error.to_string())),
+                Some(_) => anyhow::anyhow!("rate limited"),
+                None => {
+                    if failing { println!("{method}: reachable again"); }
+                    return Ok(body.get_mut("result").context("follower RPC result")?.take());
+                }
+            },
+            Err(error) => error,
+        };
+        if !failing { println!("{method}: {failure:#}; retrying"); failing = true; }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(Duration::from_secs(5));
+    }
+}
+
+fn load_follow_snapshot(mut snapshot: Value, genesis: &crate::genesis::Genesis, programs: &[crate::execution::GenesisProgram]) -> Result<(Replay, u64, String)> {
+    let last = snapshot["consensusSlot"].as_u64().context("snapshot consensusSlot")?;
+    ensure!(snapshot["anchor"]["consensusSlot"].as_u64() == Some(last), "snapshot anchor names another cblock");
+    let state: crate::execution::ExecutorSnapshot = serde_json::from_value(snapshot["executor"].take())?;
+    let start_hash = state.state_hash.clone();
+    ensure!(snapshot["anchor"]["stateHash"].as_str() == Some(start_hash.as_str()), "the starting state does not hash to cblock {last}'s state hash");
+    let mut executor = crate::execution::SvmExecutor::new(Vec::<(String, u64)>::new(), programs)?;
     executor.set_placements(genesis.placements.clone());
     if let Some(bridge) = &genesis.bridge {
         executor.set_bridge(bridge.program);
         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
     }
-    let state: crate::execution::ExecutorSnapshot = serde_json::from_value(snapshot["executor"].clone())?;
-    let start_hash = state.state_hash.clone();
     executor.load(state)?;
-    let mut last = snapshot["consensusSlot"].as_u64().context("consensusSlot")?;
-    let net_hash = rpc(url, "getSlot", json!({"slot": last * 4 + 3})).await?["stateHash"].as_str().map(str::to_owned);
-    ensure!(executor.state_hash() == start_hash && net_hash.as_deref() == Some(start_hash.as_str()), "the starting state does not hash to cblock {last}'s state hash");
-    println!("from cblock {last}: {} accounts loaded, state {} matches", executor.account_count(), &start_hash[..12]);
-    let mut replay = Replay { executor, threshold: serde_json::from_value(snapshot["threshold"].clone())?, window: None };
-    let mut checked = 0u64;
-    loop {
-        let slots = rpc(url, "getRecentSlots", json!({"limit": 64})).await?;
-        let top = slots.as_array().context("slots")?.iter()
-            .filter(|s| s["slot"].as_u64().is_some_and(|n| n % 4 == 3) && s["cblock"]["status"] == "finalized")
-            .filter_map(|s| s["cblock"]["consensusSlot"].as_u64())
-            .filter(|c| *c > last)
-            .max();
-        if let Some(top) = top {
-            // Every slot since the last cblock run, its view and blocks, in pages of 64: a follower
-            // far from the gateway pays a round trip per page, not two per slot.
-            let mut fetched = std::collections::BTreeMap::new();
-            let mut from = last * 4 + 4;
-            while from < top * 4 + 4 {
-                let count = (top * 4 + 4 - from).min(64);
-                let page = rpc(url, "getSlotRange", json!({"from": from, "count": count})).await?;
-                let page = page.as_array().context("slot range")?;
-                ensure!(!page.is_empty(), "slot {from} is not held by the gateway");
-                for entry in page {
-                    fetched.insert(entry["slot"].as_u64().context("slot")?, entry.clone());
-                }
-                from += page.len() as u64;
-            }
-            // A finalized cblock finalizes its ancestors: execute the chain back to the last one run.
-            let mut chain = vec![top];
-            loop {
-                let first = chain.last().unwrap() * 4;
-                let cblock = &fetched.get(&first).with_context(|| format!("slot {first} was not fetched"))?["view"]["cblock"];
-                let parent = cblock["parent"]["consensusSlot"].as_u64().context("cblock without a parent")?;
-                if parent == last {
-                    break;
-                }
-                ensure!(parent > last, "cblock {top} does not extend cblock {last}");
-                chain.push(parent);
-            }
-            for c in chain.into_iter().rev() {
-                for s in c * 4..c * 4 + 4 {
-                    let entry = fetched.get(&s).with_context(|| format!("slot {s} was not fetched"))?;
-                    let view = &entry["view"];
-                    check_slot(view).with_context(|| format!("slot {s}"))?;
-                    let blocks = &entry["blocks"];
-                    ensure!(!blocks.is_null(), "slot {s}: the gateway no longer holds its blocks");
-                    let recipients = view["window"]["proposers"].as_array().context("proposers")?.iter()
-                        .map(|p| (p["index"].as_u64().unwrap() as u8, p["identity"].as_str().unwrap().to_owned())).collect::<Vec<_>>();
-                    let state = replay.apply(s, &recipients, blocks).with_context(|| format!("re-executing slot {s}"))?;
-                    ensure!(view["stateHash"].as_str() == Some(state.as_str()), "slot {s}: re-executed state {} differs from the net's {}", &state[..12], view["stateHash"]);
-                    checked += 1;
-                    println!("slot {s} re-executed  agreed {}  state {} matches  checked {checked}", view["agreedSet"], &state[..12]);
-                }
-                last = c;
-            }
-        } else {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
+    ensure!(executor.state_hash() == start_hash, "the loaded state does not hash to cblock {last}'s state hash");
+    Ok((Replay { executor, threshold: serde_json::from_value(snapshot["threshold"].take())?, window: None }, last, start_hash))
 }
 
 struct Replay {
@@ -296,10 +358,10 @@ impl Replay {
     }
 }
 
-fn check_slot(slot: &Value) -> Result<()> {
+fn check_slot(slot: &Value, signed_attestations: &Value) -> Result<()> {
     let proposers = slot["window"]["proposers"].as_array().context("proposers")?;
     let mut attestations = vec![];
-    for a in slot["attestations"].as_array().context("attestations")? {
+    for a in signed_attestations.as_array().context("attestations")? {
         let index = a["proposer"].as_u64().context("proposer")? as usize;
         let identity = proposers.iter().find(|p| p["index"] == index).context("attestation by a non-proposer")?["identity"].as_str().unwrap();
         let attestation = Attestation {

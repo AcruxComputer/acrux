@@ -1,8 +1,14 @@
 # Acrux on one Linux host: Acrux Net, the API with its Fault Lab sandboxes, Postgres, and Caddy in
 # front with TLS. Run from this folder: docker compose --env-file acrux.env up -d
 name: acrux
+# Every container's log rotates at 50 MB, five files kept.
+x-logging: &logging
+  driver: json-file
+  options: { max-size: 50m, max-file: "5" }
+
 services:
   postgres:
+    logging: *logging
     image: postgres:17-alpine
     container_name: acrux-postgres
     environment: { POSTGRES_USER: acrux, POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}", POSTGRES_DB: acrux }
@@ -11,6 +17,7 @@ services:
     restart: unless-stopped
 
   net:
+    logging: *logging
     image: acrux-net:${ACRUX_VERSION:-latest}
     build: { context: ../.., dockerfile: deploy/Dockerfile, target: net }
     container_name: acrux-net
@@ -32,18 +39,17 @@ services:
       ACRUX_BRIDGE: "${ACRUX_BRIDGE:-}"
       ACRUX_BRIDGE_RPC: "${ACRUX_BRIDGE_RPC:-}"
       ACRUX_BRIDGE_PROOF_MAX: "${ACRUX_BRIDGE_PROOF_MAX:-100000}"
+      ACRUX_BRIDGE_PROOF_GRACE_SLOTS: "${ACRUX_BRIDGE_PROOF_GRACE_SLOTS:-1728000}"
     # The chain's saved state and kept transactions: a start continues from the last finalized cblock.
     volumes:
       - acrux-net:/var/lib/acrux
       - "${ACRUX_GENESIS_FILE}:/app/chain/genesis/acrux-net.json:ro"
-      - type: bind
-        source: /etc/acrux/bridge.json
-        target: /etc/acrux/bridge.json
-        read_only: true
-        bind: { create_host_path: false }
+      # The bridge rule's folder: bridge.json there, named by ACRUX_BRIDGE.
+      - /etc/acrux/bridge:/etc/acrux/bridge:ro
     restart: unless-stopped
 
   api:
+    logging: *logging
     image: acrux-api:${ACRUX_VERSION:-latest}
     build: { context: ../.., dockerfile: deploy/Dockerfile, target: api }
     container_name: acrux-api
@@ -76,6 +82,7 @@ services:
     restart: unless-stopped
 
   keeper:
+    logging: *logging
     image: acrux-api:${ACRUX_VERSION:-latest}
     build: { context: ../.., dockerfile: deploy/Dockerfile, target: api }
     container_name: acrux-keeper
@@ -87,18 +94,20 @@ services:
       LAUNCH_KEYPAIR_FILE: /etc/acrux/launch-keypair.json
       BRIDGE_PROGRAM_ID: "${BRIDGE_PROGRAM_ID:-}"
       GATEWAY_RPC_URL: http://net:4930
-      BRIDGE_RELAYER_KEYPAIR_FILE: /etc/acrux/bridge-relayer-keypair.json
+      # The relayer reports its saved-proof cursor on the node's private port.
+      GATEWAY_INTERNAL_URL: http://net:4989
+      BRIDGE_RELAYER_KEYPAIR_FILE: /etc/acrux/bridge-relayer/keypair.json
+      BRIDGE_RELAYER_MAX_NEW_WITHDRAWALS_PER_CYCLE: "${BRIDGE_RELAYER_MAX_NEW_WITHDRAWALS_PER_CYCLE:-10}"
+      BRIDGE_RELAYER_MAX_RETRY_WITHDRAWALS_PER_CYCLE: "${BRIDGE_RELAYER_MAX_RETRY_WITHDRAWALS_PER_CYCLE:-10}"
     command: ["node", "api/scripts/start-service.mjs", "keeper"]
     volumes:
       - "/etc/acrux/launch-keypair.json:/etc/acrux/launch-keypair.json:ro"
-      - type: bind
-        source: /etc/acrux/bridge-relayer-keypair.json
-        target: /etc/acrux/bridge-relayer-keypair.json
-        read_only: true
-        bind: { create_host_path: false }
+      # The relayer's fee wallet folder: keypair.json there, mode 600.
+      - /etc/acrux/bridge-relayer:/etc/acrux/bridge-relayer:ro
     restart: unless-stopped
 
   caddy:
+    logging: *logging
     image: caddy:2
     container_name: acrux-caddy
     depends_on: [net, api]

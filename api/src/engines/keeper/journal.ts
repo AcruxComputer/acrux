@@ -42,6 +42,8 @@ export type JournalOptions = {
   /** extra instructions every keeper transaction carries (a Sender tip) */
   extra?: (signer: Keypair) => TransactionInstruction[]
   broadcast?: Broadcast
+  /** Reject retired task instructions before rebroadcasting already-journaled bytes. */
+  beforeBroadcast?: (bytes: Uint8Array) => void
   registry?: ErrorRegistry
   /** checked before every send: a demoted keeper must not write */
   isLeader?: () => boolean
@@ -101,6 +103,7 @@ export function createJournal(options: JournalOptions) {
         } else if (Date.now() >= nextSend) {
           own()
           nextSend = Date.now() + REBROADCAST_MS
+          options.beforeBroadcast?.(Uint8Array.from(bytes))
           try {
             await send(Uint8Array.from(bytes), row.contextSlot)
           } catch (error) {

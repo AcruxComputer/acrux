@@ -1,6 +1,6 @@
 // Run against an operator-started local Solana bridge stand. Start one separate Acrux net with
-// archive capacity one, deposit test tokens, burn twice, and prove slots/proofs continue after
-// the archive fills. No keeper is started and neither withdrawal is released on Solana.
+// archive shedding level one, deposit test tokens, burn twice, and prove slots/proofs
+// continue above the level. No keeper is started and neither withdrawal is released on Solana.
 // Own ports from ACRUX_CHECK_BASE_PORT (5041 by default): QUIC base..base+11, gateway base+12/13, private metrics base+14. Stop only the spawned net
 // and remove its unique node/target directory. The operator's validator and stand stay running.
 // Usage: node scripts/bridge-capacity-check.mjs <stand dir> [local Solana RPC URL] [acrux binary]
@@ -104,7 +104,6 @@ try {
   const opening = await until('initial finalized proof', 60, async () => {
     try { const value = await rpc('getCblockProof', { latest: true }); return value?.chainId === chainId ? value : null } catch { return null }
   })
-  await until('archive capacity warning', 5, async () => fullWarnings > 0)
   const granted = await fetch(`${metrics}/internal/faucet`, { method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ address: stand.user, amountLamports: '2000000000' }), signal: AbortSignal.timeout(10_000) })
   if (!granted.ok) throw new Error('The capacity-check faucet grant failed.')
@@ -145,7 +144,8 @@ try {
   const after = await until('continued finalization after both withdrawals', 15, async () => {
     const latest = await rpc('getCblockProof', { latest: true }); return latest.consensusSlot > withdrawalCblocks[1] ? latest : null
   })
-  if (fullWarnings !== 1) throw new Error('A full archive must emit exactly one transition warning.')
+  await until('archive above-level warning', 5, async () => fullWarnings > 0)
+  if (fullWarnings !== 1) throw new Error('An archive above its shedding level must emit exactly one transition warning.')
   console.log(JSON.stringify({ event: 'bridge_capacity_check', capacity: 1, fullWarnings, firstCblock: opening.consensusSlot,
     withdrawalCblocks, laterCblock: after.consensusSlot, proofsServed: true }))
 } finally {

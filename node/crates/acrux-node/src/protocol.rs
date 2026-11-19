@@ -30,6 +30,9 @@ use std::{
 };
 use tokio::sync::{mpsc, RwLock};
 
+/// Two minutes of 50 ms slots for followers catching up over an ordinary remote connection.
+const FOLLOWER_SLOTS: u64 = 2_400;
+
 #[derive(Default)]
 struct LocalSlot {
     start: Option<Instant>,
@@ -46,6 +49,23 @@ struct LocalSlot {
     executed: bool,
     agreed: Option<Vec<usize>>,
     state_hash: Option<String>,
+}
+impl LocalSlot {
+    /// Retained block allocations, including shred/transaction structs in vectors. Map nodes,
+    /// allocator metadata and other protocol state are excluded; process RSS is measured outside.
+    fn block_buffer_bytes(&self) -> usize {
+        let shreds = self.shreds.values().map(|shreds| shreds.capacity() * std::mem::size_of::<Shred>() + shreds.iter().map(|s| {
+            s.data.capacity() + s.signature.capacity() + s.proof.capacity() * 32
+        }).sum::<usize>()).sum::<usize>();
+        let payload = self.payload.values().map(|txs| txs.capacity() * std::mem::size_of::<ValidatedTx>() + txs.iter().map(|tx| {
+            let h = &tx.header;
+            tx.bytes.capacity() + h.id.capacity() + h.fee_payer.capacity() + h.priority_fee_per_cu.capacity()
+                + h.writable_accounts.capacity() * std::mem::size_of::<String>() + h.writable_accounts.iter().map(String::capacity).sum::<usize>()
+        }).sum::<usize>()).sum::<usize>();
+        shreds + payload + self.cipher.values().map(Vec::capacity).sum::<usize>()
+            + self.meta.len() * std::mem::size_of::<ShredMeta>()
+            + self.attest.values().map(|(a, sig)| a.pi.capacity() * std::mem::size_of::<Option<[u8; 32]>>() + sig.capacity()).sum::<usize>()
+    }
 }
 #[derive(Clone, Copy)]
 struct WindowRun {
@@ -491,9 +511,10 @@ impl Network {
             .transpose()?;
         if let Some(archive) = &bridge_proofs {
             let mut state = gateway.write().await;
-            state.archived_cblock_proofs = archive.proofs.clone();
+            state.bridge_archive = Some(archive.store.clone());
             state.archived_withdrawals = archive.withdrawals.clone();
             state.epoch_cblock_proofs = archive.epochs.clone();
+            state.bridge_program = genesis.as_ref().and_then(|g| g.bridge.as_ref()).map(|rule| rule.program.to_string());
         }
         let resumed = match &saved {
             Some(saved) => Some(BlockRef {
@@ -621,7 +642,11 @@ impl Network {
             None => nodes[0].genesis.hash(),
         };
         let counter_base = saved.as_ref().map_or((0, 0), |s| (s.meta.finalized_cblocks, s.meta.skips));
-        gateway.write().await.counter_base = counter_base;
+        {
+            let mut gateway = gateway.write().await;
+            gateway.counter_base = counter_base;
+            gateway.finalized_cblock = resumed.map(|block| block.slot);
+        }
         if let Some(saved) = &saved {
             tracing::warn!(cblock = saved.meta.cblock, slot = saved.meta.cblock * 4 + 3, state = %saved.state.state_hash, "continuing the chain from its saved state");
         }
@@ -844,12 +869,11 @@ impl Network {
         let archive = self.bridge_proofs.as_ref().expect("bridge proof archive configured");
         let mut gateway = self.gateway.write().await;
         if archived {
-            if archive.proofs.contains_key(&c) {
-                gateway.archived_cblock_proofs.insert(c, proof.clone());
+            if archive.withdrawals.contains_key(&c) {
                 gateway.archived_withdrawals.insert(c, archive.withdrawals[&c].clone());
+                let epoch = c * 4 / proof["epochSlots"].as_u64().expect("proof epochSlots");
+                gateway.epoch_cblock_proofs.entry(epoch).or_insert(c);
             }
-            let epoch = c * 4 / proof["epochSlots"].as_u64().expect("proof epochSlots");
-            gateway.epoch_cblock_proofs.entry(epoch).or_insert(c);
         }
         gateway.keep_cblock_proof(c, proof);
     }
@@ -1174,7 +1198,6 @@ impl Network {
                 if !removed.is_empty() {
                     let mut gateway = self.gateway.write().await;
                     for slot in removed {
-                        gateway.archived_cblock_proofs.remove(&slot);
                         gateway.archived_withdrawals.remove(&slot);
                     }
                     gateway.epoch_cblock_proofs = archive.epochs.clone();
@@ -1278,6 +1301,19 @@ impl Network {
             }
             let prepared = self.pending_bridge_proofs.keys().copied().take_while(|c| *c <= durable).collect::<Vec<_>>();
             for c in prepared { self.record_proof(c).await; }
+            // Age is measured against persisted finality, after publishing every prepared
+            // ancestor. A crash cannot shed an old proof using a frontier that was never saved.
+            let saved_cursor = self.gateway.read().await.bridge_saved_cursor;
+            if let (Some(archive), Some(prepared_through)) = (&mut self.bridge_proofs, self.proof_prepared_through) {
+                let removed = archive.shed_stale(durable.min(prepared_through), saved_cursor)?;
+                if !removed.is_empty() {
+                    let mut gateway = self.gateway.write().await;
+                    for slot in removed {
+                        gateway.archived_withdrawals.remove(&slot);
+                    }
+                    gateway.epoch_cblock_proofs = archive.epochs.clone();
+                }
+            }
         }
         let queued = Instant::now();
         self.observer.submit(node, events, step.persist).await?;
@@ -1446,7 +1482,14 @@ impl Network {
         let wall = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let json = facts.json(utc(wall));
         self.exchange.prune_commit_times(until.saturating_sub(64));
-        self.gateway.write().await.facts = json;
+        let node = &self.nodes[0];
+        let retained = node.slots.iter().filter(|(_, local)| local.executed && !local.cipher.is_empty()).map(|(slot, _)| *slot).collect::<Vec<_>>();
+        let bytes = node.slots.values().map(LocalSlot::block_buffer_bytes).sum::<usize>() as u64;
+        let mut gateway = self.gateway.write().await;
+        gateway.facts = json;
+        gateway.follower_retained_slots = retained.len() as u64;
+        gateway.follower_earliest_slot = retained.first().copied();
+        gateway.follower_retained_block_bytes = bytes;
     }
     async fn tick(&mut self) -> Result<()> {
         let _phase = self.profile.measure(None, "protocol.tick");
@@ -1575,15 +1618,15 @@ impl Network {
             }
         }
         for id in self.active.clone() {
-            // Validator 0 serves followers through the gateway, so it holds blocks for 256 slots.
-            let held = if id == 0 { 256 } else { 64 };
+            // Validator 0 serves followers; other validators retain their short execution window.
+            let held = if id == 0 { FOLLOWER_SLOTS } else { 64 };
             let node = &mut self.nodes[id];
             if let Some(last) = node.last_executed {
                 for (slot, local) in node
                     .slots
-                    .range_mut(last.saturating_sub(held + 32)..last.saturating_sub(held))
+                    .range_mut(last.saturating_sub(held + 32)..last.saturating_sub(held - 1))
                 {
-                    if *slot + held < last {
+                    if *slot + held <= last {
                         local.shreds.clear();
                         local.cipher.clear();
                         local.meta.clear();
@@ -1607,9 +1650,10 @@ impl Network {
                 node.threshold_checkpoints
                     .retain(|slot, _| *slot + 8 >= window * 4 || *slot >= floor || Some(*slot) == parent);
             }
-            // Everything 64 consensus slots below finality is settled and already in the store.
+            // Keep node zero's local slots, windows and parent chain for the same follower window.
             if let Some(finalized) = node.votor.finalized() {
-                let below = finalized.slot.saturating_sub(64).min(proof_floor.unwrap_or(u64::MAX));
+                let held_cblocks = if id == 0 { FOLLOWER_SLOTS / 4 } else { 64 };
+                let below = finalized.slot.saturating_sub(held_cblocks).min(proof_floor.unwrap_or(u64::MAX));
                 if below > node.votor.pruned_below() {
                     node.votor.prune(below);
                     node.slots = node.slots.split_off(&(below * 4));
@@ -3382,35 +3426,27 @@ impl Network {
             GatewayCommand::ExecutionSnapshot { reply } => {
                 let result = (|| {
                     let node = &self.nodes[0];
-                    let finalized = node.votor.finalized().context("Nothing finalized yet")?;
+                    let finalized = self.finalized_checkpoint()?;
                     let checkpoint = node.checkpoints.get(&finalized.slot).context("Finalized checkpoint not held")?;
                     let threshold = node.threshold_checkpoints.get(&finalized.slot).context("Finalized fragment cache not held")?;
+                    let executor = node.executor.as_ref().unwrap().snapshot(checkpoint);
                     Ok::<_, anyhow::Error>(json!({
                         "consensusSlot": finalized.slot,
                         "lastSlot": finalized.slot * 4 + 3,
-                        "executor": node.executor.as_ref().unwrap().snapshot(checkpoint),
+                        "anchor": {"consensusSlot": finalized.slot, "hash": hex::encode(finalized.hash), "stateHash": executor.state_hash},
+                        "executor": executor,
                         "threshold": threshold,
                     }))
                 })();
                 let _ = reply.send(result.map_err(|e| e.to_string()));
             }
             GatewayCommand::SlotBlocks { slot, reply } => {
-                let result = (|| {
-                    let local = self.nodes[0].slots.get(&slot).context("Slot not held")?;
-                    let agreed = local.agreed.clone().context("Slot not agreed")?;
-                    ensure!(!local.cipher.is_empty(), "Blocks no longer held");
-                    let blocks = agreed.iter().map(|q| {
-                        let slices = local.meta.iter().filter(|((p, _), _)| p == q).map(|((_, i), meta)| json!({
-                            "meta": meta,
-                            "cipher": local.cipher.get(&(*q, *i)).map(|c| B64.encode(c)),
-                            "root": local.shreds.get(&(*q, *i)).and_then(|s| s.first()).map(|s| hex::encode(s.root)),
-                        })).collect::<Vec<_>>();
-                        json!({"proposer": q, "slices": slices})
-                    }).collect::<Vec<_>>();
-                    let attestations = local.attest.values().map(|(a, _)| json!({"proposer": a.proposer, "pi": a.pi.iter().map(|h| h.map(hex::encode)).collect::<Vec<_>>(), "key": B64.encode(a.key)})).collect::<Vec<_>>();
-                    Ok::<_, anyhow::Error>(json!({"slot": slot, "agreed": agreed, "blocks": blocks, "attestations": attestations}))
-                })();
+                let result = self.slot_blocks(slot, false);
                 let _ = reply.send(result.map_err(|e| e.to_string()));
+            }
+            GatewayCommand::FollowerBlocks { from, count, reply } => {
+                let blocks = (from..from + count).map(|slot| self.slot_blocks(slot, true).ok()).collect::<Vec<_>>();
+                let _ = reply.send(Ok(json!(blocks)));
             }
             GatewayCommand::DemoPool { reply } => {
                 let _ = reply.send(self.pool_reserves().map(|(genesis, reserves, slot)| genesis.demo_pool(reserves, slot)).map_err(|e| e.to_string()));
@@ -3446,6 +3482,42 @@ impl Network {
             }
         }
     }
+    /// A snapshot must not expose finality beyond the durable checkpoint. Follow the actual
+    /// parent chain, since a skipped window can make the preceding numeric cblock an orphan.
+    fn finalized_checkpoint(&self) -> Result<BlockRef> {
+        let node = &self.nodes[0];
+        let mut block = node.votor.finalized().context("Nothing finalized yet")?;
+        let durable = crate::state::durable();
+        while block.slot > durable {
+            block = if block.slot % 4 == 0 {
+                node.windows.get(&(block.slot / 4)).and_then(|w| w.parent)
+            } else {
+                node.executed_blocks.get(&(block.slot - 1)).copied()
+            }.context("No durable finalized ancestor held")?;
+        }
+        Ok(block)
+    }
+
+    fn slot_blocks(&self, slot: u64, signed_attestations: bool) -> Result<Value> {
+        let local = self.nodes[0].slots.get(&slot).context("Slot not held")?;
+        let agreed = local.agreed.as_ref().context("Slot not agreed")?;
+        ensure!(!local.cipher.is_empty(), "Blocks no longer held");
+        let blocks = agreed.iter().map(|q| {
+            let slices = local.meta.iter().filter(|((p, _), _)| p == q).map(|((_, i), meta)| json!({
+                "meta": meta,
+                "cipher": local.cipher.get(&(*q, *i)).map(|c| B64.encode(c)),
+                "root": local.shreds.get(&(*q, *i)).and_then(|s| s.first()).map(|s| hex::encode(s.root)),
+            })).collect::<Vec<_>>();
+            json!({"proposer": q, "slices": slices})
+        }).collect::<Vec<_>>();
+        let attestations = local.attest.values().map(|(a, signature)| {
+            let mut attestation = json!({"proposer": a.proposer, "pi": a.pi.iter().map(|h| h.map(hex::encode)).collect::<Vec<_>>(), "key": B64.encode(a.key)});
+            if signed_attestations { attestation["signature"] = json!(bs58::encode(signature).into_string()); }
+            attestation
+        }).collect::<Vec<_>>();
+        Ok(json!({"slot": slot, "agreed": agreed, "blocks": blocks, "attestations": attestations}))
+    }
+
     /// The demo pool's vault balances, read from node zero's executed state.
     fn pool_reserves(&self) -> Result<(Arc<crate::genesis::Genesis>, [u64; 2], u64)> {
         let genesis = self.genesis.clone().context("No demo pool in this net's genesis")?;
@@ -4037,6 +4109,10 @@ impl Network {
             "getEpochInfo" => json!({"absoluteSlot": slot, "blockHeight": slot, "epoch": slot / 432_000, "slotIndex": slot % 432_000, "slotsInEpoch": 432_000}),
             "getLatestBlockhash" => json!({"context": context, "value": {"blockhash": executor.latest_blockhash(), "lastValidBlockHeight": slot + crate::execution::BLOCKHASH_AGE_SLOTS - 8}}),
             "getBalance" => json!({"context": context, "value": executor.balance(arg(0).as_str().context("address")?)?}),
+            "getSupply" => {
+                let total = executor.total_lamports()?;
+                json!({"context": context, "value": {"total": total, "circulating": total, "nonCirculating": 0, "nonCirculatingAccounts": []}})
+            }
             "getAccountInfo" => {
                 let encoding = encoding(&arg(1));
                 json!({"context": context, "value": executor.account(arg(0).as_str().context("address")?)?.filter(|a| a.lamports > 0).map(|a| account_json(&a, &encoding))})

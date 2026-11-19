@@ -1,7 +1,19 @@
 import { readFile, stat } from 'node:fs/promises'
 import { Keypair, PublicKey } from '@solana/web3.js'
 
-export type BridgeRelayerConfig = { program: PublicKey; rpcUrl: string; gatewayUrl: string; keypairFile: string; intervalMs: number }
+export type BridgeRelayerConfig = {
+  program: PublicKey
+  rpcUrl: string
+  gatewayUrl: string
+  gatewayInternalUrl: string
+  keypairFile: string
+  intervalMs: number
+  maxNewWithdrawalsPerCycle: number
+  maxRetryWithdrawalsPerCycle: number
+  /** Parked withdrawals waiting for the recipient's token account: a budget apart, so a flood of them never delays other retries. */
+  maxAccountRetryWithdrawalsPerCycle: number
+  maxSavedCblocksPerCycle: number
+}
 
 export function readBridgeRelayerConfig(env: NodeJS.ProcessEnv = process.env): BridgeRelayerConfig | null {
   const rawProgram = env.BRIDGE_PROGRAM_ID?.trim()
@@ -20,7 +32,19 @@ export function readBridgeRelayerConfig(env: NodeJS.ProcessEnv = process.env): B
   const rawInterval = env.BRIDGE_RELAYER_INTERVAL_SECONDS?.trim() || '15'
   const seconds = Number(rawInterval)
   if (!/^\d+$/.test(rawInterval) || !Number.isSafeInteger(seconds) || seconds < 1 || seconds > 60) throw new Error('BRIDGE_RELAYER_INTERVAL_SECONDS must be 1 to 60.')
-  return { program, rpcUrl: url('SOLANA_RPC_URL'), gatewayUrl: url('GATEWAY_RPC_URL'), keypairFile, intervalMs: seconds * 1000 }
+  const batchSize = (name: string, fallback = 10) => {
+    const raw = env[name]?.trim() || String(fallback)
+    const value = Number(raw)
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < 1 || value > 2_147_483_647) throw new Error(`${name} must be a positive 32-bit integer.`)
+    return value
+  }
+  return {
+    program, rpcUrl: url('SOLANA_RPC_URL'), gatewayUrl: url('GATEWAY_RPC_URL'), gatewayInternalUrl: url('GATEWAY_INTERNAL_URL'), keypairFile, intervalMs: seconds * 1000,
+    maxNewWithdrawalsPerCycle: batchSize('BRIDGE_RELAYER_MAX_NEW_WITHDRAWALS_PER_CYCLE'),
+    maxRetryWithdrawalsPerCycle: batchSize('BRIDGE_RELAYER_MAX_RETRY_WITHDRAWALS_PER_CYCLE'),
+    maxAccountRetryWithdrawalsPerCycle: batchSize('BRIDGE_RELAYER_MAX_ACCOUNT_RETRY_WITHDRAWALS_PER_CYCLE', 30),
+    maxSavedCblocksPerCycle: batchSize('BRIDGE_RELAYER_MAX_SAVED_CBLOCKS_PER_CYCLE', 512),
+  }
 }
 
 export async function loadBridgeRelayerKeypair(config: BridgeRelayerConfig): Promise<Keypair> {

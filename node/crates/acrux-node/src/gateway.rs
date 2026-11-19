@@ -68,6 +68,11 @@ pub enum GatewayCommand {
         slot: u64,
         reply: CommandReply,
     },
+    FollowerBlocks {
+        from: u64,
+        count: u64,
+        reply: CommandReply,
+    },
     Quote {
         params: Value,
         reply: CommandReply,
@@ -90,13 +95,21 @@ pub struct GatewayState {
     /// The transactions people sent, kept for days, when the net persists.
     pub kept: Option<Arc<crate::history::History>>,
     pub facts: Value,
+    /// Published by node zero's durable finalization event, independently of the explorer cache.
+    pub finalized_cblock: Option<u64>,
+    pub follower_retained_slots: u64,
+    pub follower_retained_block_bytes: u64,
+    pub follower_earliest_slot: Option<u64>,
     /// Finalized cblocks' proofs for Solana's light client, by consensus slot: the hash's
     /// preimage, the outbox and the signed finalizing votes.
     pub cblock_proofs: BTreeMap<u64, Value>,
-    /// Withdrawal proofs and one representative per bridge epoch, outside the rolling window.
-    pub archived_cblock_proofs: BTreeMap<u64, Value>,
+    /// Archived payloads stay in redb; only published slots/epochs/sequences are indexed here.
+    pub bridge_archive: Option<Arc<crate::bridge::ProofArchiveStore>>,
     pub archived_withdrawals: BTreeMap<u64, Vec<u64>>,
     pub epoch_cblock_proofs: BTreeMap<u64, u64>,
+    pub bridge_program: Option<String>,
+    /// Volatile acknowledgement of the relayer's durable Postgres save cursor.
+    pub bridge_saved_cursor: Option<u64>,
     pub parameters: Value,
     pub balances: BTreeMap<String, u64>,
     pub stream_id: String,
@@ -123,10 +136,16 @@ impl GatewayState {
             current_window: Value::Null,
             upcoming_windows: vec![],
             facts: Value::Null,
+            finalized_cblock: None,
+            follower_retained_slots: 0,
+            follower_retained_block_bytes: 0,
+            follower_earliest_slot: None,
             cblock_proofs: BTreeMap::new(),
-            archived_cblock_proofs: BTreeMap::new(),
+            bridge_archive: None,
             archived_withdrawals: BTreeMap::new(),
             epoch_cblock_proofs: BTreeMap::new(),
+            bridge_program: None,
+            bridge_saved_cursor: None,
             counters: json!({"slots":0,"finalizedCblocks":0,"skips":0,"averageCommitSpreadUs":0}),
             counter_base: (0, 0),
             kept: None,
@@ -232,6 +251,7 @@ pub async fn run_gateway(
         .route("/metrics", get(metrics))
         .route("/health", get(health))
         .route("/internal/faucet", post(credit).get(faucet))
+        .route("/internal/bridge-saved", post(bridge_saved).layer(DefaultBodyLimit::max(256)))
         .with_state(state);
     // 127.0.0.1 locally; a container sets ACRUX_BIND=0.0.0.0.
     let bind: IpAddr = std::env::var("ACRUX_BIND").unwrap_or_else(|_| "127.0.0.1".into()).parse()?;
@@ -314,7 +334,7 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
     }
     let params = request.get("params").cloned().unwrap_or(json!({}));
     // Solana's methods take array params; Acrux's take an object. Solana-only methods may omit them.
-    let solana_only = matches!(method, "getHealth" | "getVersion" | "getGenesisHash" | "getFeeForMessage" | "simulateTransaction" | "getRecentPrioritizationFees" | "getBlockTime" | "getTokenAccountsByOwner" | "getTokenAccountBalance" | "getTokenSupply" | "getBlockHeight" | "getEpochInfo" | "getAccountInfo" | "getMultipleAccounts" | "getProgramAccounts" | "getMinimumBalanceForRentExemption" | "getSignaturesForAddress" | "getVoteAccounts" | "sendTransaction" | "getSignatureStatuses" | "getRecentPerformanceSamples");
+    let solana_only = matches!(method, "getHealth" | "getVersion" | "getGenesisHash" | "getFeeForMessage" | "simulateTransaction" | "getRecentPrioritizationFees" | "getBlockTime" | "getTokenAccountsByOwner" | "getTokenAccountBalance" | "getTokenSupply" | "getSupply" | "getBlockHeight" | "getEpochInfo" | "getAccountInfo" | "getMultipleAccounts" | "getProgramAccounts" | "getMinimumBalanceForRentExemption" | "getSignaturesForAddress" | "getVoteAccounts" | "sendTransaction" | "getSignatureStatuses" | "getRecentPerformanceSamples");
     if params.is_array() || (solana_only && !params.is_object()) || (solana_only && params.as_object().is_some_and(|o| o.is_empty())) {
         let params = if params.is_array() { params } else { json!([]) };
         // ACRUX_LOG_RPC=1: one line per Solana call, its method and encoding, to see what a wallet asks.
@@ -350,19 +370,30 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
             if selectors != 1 || (slot.is_none() && epoch.is_none() && params.get("latest") != Some(&Value::Bool(true))) {
                 Err(("INVALID_INPUT", "Give exactly one of consensusSlot, epoch, or latest: true."))
             } else {
-                let proof = if let Some(slot) = slot {
-                    state.cblock_proofs.get(&slot).or_else(|| state.archived_cblock_proofs.get(&slot))
+                let slot = if let Some(slot) = slot {
+                    Some(slot)
                 } else if let Some(epoch) = epoch {
-                    state.epoch_cblock_proofs.get(&epoch).and_then(|slot| state.archived_cblock_proofs.get(slot)).or_else(|| {
+                    state.epoch_cblock_proofs.get(&epoch).copied().or_else(|| {
                         state.cblock_proofs.iter().find_map(|(slot, proof)| {
                             let epoch_slots = proof["epochSlots"].as_u64().filter(|length| *length > 0)?;
-                            (slot * 4 / epoch_slots == epoch).then_some(proof)
+                            (slot * 4 / epoch_slots == epoch).then_some(*slot)
                         })
                     })
                 } else {
-                    state.cblock_proofs.last_key_value().into_iter().chain(state.archived_cblock_proofs.last_key_value()).max_by_key(|(slot, _)| *slot).map(|(_, proof)| proof)
+                    state.cblock_proofs.keys().next_back().into_iter().chain(state.archived_withdrawals.keys().next_back()).max().copied()
                 };
-                proof.cloned().ok_or(("NOT_FOUND", "No finalized bridge proof is held for this selector; the archive capacity may have expired it."))
+                match slot {
+                    Some(slot) => match state.cblock_proofs.get(&slot) {
+                        Some(proof) => Ok(proof.clone()),
+                        None if state.archived_withdrawals.contains_key(&slot) => match state.bridge_archive.as_ref().map(|archive| archive.get(slot)).transpose() {
+                            Ok(Some(Some(proof))) => Ok(proof),
+                            Ok(_) => Err(("NOT_FOUND", "No finalized bridge proof is held for this selector.")),
+                            Err(_) => Err(("INTERNAL_ERROR", "The archived bridge proof could not be read.")),
+                        },
+                        None => Err(("NOT_FOUND", "No finalized bridge proof is held for this selector.")),
+                    },
+                    None => Err(("NOT_FOUND", "No finalized bridge proof is held for this selector.")),
+                }
             }
         },
         "getFacts" => match state.read().await.facts.clone() {
@@ -536,9 +567,29 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
             }
             _ => Err(("INVALID_INPUT", "from must be a slot and count 1 to 64.")),
         },
+        "getFinalizedCblock" => Ok(finalized_head(&*state.read().await)),
+        "getFollowerPage" => match (params.get("from").and_then(safe_integer), params.get("count").and_then(safe_integer)) {
+            (Some(from), Some(count @ 1..=256)) => {
+                let (finalized, views) = {
+                    let gateway = state.read().await;
+                    let views = (from..from + count).map(|slot| {
+                        stored_read(&gateway.slots.get(&slot).cloned(), gateway.store.as_ref(), &format!("slot/{slot}"), "Slot not found.")
+                            .ok().map(|view| follower_view(&view))
+                    }).collect::<Vec<_>>();
+                    (finalized_head(&gateway), views)
+                };
+                match command(&state, |reply| GatewayCommand::FollowerBlocks { from, count, reply }).await {
+                    Ok(blocks) => Ok(json!({"finalized": finalized, "slots": views.into_iter().enumerate().map(|(i, view)| {
+                        json!({"slot": from + i as u64, "view": view, "blocks": blocks[i]})
+                    }).collect::<Vec<_>>()})),
+                    Err(_) => Err(("NET_UNAVAILABLE", "The node cannot serve follower blocks.")),
+                }
+            }
+            _ => Err(("INVALID_INPUT", "from must be a slot and count 1 to 256.")),
+        },
         "getExecutionSnapshot" => command(&state, |reply| GatewayCommand::ExecutionSnapshot { reply }).await.map_err(|_| ("NET_UNAVAILABLE", "No finalized cblock to start from yet.")),
         "getSlotBlocks" => match params.get("slot").and_then(safe_integer) {
-            Some(slot) => command(&state, |reply| GatewayCommand::SlotBlocks { slot, reply }).await.map_err(|_| ("NOT_FOUND", "This slot's blocks are no longer held (the last 256 slots are).")),
+            Some(slot) => command(&state, |reply| GatewayCommand::SlotBlocks { slot, reply }).await.map_err(|_| ("NOT_FOUND", "This slot's blocks are no longer held (the last 2400 slots are).")),
             None => Err(("INVALID_INPUT", "slot must be a non-negative safe integer.")),
         },
         "getDemoPool" => command(&state, |reply| GatewayCommand::DemoPool { reply }).await.map_err(|_| ("PROGRAM_UNAVAILABLE", "The demo pool is not in this net's genesis.")),
@@ -803,6 +854,38 @@ async fn credit(State(state): State<SharedGateway>, headers: HeaderMap, body: St
             None => (StatusCode::SERVICE_UNAVAILABLE, Json(error("NET_UNAVAILABLE", &message))).into_response(),
         },
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BridgeSaved {
+    program: String,
+    next_withdrawal_sequence: String,
+}
+
+/// Acknowledges only the relayer's durable save frontier, over the same trusted private port as
+/// the faucet. It is intentionally forgotten on restart until the keeper reports its cursor again.
+async fn bridge_saved(State(state): State<SharedGateway>, headers: HeaderMap, body: String) -> Response {
+    if headers.contains_key(header::ORIGIN) {
+        return (StatusCode::FORBIDDEN, Json(error("ORIGIN_NOT_ALLOWED", "This endpoint is for the local keeper."))).into_response();
+    }
+    let params = serde_json::from_str::<BridgeSaved>(&body).ok();
+    let Some(params) = params.filter(|params| valid_address(&params.program)) else {
+        return (StatusCode::BAD_REQUEST, Json(error("INVALID_INPUT", "Expected a bridge program and decimal nextWithdrawalSequence."))).into_response();
+    };
+    let sequence = &params.next_withdrawal_sequence;
+    let cursor = (!sequence.is_empty() && sequence.len() <= 20 && sequence.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| sequence.parse::<u64>().ok()).flatten();
+    let Some(cursor) = cursor else {
+        return (StatusCode::BAD_REQUEST, Json(error("INVALID_INPUT", "nextWithdrawalSequence must be a decimal u64 string."))).into_response();
+    };
+    let mut state = state.write().await;
+    if state.bridge_program.as_deref() != Some(params.program.as_str()) {
+        return (StatusCode::CONFLICT, Json(error("BRIDGE_MISMATCH", "The program does not match this node's configured bridge."))).into_response();
+    }
+    let cursor = state.bridge_saved_cursor.map_or(cursor, |held| held.max(cursor));
+    state.bridge_saved_cursor = Some(cursor);
+    Json(json!({"program": params.program, "nextWithdrawalSequence": cursor.to_string()})).into_response()
 }
 
 /// The private port's read of what the faucet can still grant.
@@ -1151,6 +1234,22 @@ async fn stream(mut socket: WebSocket, state: SharedGateway, acrux: bool) {
         }
     }
 }
+fn finalized_head(state: &GatewayState) -> Value {
+    json!({"consensusSlot": state.finalized_cblock})
+}
+
+/// The follower checks execution, proposer signatures and finality summaries. Explorer timings,
+/// votes, transaction schedules and the duplicate attestation list do not enter that check.
+fn follower_view(view: &Value) -> Value {
+    let proposers = view["window"]["proposers"].as_array().into_iter().flatten()
+        .map(|p| json!({"index": p["index"], "identity": p["identity"]})).collect::<Vec<_>>();
+    let certificates = view["cblock"]["certificates"].as_array().into_iter().flatten()
+        .map(|c| json!({"kind": c["kind"], "stakeShare": c["stakeShare"], "threshold": c["threshold"]})).collect::<Vec<_>>();
+    json!({"slot": view["slot"], "stateHash": view["stateHash"], "agreedSet": view["agreedSet"],
+        "window": {"proposers": proposers}, "cblock": {"consensusSlot": view["cblock"]["consensusSlot"],
+            "parent": view["cblock"]["parent"], "certificates": certificates}})
+}
+
 async fn metrics(State(state): State<SharedGateway>) -> impl IntoResponse {
     let state = state.read().await;
     let mut output = String::new();
@@ -1169,6 +1268,8 @@ async fn metrics(State(state): State<SharedGateway>) -> impl IntoResponse {
                 .unwrap_or(0.0)
         ));
     }
+    output.push_str(&format!("acrux_follower_retained_slots {}\nacrux_follower_retained_block_bytes {}\nacrux_follower_earliest_slot {}\n",
+        state.follower_retained_slots, state.follower_retained_block_bytes, state.follower_earliest_slot.unwrap_or(0)));
     // Outside use this hour: transactions people sent (not the built-in traffic or the faucet's
     // credits) and their distinct fee payers.
     if let Some((_, sent, payers)) = state.kept.as_ref().and_then(|kept| kept.use_by_hour(1).ok()).and_then(|h| h.first().copied()) {
@@ -1185,7 +1286,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn bridge_review_full_archive_continues_serving_new_proofs_and_preserves_saved_proofs() {
+    async fn bridge_review_archived_proofs_are_served_from_redb_after_index_only_reload() {
         use crate::bridge::ProofArchive;
         let dir = std::path::Path::new("target").join(format!("bridge-review-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1196,30 +1297,64 @@ mod tests {
             sequence, solana_mint: [1;32], recipient: [2;32], amount: 10,
         }).unwrap())];
         let proof = json!({"consensusSlot":7,"epochSlots":432000,"hash":"saved-proof","outbox":outbox(0)});
-        let newer = json!({"consensusSlot":108000,"epochSlots":432000,"hash":"rolling-proof","outbox":outbox(1)});
+        let newer = json!({"consensusSlot":108000,"epochSlots":432000,"hash":"new-epoch-proof","outbox":outbox(1)});
+        let rolling = json!({"consensusSlot":216000,"epochSlots":432000,"hash":"rolling-proof","outbox":outbox(2)});
         {
             let mut archive = ProofArchive::open(Some(&path),432000,Some(7)).unwrap();
             assert!(archive.keep(7,0,true,&proof).unwrap());
-            assert!(!archive.keep(108000,1,true,&newer).unwrap(), "capacity must skip storage without stopping finalization or evicting saved proofs");
+            assert!(archive.keep(108000,1,true,&newer).unwrap(), "the shedding level must not discard a new representative or withdrawal");
         }
-        let archive = ProofArchive::open(Some(&path),432000,Some(7)).unwrap();
+        let archive = ProofArchive::open(Some(&path),432000,Some(108000)).unwrap();
         if let Some(value) = previous { std::env::set_var("ACRUX_BRIDGE_PROOF_MAX",value); } else { std::env::remove_var("ACRUX_BRIDGE_PROOF_MAX"); }
         let (commands, _) = mpsc::channel(1);
         let mut state = GatewayState::new(commands);
-        state.archived_cblock_proofs = archive.proofs.clone();
+        state.bridge_archive = Some(archive.store.clone());
         state.archived_withdrawals = archive.withdrawals.clone();
         state.epoch_cblock_proofs = archive.epochs.clone();
-        // This is the same unconditional rolling publication used by protocol::record_proof.
-        state.keep_cblock_proof(108000, newer.clone());
         let state = Arc::new(RwLock::new(state));
-        for (params, expected) in [(json!({"consensusSlot":7}), proof), (json!({"consensusSlot":108000}), newer.clone()), (json!({"epoch":1}), newer)] {
+        assert!(state.read().await.cblock_proofs.is_empty(), "reload restores only archive indexes and a DB reader");
+        for (params, expected) in [(json!({"consensusSlot":7}), proof), (json!({"consensusSlot":108000}), newer.clone()), (json!({"epoch":1}), newer.clone()), (json!({"latest":true}), newer)] {
             let response = rpc_one(state.clone(), "127.0.0.1".parse().unwrap(), json!({"jsonrpc":"2.0","id":1,"method":"getCblockProof","params":params})).await;
             let bytes = axum::body::to_bytes(response.into_body(), 10000).await.unwrap();
             let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(body["result"], expected);
         }
+        // The rolling publication still serves proofs without an archived epoch representative.
+        state.write().await.keep_cblock_proof(216000,rolling.clone());
+        for params in [json!({"epoch":2}),json!({"latest":true})] {
+            let response = rpc_one(state.clone(), "127.0.0.1".parse().unwrap(), json!({"jsonrpc":"2.0","id":1,"method":"getCblockProof","params":params})).await;
+            let bytes = axum::body::to_bytes(response.into_body(),10000).await.unwrap();
+            let body:Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["result"],rolling);
+        }
+        assert_eq!(state.read().await.cblock_proofs.len(),1, "archive reads never populate a proof payload cache");
+        drop(state);
         drop(archive);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bridge_review_saved_cursor_is_program_checked_monotonic_and_volatile() {
+        let (commands,_) = mpsc::channel(1);
+        let program = solana_sdk::pubkey::Pubkey::new_unique().to_string();
+        let mut gateway = GatewayState::new(commands);
+        gateway.bridge_program = Some(program.clone());
+        let state = Arc::new(RwLock::new(gateway));
+        assert_eq!(state.read().await.bridge_saved_cursor,None);
+        for cursor in ["10","7","18446744073709551615"] {
+            let response = bridge_saved(State(state.clone()),HeaderMap::new(),json!({"program":program,"nextWithdrawalSequence":cursor}).to_string()).await;
+            assert_eq!(response.status(),StatusCode::OK);
+        }
+        assert_eq!(state.read().await.bridge_saved_cursor,Some(u64::MAX));
+        for cursor in ["-1","+2"," 2","18446744073709551616",""] {
+            let response = bridge_saved(State(state.clone()),HeaderMap::new(),json!({"program":program,"nextWithdrawalSequence":cursor}).to_string()).await;
+            assert_eq!(response.status(),StatusCode::BAD_REQUEST);
+        }
+        let response = bridge_saved(State(state.clone()),HeaderMap::new(),json!({"program":solana_sdk::pubkey::Pubkey::new_unique().to_string(),"nextWithdrawalSequence":"1"}).to_string()).await;
+        assert_eq!(response.status(),StatusCode::CONFLICT);
+        assert_eq!(state.read().await.bridge_saved_cursor,Some(u64::MAX));
+        let (commands,_) = mpsc::channel(1);
+        assert_eq!(GatewayState::new(commands).bridge_saved_cursor,None, "an acknowledgement is never restored from disk");
     }
 
     #[test]

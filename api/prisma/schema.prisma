@@ -230,6 +230,7 @@ model BridgeRelayerState {
   lastHandedEpoch        BigInt?  @map("last_handed_epoch")
   lastRelayedAt          DateTime? @map("last_relayed_at") @db.Timestamptz(3)
   nextWithdrawalSequence BigInt   @default(0) @map("next_withdrawal_sequence")
+  savedWithdrawalSequence BigInt  @default(0) @map("saved_withdrawal_sequence")
   updatedAt              DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   @@map("bridge_relayer_states")
@@ -251,4 +252,15 @@ model BridgeUnpaidWithdrawal {
   @@id([program, sequence])
   @@index([program, nextAttemptAt])
   @@map("bridge_unpaid_withdrawals")
+}
+
+/// One durable finalized withdrawal proof, shared by every withdrawal in its cblock.
+model BridgeSavedCblockProof {
+  program   String   @db.VarChar(44)
+  cblock    BigInt
+  proof     Json
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@id([program, cblock])
+  @@map("bridge_saved_cblock_proofs")
 }

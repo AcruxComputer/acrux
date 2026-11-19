@@ -139,6 +139,8 @@ const goodDestination = getAssociatedTokenAddressSync(mint, goodRecipient)
 await send(solana, [
   createAssociatedTokenAccountIdempotentInstruction(user.publicKey, badDestination, badRecipient.publicKey, mint, TOKEN_PROGRAM_ID),
   createSetAuthorityInstruction(badDestination, badRecipient.publicKey, AuthorityType.AccountOwner, user.publicKey, [], TOKEN_PROGRAM_ID),
+  // M6: the withdrawer pays for the normal recipient's ATA before the relayer uses it.
+  createAssociatedTokenAccountIdempotentInstruction(user.publicKey, goodDestination, goodRecipient, mint, TOKEN_PROGRAM_ID),
 ], [user, badRecipient])
 assert.ok((await tokenAccount(solana, badDestination)).owner.equals(user.publicKey), 'Recipient ATA ownership must have moved before the burn.')
 async function withdraw(recipient) {
