@@ -1,11 +1,12 @@
-//! A hub observer: bootstrap once, then authenticate and replay the actual QUIC wire.
+//! A hub peer: bootstrap once, replay the wire, and vote only while admitted.
 use crate::{cli, consensus::{BlockRef, Certificate, CertificateKind, Votor}, crypto,
     types::{Attestation, CblockWitness, Commitment, Envelope, SignedVote, Wire}};
 use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use bincode::Options;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use redb::{Database, Durability, ReadableTable, TableDefinition};
 use serde_json::{json, Value};
 use solana_sdk::signature::read_keypair_file;
 use std::{collections::{BTreeMap, BTreeSet}, time::Duration};
@@ -21,6 +22,67 @@ const MAX_PENDING_MATERIAL_BYTES: usize = 64 * 1024 * 1024;
 
 type Accepted = (u64, Option<Vec<usize>>, Vec<Option<[u8; 32]>>);
 type Preimage = (u64, Option<BlockRef>, Vec<Accepted>, String);
+
+const VOTE_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("consensus_votes");
+#[derive(Serialize, Deserialize)]
+struct KeptVote { vote: crate::consensus::Vote, envelope: Vec<u8> }
+#[derive(Serialize, Deserialize)]
+struct VoteState { finalized: BlockRef, votes: Vec<KeptVote> }
+struct VoteJournal { db: Database, chain: String, state: VoteState }
+impl VoteJournal {
+    fn open(identity: &str, chain: String, anchor: BlockRef) -> Result<Self> {
+        // Database's exclusive file lock also prevents two processes signing with this identity.
+        let db = Database::create(format!("{identity}.acrux-votes.redb"))?;
+        let write = db.begin_write()?;
+        let state = {
+            let table = write.open_table(VOTE_JOURNALS)?;
+            let value = table.get(chain.as_str())?;
+            value.map(|value|decode(value.value())).transpose()?.unwrap_or(VoteState {finalized:anchor,votes:vec![]})
+        };
+        write.commit()?;
+        ensure!(anchor.slot >= state.finalized.slot && (anchor.slot != state.finalized.slot || anchor.hash == state.finalized.hash),
+            "Snapshot is older than or conflicts with this identity's finalized vote journal");
+        let mut journal = Self {db,chain,state};
+        journal.finalize(anchor)?;
+        Ok(journal)
+    }
+    fn existing(&self, vote: &crate::consensus::Vote) -> Result<Option<Vec<u8>>> {
+        use crate::consensus::VoteKind;
+        ensure!(vote.slot > self.state.finalized.slot, "Refusing to sign a vote at or below the durable finalized anchor");
+        for kept in self.state.votes.iter().filter(|kept|kept.vote.slot == vote.slot) {
+            let old = &kept.vote;
+            ensure!(old.validator == vote.validator, "This identity's epoch voter index changed after signing");
+            let initial = matches!(old.kind,VoteKind::Notar|VoteKind::Skip) && matches!(vote.kind,VoteKind::Notar|VoteKind::Skip);
+            let final_phase = old.kind == VoteKind::Finalize && vote.kind == VoteKind::Finalize;
+            ensure!(!(initial || final_phase) || (old.kind == vote.kind && old.hash == vote.hash),
+                "Refusing to equivocate against this identity's durable vote journal");
+            if old == vote { return Ok(Some(kept.envelope.clone())) }
+        }
+        Ok(None)
+    }
+    fn record(&mut self, vote: crate::consensus::Vote, envelope: Vec<u8>) -> Result<()> {
+        ensure!(self.existing(&vote)?.is_none(), "Vote was already durably signed");
+        ensure!(envelope.len() <= 2048, "Signed vote envelope exceeds the member ingress limit");
+        ensure!(self.state.votes.len() < MAX_PENDING_SLOTS, "Unfinalized vote journal exceeded its bound");
+        self.state.votes.push(KeptVote {vote,envelope});
+        self.save()
+    }
+    fn finalize(&mut self, anchor: BlockRef) -> Result<()> {
+        ensure!(anchor.slot >= self.state.finalized.slot && (anchor.slot != self.state.finalized.slot || anchor.hash == self.state.finalized.hash), "Finalized vote journal moved backward or changed its hash");
+        self.state.finalized = anchor;
+        self.state.votes.retain(|kept|kept.vote.slot > anchor.slot);
+        self.save()
+    }
+    fn save(&self) -> Result<()> {
+        let bytes = bincode::serialize(&self.state)?;
+        ensure!(bytes.len() as u64 <= MAX_WIRE_BYTES, "Unfinalized vote journal exceeded its byte bound");
+        let mut write = self.db.begin_write()?;
+        write.set_durability(Durability::Immediate);
+        { write.open_table(VOTE_JOURNALS)?.insert(self.chain.as_str(),bytes.as_slice())?; }
+        write.commit()?;
+        Ok(())
+    }
+}
 
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     Ok(bincode::DefaultOptions::new().with_fixint_encoding().with_limit(MAX_WIRE_BYTES)
@@ -59,13 +121,21 @@ struct Observer {
     replay: cli::Replay,
     anchor: BlockRef,
     keys: Vec<VerifyingKey>,
-    stakes: Vec<u64>,
     votor: Votor,
+    signer: SigningKey,
+    journal: VoteJournal,
+    identity: String,
+    hub: String,
+    checkpoints: BTreeMap<BlockRef, cli::ReplayCheckpoint>,
+    outgoing: Vec<Vec<u8>>,
+    epoch_updates: BTreeMap<u64, (crate::execution::AdmissionSnapshot, Vec<solana_sdk::pubkey::Pubkey>)>,
+    reported_epoch: Option<u64>,
     bridge: Option<crate::genesis::BridgeConfig>,
     slots: BTreeMap<u64, Slot>,
     witnesses: BTreeMap<BlockRef, Witness>,
     finalized: BTreeMap<u64, Finalized>,
     seen: BTreeMap<[u8; 32], u64>,
+    pending: BTreeMap<[u8; 32], (u64, Envelope)>,
     checked: u64,
     buffered_bytes: usize,
 }
@@ -75,10 +145,83 @@ impl Observer {
         let ids = self.replay.proposers.as_ref().context("Missing proposer configuration")?.ids(slot / 16)?;
         ids.get(role - 1).copied().context("Missing drawn proposer")
     }
+    fn vote_identity(&self, slot: u64, index: usize) -> Result<&VerifyingKey> {
+        let proposers = self.replay.proposers.as_ref().context("Missing proposer configuration")?;
+        let (members, _) = proposers.voting_set(slot)?;
+        let identity = members.get(index).context("Vote by an unknown epoch member")?;
+        let global = proposers.catalog.iter().position(|known| known == identity).context("Epoch member is absent from the validator catalog")?;
+        self.keys.get(global).context("Epoch member key is not finalized yet")
+    }
     fn verify_vote(&self, signed: &SignedVote) -> Result<()> {
-        let key = self.keys.get(signed.vote.validator).context("Vote by an unknown validator")?;
-        crypto::verify_bytes(key, &crate::types::vote_message(&signed.vote, self.bridge.as_ref())?, &signed.signature)
+        crypto::verify_bytes(self.vote_identity(signed.vote.slot, signed.vote.validator)?,
+            &crate::types::vote_message(&signed.vote, self.bridge.as_ref())?, &signed.signature)
             .context("Invalid consensus vote signature")
+    }
+    fn actions(&mut self, actions: Vec<crate::consensus::Action>) -> Result<()> {
+        for action in actions {
+            match action {
+                crate::consensus::Action::SendVote(vote) => {
+                    ensure!(self.votor.own_at(vote.slot) == Some(vote.validator), "Consensus emitted a vote for another epoch member");
+                    if let Some(envelope) = self.journal.existing(&vote)? {
+                        self.outgoing.push(envelope);
+                        continue;
+                    }
+                    let message = crate::types::vote_message(&vote, self.bridge.as_ref())?;
+                    let signature = crypto::sign_bytes(&self.signer, &message);
+                    let from = self.replay.proposers.as_ref().context("Missing proposer configuration")?.catalog.iter()
+                        .position(|known| known == &self.identity).context("Own admitted identity is absent from the validator catalog")?;
+                    let body = Wire::Vote(SignedVote {vote:vote.clone(),signature});
+                    let signature = crypto::sign_bytes(&self.signer, &bincode::serialize(&body)?);
+                    let envelope = bincode::serialize(&Envelope {from,body,signature})?;
+                    self.journal.record(vote.clone(),envelope.clone())?;
+                    self.outgoing.push(envelope);
+                    println!("vote {:?} cblock {} epoch {}",vote.kind,vote.slot,self.epoch(vote.slot));
+                }
+                // A locally formed certificate may still include our unsent queued vote. Wait
+                // for the node's signed certificate before advancing the durable final anchor.
+                crate::consensus::Action::SendCertificate(_) => {},
+                _ => {},
+            }
+        }
+        Ok(())
+    }
+    fn epoch(&self, cblock: u64) -> u64 { cblock * 4 / self.bridge.as_ref().map_or(432_000, |bridge|bridge.epoch_slots) }
+    fn status(&mut self, cblock: u64) {
+        let epoch = self.epoch(cblock);
+        if self.reported_epoch == Some(epoch) { return }
+        self.reported_epoch = Some(epoch);
+        match self.votor.own_at(cblock) {
+            Some(index) => println!("epoch {epoch} member {} voting index {index}",self.identity),
+            None => println!("epoch {epoch} observer {}",self.identity),
+        }
+    }
+    fn learn_finalized(&mut self) -> Result<()> {
+        self.replay.learn_finalized()?;
+        let proposers = self.replay.proposers.as_ref().context("Missing proposer configuration")?;
+        ensure!(proposers.catalog.len() >= self.keys.len(), "Finalized validator catalog shrank");
+        for identity in &proposers.catalog[self.keys.len()..] {
+            let bytes: [u8;32] = bs58::decode(identity).into_vec()?.try_into().map_err(|_|anyhow::anyhow!("Invalid validator identity"))?;
+            self.keys.push(VerifyingKey::from_bytes(&bytes)?);
+        }
+        for snapshot in proposers.admissions.values() {
+            let own = snapshot.members.iter().position(|member|member.identity.to_string()==self.identity && member.hub==self.hub);
+            let from = snapshot.epoch.checked_mul(proposers.config.epoch_slots).context("Voting epoch overflow")? / 4;
+            let stakes = snapshot.members.iter().map(|member|member.stake).collect::<Vec<_>>();
+            // The bootstrap epoch inherits the legacy set. Its hashed marker can finalize
+            // after its first wire votes; an identical inherited set needs no replacement.
+            if self.votor.stakes_at(from) != stakes || self.votor.own_at(from) != own {
+                self.votor.install_stakes(from,own,stakes)?;
+            }
+        }
+        for checkpoint in self.checkpoints.values_mut() { checkpoint.proposers = self.replay.proposers.clone(); }
+        let ready = self.epoch_updates.iter().filter(|(epoch,_)|proposers.admissions.contains_key(epoch)).map(|(epoch,_)|*epoch).collect::<Vec<_>>();
+        for epoch in ready {
+            let (snapshot,catalog) = self.epoch_updates.remove(&epoch).unwrap();
+            ensure!(proposers.admissions[&epoch] == snapshot, "Wire validator epoch differs from the replayed hashed snapshot");
+            let catalog = catalog.iter().map(ToString::to_string).collect::<Vec<_>>();
+            ensure!(proposers.catalog.starts_with(&catalog), "Wire validator catalog differs from the replayed hashed catalog");
+        }
+        Ok(())
     }
     fn shred(&mut self, shred: crypto::Shred) -> Result<()> {
         let slot = shred.meta.slot;
@@ -158,6 +301,11 @@ impl Observer {
             ensure!(vote == &proof.vote, "Certificate proof names another vote");
             self.verify_vote(proof)?;
         }
+        self.record_finality(&certificate)?;
+        let actions = self.votor.receive(crate::consensus::Message::Certificate(certificate))?;
+        self.actions(actions)
+    }
+    fn record_finality(&mut self, certificate: &Certificate) -> Result<()> {
         let (kind, threshold) = match certificate.kind {
             CertificateKind::FastFinalization => ("fast_finalization", 0.8),
             CertificateKind::Finalization => ("slow_finalization", 0.6),
@@ -168,10 +316,11 @@ impl Observer {
             if block.slot == self.anchor.slot { ensure!(block == self.anchor, "Conflicting finalized anchor"); }
             return Ok(())
         }
-        let stake = certificate.votes.iter().map(|vote| self.stakes[vote.validator] as u128).sum::<u128>();
-        let total = self.stakes.iter().map(|stake| *stake as u128).sum::<u128>();
+        let weights = self.votor.stakes_at(certificate.slot);
+        let stake = certificate.votes.iter().map(|vote|weights[vote.validator] as u128).sum::<u128>();
+        let total = weights.iter().map(|stake|*stake as u128).sum::<u128>();
         if let Some(known) = self.finalized.get(&block.slot) { ensure!(known.block == block, "Conflicting finalized cblocks"); }
-        self.finalized.insert(block.slot, Finalized { block, kind, share: stake as f64 / total as f64, threshold });
+        self.finalized.insert(block.slot, Finalized {block,kind,share:stake as f64 / total as f64,threshold});
         Ok(())
     }
     fn witness(&mut self, wire: CblockWitness, from: usize) -> Result<()> {
@@ -205,14 +354,72 @@ impl Observer {
         if self.seen.contains_key(&digest) { return Ok(()) }
         let envelope: Envelope = decode(&packet.payload)?;
         ensure!(envelope.from == packet.from, "Mirrored envelope has another sender");
+        if !self.epoch_ready(&envelope.body)? {
+            if !self.pending.contains_key(&digest) {
+                ensure!(self.pending.len() + self.seen.len() < MAX_SEEN_ENVELOPES
+                    && self.buffered_bytes.checked_add(packet.payload.len()).is_some_and(|bytes| bytes <= MAX_PENDING_MATERIAL_BYTES),
+                    "Observer pending material exceeded its window; restart from a fresh snapshot");
+                self.buffered_bytes += packet.payload.len();
+                // These bytes are not trusted yet. The epoch's hashed catalog supplies the
+                // sender and voter keys; verify both signatures when replay catches up.
+                self.pending.insert(digest,(packet.slot,envelope));
+            }
+        } else {
+            self.envelope(envelope,digest,packet.slot)?;
+        }
+        loop {
+            self.speculate()?;
+            self.replay_ready()?;
+            if !self.drain_pending()? { return Ok(()) }
+        }
+    }
+    fn epoch_ready(&self, wire: &Wire) -> Result<bool> {
+        let proposers = self.replay.proposers.as_ref().context("Missing proposer configuration")?;
+        let known = |cblock: u64| {
+            let Some(from) = proposers.config.admission_from_slot else { return true };
+            let epoch = cblock / (proposers.config.epoch_slots / 4);
+            epoch <= from / proposers.config.epoch_slots || proposers.admissions.contains_key(&epoch)
+        };
+        Ok(match wire {
+            Wire::Vote(vote) => known(vote.vote.slot),
+            Wire::Certificate {certificate,..} => known(certificate.slot),
+            Wire::Shreds(shreds) | Wire::Relay(shreds) => shreds.iter().all(|shred|known(shred.meta.slot / 4)),
+            Wire::Commit(commitment) => known(commitment.slot / 4),
+            Wire::Attest(attestation) => known(attestation.slot / 4),
+            Wire::Handover {slot,shreds,attestations,..} => known(*slot / 4)
+                && shreds.iter().all(|shred|known(shred.meta.slot / 4))
+                && attestations.iter().all(|(attestation,_)|known(attestation.slot / 4)),
+            Wire::Equivocation {first,second} => known(first.0.slot / 4) && known(second.0.slot / 4),
+            Wire::Cblock(witness) => known(witness.block.slot),
+            Wire::ValidatorEpoch {..} | Wire::Submit(_) | Wire::SubmitFragment(_) => true,
+        })
+    }
+    fn drain_pending(&mut self) -> Result<bool> {
+        let mut ready = vec![];
+        for (digest,(_,envelope)) in &self.pending {
+            if self.epoch_ready(&envelope.body)? { ready.push(*digest); }
+        }
+        for digest in &ready {
+            let (slot,envelope) = self.pending.remove(digest).unwrap();
+            self.buffered_bytes -= usize::try_from(bincode::serialized_size(&envelope)?)?;
+            self.envelope(envelope,*digest,slot)?;
+        }
+        Ok(!ready.is_empty())
+    }
+    fn envelope(&mut self, envelope: Envelope, digest: [u8;32], slot: u64) -> Result<()> {
         let key = self.keys.get(envelope.from).context("Envelope from an unknown validator")?;
         crypto::verify_bytes(key, &bincode::serialize(&envelope.body)?, &envelope.signature).context("Invalid wire envelope signature")?;
-        self.seen.insert(digest, packet.slot);
+        self.seen.insert(digest, slot);
         match envelope.body {
             Wire::Shreds(shreds) | Wire::Relay(shreds) => for shred in shreds { self.shred(shred)?; },
             Wire::Commit(commitment) => self.commitment(commitment, None, Some(envelope.from))?,
             Wire::Attest(attestation) => self.attest(attestation, envelope.signature, Some(envelope.from))?,
-            Wire::Vote(vote) => self.verify_vote(&vote)?,
+            Wire::Vote(vote) => {
+                self.verify_vote(&vote)?;
+                ensure!(self.keys[envelope.from] == *self.vote_identity(vote.vote.slot,vote.vote.validator)?, "Vote envelope belongs to another epoch member");
+                let actions = self.votor.receive(crate::consensus::Message::Vote(vote.vote))?;
+                self.actions(actions)?;
+            },
             Wire::Certificate { certificate, proofs } => self.certificate(certificate, proofs)?,
             Wire::Handover { shreds, attestations, .. } => {
                 for shred in shreds { self.shred(shred)?; }
@@ -224,12 +431,18 @@ impl Observer {
                 self.commitment(second.0, Some(&second.1), None)?;
             }
             Wire::Cblock(witness) => self.witness(witness, envelope.from)?,
+            Wire::ValidatorEpoch {snapshot,catalog} => {
+                ensure!(envelope.from == 0 && snapshot.members.len() <= 32, "Invalid validator epoch publisher or size");
+                ensure!(self.epoch_updates.len() < MAX_PENDING_SLOTS / 4 || self.epoch_updates.contains_key(&snapshot.epoch), "Too many pending validator epochs");
+                if let Some((known,known_catalog)) = self.epoch_updates.get(&snapshot.epoch) { ensure!(known == &snapshot && known_catalog == &catalog, "Conflicting validator epoch messages"); }
+                self.epoch_updates.insert(snapshot.epoch,(snapshot,catalog));
+            },
             // Observing an application's submission is not its admission or execution.
             Wire::Submit(_) | Wire::SubmitFragment(_) => {},
         }
         ensure!(self.slots.len() <= MAX_PENDING_SLOTS && self.witnesses.len() <= MAX_PENDING_SLOTS / 4
-            && self.seen.len() <= MAX_SEEN_ENVELOPES, "Observer data exceeded its window; restart from a fresh snapshot");
-        self.replay_ready()
+            && self.seen.len() + self.pending.len() <= MAX_SEEN_ENVELOPES, "Observer data exceeded its window; restart from a fresh snapshot");
+        Ok(())
     }
     fn slot_blocks(&self, accepted: &Accepted) -> Result<Option<Value>> {
         let (slot, agreed, pi) = accepted;
@@ -253,22 +466,65 @@ impl Observer {
         }
         Ok(Some(json!({"attestations":attestations,"blocks":blocks})))
     }
-    fn outbox(&self, cblock: u64) -> Result<()> {
-        let Some(root) = self.witnesses[&self.anchor].wire.outbox_root else { return Ok(()) };
+    fn outbox(&self, block: BlockRef) -> Result<()> {
+        let Some(root) = self.witnesses[&block].wire.outbox_root else { return Ok(()) };
         let bridge = self.bridge.as_ref().context("Bridge cblock without a bridge rule")?;
-        let mut entries = vec![crate::bridge::OutboxEntry::ValidatorSet {
-            epoch: cblock * 4 / bridge.epoch_slots + 1,
-            validators: self.keys.iter().zip(&self.stakes).map(|(key,stake)|(key.to_bytes(),*stake)).collect(),
-        }];
-        entries.extend(self.replay.executor.withdrawals(cblock).into_iter().map(|(sequence,solana_mint,recipient,amount)| crate::bridge::OutboxEntry::Withdrawal {sequence,solana_mint,recipient,amount}));
-        if let Some(burn) = self.replay.executor.fee_burn(cblock)? { entries.push(crate::bridge::OutboxEntry::FeeBurn {epoch:burn.epoch,amount:burn.amount}); }
-        ensure!(crate::bridge::outbox_root(&entries) == root, "Cblock {cblock}'s re-executed outbox differs from its commitment");
+        let epoch = block.slot * 4 / bridge.epoch_slots + 1;
+        let checkpoint = self.replay.executor.checkpoint();
+        let snapshot = self.replay.executor.admission_snapshot(&checkpoint,epoch)?;
+        let admission_active = bridge.admission_from_slot.is_some_and(|from|block.slot * 4 >= from);
+        let mut entries = vec![];
+        if let Some(snapshot) = snapshot {
+            entries.push(crate::bridge::OutboxEntry::ValidatorSet {epoch,validators:snapshot.members.iter().map(|member|(member.identity.to_bytes(),member.stake)).collect()});
+        } else if !admission_active {
+            entries.push(crate::bridge::OutboxEntry::ValidatorSet {epoch,validators:self.keys.iter().take(12).map(|key|(key.to_bytes(),100_000_000)).collect()});
+        }
+        entries.extend(self.replay.executor.withdrawals(block.slot).into_iter().map(|(sequence,solana_mint,recipient,amount)| crate::bridge::OutboxEntry::Withdrawal {sequence,solana_mint,recipient,amount}));
+        if let Some(burn) = self.replay.executor.fee_burn(block.slot)? { entries.push(crate::bridge::OutboxEntry::FeeBurn {epoch:burn.epoch,amount:burn.amount}); }
+        ensure!(crate::bridge::outbox_root(&entries) == root, "Cblock {}'s re-executed outbox differs from its commitment",block.slot);
         Ok(())
+    }
+    fn view(&self, block: BlockRef, offset: usize, finality: Option<&Finalized>) -> Result<(Value, Vec<(u8,String)>)> {
+        let witness = &self.witnesses[&block];
+        let accepted = &witness.accepted[offset];
+        let proposers = self.replay.proposers.as_ref().context("Missing proposer configuration")?.window(accepted.0 / 16)?.proposers;
+        let recipients = proposers.iter().enumerate().map(|(index,identity)|((index+1) as u8,identity.clone())).collect::<Vec<_>>();
+        let certificates = finality.map(|finality|vec![json!({"kind":finality.kind,"stakeShare":finality.share,"threshold":finality.threshold,"consensusSlot":finality.block.slot})]).unwrap_or_default();
+        Ok((json!({"slot":accepted.0,"stateHash":witness.wire.state_hashes[offset],"agreedSet":accepted.1,
+            "window":{"proposers":proposers.iter().enumerate().map(|(index,identity)|json!({"index":index+1,"identity":identity})).collect::<Vec<_>>()},
+            "cblock":{"certificates":certificates}}),recipients))
+    }
+    fn speculate(&mut self) -> Result<()> {
+        loop {
+            let mut ready = None;
+            for (block,witness) in self.witnesses.iter().filter(|(block,_)| !self.checkpoints.contains_key(block)) {
+                let Some(parent) = witness.wire.parent else { continue };
+                let Some(checkpoint) = self.checkpoints.get(&parent) else { continue };
+                let blocks = witness.accepted.iter().map(|accepted|self.slot_blocks(accepted)).collect::<Result<Vec<_>>>()?;
+                if blocks.iter().any(Option::is_none) { continue }
+                ready = Some((*block,parent,checkpoint.clone(),blocks));
+                break;
+            }
+            let Some((block,parent,checkpoint,blocks)) = ready else { return Ok(()) };
+            self.replay.restore(checkpoint)?;
+            self.status(block.slot);
+            for (offset,blocks) in blocks.into_iter().enumerate() {
+                let blocks = blocks.unwrap();
+                let (view,recipients) = self.view(block,offset,None)?;
+                cli::check_slot_agreement(&view,&blocks["attestations"])?;
+                let slot = block.slot * 4 + offset as u64;
+                let state = self.replay.apply(slot,&recipients,&blocks).with_context(||format!("re-executing slot {slot}"))?;
+                ensure!(view["stateHash"].as_str() == Some(state.as_str()), "Slot {slot}: re-executed state differs from the signed cblock");
+            }
+            self.outbox(block)?;
+            self.checkpoints.insert(block,self.replay.checkpoint());
+            let actions = self.votor.local_block(crate::consensus::Block {id:block,parent:Some(parent)})?;
+            self.actions(actions)?;
+        }
     }
     fn replay_ready(&mut self) -> Result<()> {
         loop {
             let mut ready = None;
-            // Any finalized descendant authenticates the hash-linked ancestors down to the anchor.
             for finality in self.finalized.values() {
                 let mut chain = vec![];
                 let mut at = finality.block;
@@ -280,42 +536,36 @@ impl Observer {
                     at = witness.wire.parent.context("Finalized chain lost its parent")?;
                 }
                 if missing { continue }
-                let first = *chain.last().context("Empty finalized extension")?;
-                let mut blocks = vec![];
-                for accepted in &self.witnesses[&first].accepted {
-                    let Some(block) = self.slot_blocks(accepted)? else { missing = true; break };
-                    blocks.push(block);
-                }
-                if !missing { ready = Some((first, finality.clone(), blocks)); break }
+                let block = *chain.last().context("Empty finalized extension")?;
+                if let Some(checkpoint) = self.checkpoints.get(&block) { ready = Some((block,finality.clone(),checkpoint.clone())); break }
             }
-            let Some((block, finality, blocks)) = ready else { return Ok(()) };
-            let witness = &self.witnesses[&block];
-            for (offset, (accepted, blocks)) in witness.accepted.iter().zip(blocks).enumerate() {
-                let slot = accepted.0;
-                let proposers = self.replay.proposers.as_ref().context("Missing proposer configuration")?.window(slot / 16)?.proposers;
-                let recipients = proposers.iter().enumerate().map(|(index,identity)|((index+1) as u8,identity.clone())).collect::<Vec<_>>();
-                let view = json!({"slot":slot,"stateHash":witness.wire.state_hashes[offset],"agreedSet":accepted.1,
-                    "window":{"proposers":proposers.iter().enumerate().map(|(index,identity)|json!({"index":index+1,"identity":identity})).collect::<Vec<_>>()},
-                    "cblock":{"certificates":[{"kind":finality.kind,"stakeShare":finality.share,"threshold":finality.threshold,"consensusSlot":finality.block.slot}]}});
-                cli::check_slot(&view, &blocks["attestations"]).with_context(||format!("slot {slot}"))?;
-                let state = self.replay.apply(slot, &recipients, &blocks).with_context(||format!("re-executing slot {slot}"))?;
-                ensure!(state == witness.wire.state_hashes[offset], "Slot {slot}: re-executed state differs from the certified cblock");
+            let Some((block,finality,checkpoint)) = ready else { return Ok(()) };
+            self.replay.restore(checkpoint)?;
+            for offset in 0..4 {
+                let accepted = &self.witnesses[&block].accepted[offset];
+                let blocks = self.slot_blocks(accepted)?.context("Finalized block data disappeared")?;
+                let (view,_) = self.view(block,offset,Some(&finality))?;
+                cli::check_slot(&view,&blocks["attestations"])?;
                 self.checked += 1;
+                let slot = accepted.0;
+                let state = &self.witnesses[&block].wire.state_hashes[offset];
                 println!("slot {slot} re-executed  agreed {}  state {} matches  checked {}",view["agreedSet"],&state[..12],self.checked);
             }
+            self.journal.finalize(block)?;
             self.anchor = block;
-            self.outbox(block.slot)?;
-            if let Some(proposers) = &mut self.replay.proposers {
-                for (epoch,weights) in self.replay.executor.stake_schedule_snapshots(&self.replay.executor.checkpoint())? { proposers.learn(epoch,weights)?; }
-            }
-            self.buffered_bytes -= self.slots.iter().filter(|(slot,_)| **slot / 4 <= block.slot)
-                .map(|(_,slot)|slot.buffered_bytes).sum::<usize>();
+            self.learn_finalized()?;
+            self.checkpoints.insert(block,self.replay.checkpoint());
+            self.checkpoints.retain(|known,_|known.slot >= block.slot);
+            self.buffered_bytes -= self.slots.iter().filter(|(slot,_)| **slot / 4 <= block.slot).map(|(_,slot)|slot.buffered_bytes).sum::<usize>();
             self.slots.retain(|slot,_| *slot / 4 > block.slot);
             self.witnesses.retain(|known,_| known.slot > block.slot);
             self.finalized.retain(|slot,_| *slot > block.slot);
             self.seen.retain(|_,slot| *slot / 4 > block.slot);
+            self.votor.prune(block.slot.saturating_sub(8));
+            self.speculate()?;
         }
     }
+
 }
 
 pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str) -> Result<()> {
@@ -324,7 +574,7 @@ pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str) -> Re
     let snapshot = cli::rpc(url,"getExecutionSnapshot",json!({})).await?;
     let config: crate::protocol::ProposerConfig = serde_json::from_value(snapshot["proposerConfig"].clone()).context("Missing public proposer configuration")?;
     let stakes: Vec<u64> = serde_json::from_value(snapshot["consensusStakes"].clone()).context("Missing consensus stakes")?;
-    ensure!(stakes.len() == config.identities.len() && !stakes.is_empty() && stakes.iter().all(|stake|*stake>0), "Invalid consensus stake set");
+    ensure!(!stakes.is_empty() && stakes.len() <= 32 && stakes.iter().all(|stake|*stake>0), "Invalid consensus stake set");
     stakes.iter().try_fold(0u128,|total,stake|total.checked_add(*stake as u128)).context("Consensus stake overflow")?;
     let keys = config.identities.iter().map(|identity| {
         let bytes: [u8;32] = bs58::decode(identity).into_vec()?.try_into().map_err(|_|anyhow::anyhow!("Invalid validator identity"))?;
@@ -333,6 +583,7 @@ pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str) -> Re
     ensure!(config.identities.iter().collect::<BTreeSet<_>>().len() == keys.len(), "Duplicate validator identities");
     let anchor_hash = hash32(snapshot["anchor"]["hash"].as_str().context("Missing snapshot anchor hash")?)?;
     let (replay,last,start_hash) = cli::load_follow_snapshot(snapshot,&genesis,&programs)?;
+    ensure!(replay.proposers.as_ref().context("Missing proposer configuration")?.voting_set(last)?.1 == stakes, "Snapshot consensus stakes differ from the replayed epoch set");
     let peers: HubPeers = serde_json::from_value(cli::rpc(url,"getHubPeers",json!({"hub":hub})).await?)?;
     ensure!(peers.hub == hub && peers.peers.len() == 4, "The endpoint returned another hub");
     let expected = config.hubs.iter().find(|candidate|candidate.code==hub).context("Unknown hub")?;
@@ -345,6 +596,9 @@ pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str) -> Re
     let address = tokio::net::lookup_host(&peers.address).await?.next().context("The hub address did not resolve")?;
     let keypair = read_keypair_file(identity).map_err(|error|anyhow::anyhow!("Read observer identity: {error}"))?;
     let signer = SigningKey::from_bytes(&keypair.to_bytes()[..32].try_into()?);
+    let anchor = BlockRef {slot:last,hash:anchor_hash};
+    let chain = match &genesis.bridge { Some(bridge) => bridge.chain_tag(), None => crypto::hash(&bincode::serialize(&(&config.seed,&config.identities))?) };
+    let journal = VoteJournal::open(identity,hex::encode(chain),anchor)?;
     let from_slot = last.checked_mul(4).and_then(|slot|slot.checked_add(4)).context("Snapshot slot overflow")?;
     let mut client = crate::external::ExternalClient::connect(address,&cert,hub,&signer,from_slot).await?;
     let control = client.control.clone();
@@ -359,12 +613,22 @@ pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str) -> Re
         }
     });
     println!("from cblock {last}: {} accounts loaded, state {} matches",replay.executor.account_count(),&start_hash[..12]);
-    let mut observer = Observer {replay,anchor:BlockRef {slot:last,hash:anchor_hash},keys,stakes:stakes.clone(),votor:Votor::new(0,stakes)?,bridge:genesis.bridge.clone(),slots:BTreeMap::new(),witnesses:BTreeMap::new(),finalized:BTreeMap::new(),seen:BTreeMap::new(),checked:0,buffered_bytes:0};
+    let identity = bs58::encode(signer.verifying_key().to_bytes()).into_string();
+    let legacy_stakes = vec![100_000_000;config.identities.len()];
+    let mut votor = Votor::new(0,legacy_stakes.clone())?;
+    votor.install_stakes(0,None,legacy_stakes)?;
+    let mut observer = Observer {checkpoints:BTreeMap::from([(anchor,replay.checkpoint())]),replay,anchor,keys,votor,signer,journal,identity,hub:hub.to_owned(),outgoing:vec![],epoch_updates:BTreeMap::new(),reported_epoch:None,bridge:genesis.bridge.clone(),slots:BTreeMap::new(),witnesses:BTreeMap::new(),finalized:BTreeMap::new(),seen:BTreeMap::new(),pending:BTreeMap::new(),checked:0,buffered_bytes:0};
+    observer.learn_finalized()?;
+    observer.votor.resume(anchor);
+    observer.status(last);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     let outcome = async {
         loop {
             tokio::select! {
-                packet = packets.recv() => observer.packet(packet.context("Hub wire stream ended")??,&recipients)?,
+                packet = packets.recv() => {
+                    observer.packet(packet.context("Hub wire stream ended")??,&recipients)?;
+                    for envelope in observer.outgoing.drain(..) { control.send_envelope(&envelope).await?; }
+                },
                 _ = heartbeat.tick() => for peer in &peers.peers {
                     let rtt = control.ping(peer.id).await?;
                     println!("hub {hub} link {} RTT {:.3} ms",peer.identity,rtt.as_secs_f64()*1000.0);
@@ -377,4 +641,95 @@ pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str) -> Re
     reader.abort();
     let _ = reader.await;
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{consensus::{CertificateKind,Vote,VoteKind}, execution::{AdmissionMember,AdmissionSnapshot},
+        protocol::{ProposerConfig,ProposerSchedules}, schedule::{Hub,Member}};
+    use solana_sdk::pubkey::Pubkey;
+
+    #[test]
+    fn admission_wire_votes_wait_for_the_finalized_cutoff_set() {
+        let signers = (1..=12).map(|seed|SigningKey::from_bytes(&[seed;32])).collect::<Vec<_>>();
+        let identities = signers.iter().map(|key|bs58::encode(key.verifying_key().to_bytes()).into_string()).collect::<Vec<_>>();
+        let hubs = ["FRA","NYC","TYO"].into_iter().enumerate().map(|(index,code)|Hub {
+            code:code.into(),region:code.into(),members:identities[index*4..index*4+4].iter()
+                .map(|identity|Member {identity:identity.clone(),stake:100_000_000}).collect(),
+        }).collect::<Vec<_>>();
+        let config = ProposerConfig {seed:"9".into(),windows_per_epoch:96,identities:identities.clone(),hubs,
+            epoch_slots:256,stake_from_slot:Some(256),genesis_stake_lamports:Some(1_000_000_000),admission_from_slot:Some(512)};
+        let replay = cli::Replay::for_test(ProposerSchedules::new(config.clone()).unwrap()).unwrap();
+        let signer = SigningKey::from_bytes(&[88;32]);
+        let identity = bs58::encode(signer.verifying_key().to_bytes()).into_string();
+        let anchor = BlockRef {slot:127,hash:[1;32]};
+        let journal = VoteJournal {
+            db:Database::builder().create_with_backend(redb::backends::InMemoryBackend::new()).unwrap(),
+            chain:"admission-order-check".into(),state:VoteState {finalized:anchor,votes:vec![]},
+        };
+        let mut votor = Votor::new(0,vec![100_000_000;12]).unwrap();
+        votor.install_stakes(0,None,vec![100_000_000;12]).unwrap();
+        votor.resume(anchor);
+        let mut observer = Observer {
+            checkpoints:BTreeMap::from([(anchor,replay.checkpoint())]),replay,anchor,
+            keys:signers.iter().map(SigningKey::verifying_key).collect(),votor,signer,journal,identity,
+            hub:"FRA".into(),outgoing:vec![],epoch_updates:BTreeMap::new(),reported_epoch:None,bridge:None,
+            slots:BTreeMap::new(),witnesses:BTreeMap::new(),finalized:BTreeMap::new(),seen:BTreeMap::new(),
+            pending:BTreeMap::new(),checked:0,buffered_bytes:0,
+        };
+        let packet = |from:usize,key:&SigningKey,slot:u64,body:Wire| {
+            let signature = crypto::sign_bytes(key,&bincode::serialize(&body).unwrap());
+            crate::external::Packet {from,to:0,slot:slot*4,payload:bincode::serialize(&Envelope {from,body,signature}).unwrap()}
+        };
+        let signed_vote = |key:&SigningKey,validator,slot,kind| {
+            let vote = Vote {validator,slot,hash:Some([9;32]),kind};
+            let signature = crypto::sign_bytes(key,&crate::types::vote_message(&vote,None).unwrap());
+            SignedVote {vote,signature}
+        };
+        let recipients = BTreeSet::from([0]);
+        // Reproduce the stand's first boundary: legacy votes run ahead of the newly
+        // replayed bootstrap marker. Its identical inherited set must stay immutable.
+        let vote = signed_vote(&signers[0],0,128,VoteKind::Notar);
+        observer.packet(packet(0,&signers[0],128,Wire::Vote(vote)),&recipients).unwrap();
+        let mut catalog = signers.iter().map(|key|Pubkey::new_from_array(key.verifying_key().to_bytes())).collect::<Vec<_>>();
+        let bootstrap = AdmissionSnapshot {epoch:2,cutoff_slot:512,members:catalog.iter().enumerate().map(|(index,identity)|AdmissionMember {
+            identity:*identity,hub:config.hubs[index/4].code.clone(),stake:100_000_000,admitted_at_epoch:0,
+        }).collect()};
+        observer.replay.proposers.as_mut().unwrap().learn_admission(bootstrap,catalog.clone()).unwrap();
+        observer.learn_finalized().unwrap();
+        assert_eq!(observer.votor.sizes()[1],1);
+
+        // The next epoch's outside sender/catalog and weights are still unknown. Hold
+        // its votes and a certificate without counting any against the bootstrap set.
+        let votes = (0..8).map(|index|signed_vote(&signers[index],index,192,VoteKind::Finalize))
+            .chain(std::iter::once(signed_vote(&observer.signer,12,192,VoteKind::Finalize))).collect::<Vec<_>>();
+        for signed in &votes {
+            let from = signed.vote.validator;
+            let signer = if from == 12 {&observer.signer} else {&signers[from]};
+            observer.packet(packet(from,signer,192,Wire::Vote(signed.clone())),&recipients).unwrap();
+        }
+        let certificate = Certificate {kind:CertificateKind::Finalization,slot:192,hash:Some([9;32]),votes:votes.iter().map(|vote|vote.vote.clone()).collect()};
+        observer.packet(packet(0,&signers[0],192,Wire::Certificate {certificate,proofs:votes}),&recipients).unwrap();
+        assert_eq!(observer.pending.len(),10);
+        assert_eq!(observer.votor.sizes()[1],1);
+
+        // Finalized replay reaches epoch 2's midpoint, before epoch 3 starts. The
+        // exact hashed snapshot is the sole source of the newly installed voter set.
+        catalog.push(Pubkey::new_from_array(observer.signer.verifying_key().to_bytes()));
+        let snapshot = AdmissionSnapshot {epoch:3,cutoff_slot:640,members:catalog.iter().enumerate().map(|(index,identity)|AdmissionMember {
+            identity:*identity,hub:if index==12 {"FRA".into()} else {config.hubs[index/4].code.clone()},
+            stake:if index==12 {2_000_000_000} else {1_000_000_000},admitted_at_epoch:if index==12 {3} else {0},
+        }).collect()};
+        observer.replay.proposers.as_mut().unwrap().learn_admission(snapshot.clone(),catalog).unwrap();
+        observer.learn_finalized().unwrap();
+        assert_eq!(observer.votor.own_at(192),Some(12));
+        assert_eq!(observer.votor.stakes_at(192),snapshot.members.iter().map(|member|member.stake).collect::<Vec<_>>());
+        assert!(observer.drain_pending().unwrap());
+        assert!(observer.pending.is_empty());
+        assert_eq!(observer.buffered_bytes,0);
+        assert_eq!(observer.votor.sizes()[1],10); // one old vote plus nine new identities
+        assert!(observer.votor.sizes()[2] > 0);
+        assert!((observer.finalized[&192].share - 10.0/14.0).abs() < f64::EPSILON);
+    }
 }

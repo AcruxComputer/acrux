@@ -79,7 +79,8 @@ export const FragmentSubmission = z.strictObject({ header: TxHeader, n: z.number
 export const Submission = z.strictObject({ id: TxId, accepted: z.literal(true), targetSlot: SlotNumber })
 /** The chain a hub or membership lives on: Acrux's own Hub Registry, or the one on Solana mainnet. */
 export const RegistryChain = z.enum(['acrux', 'solana'])
-export const Member = z.strictObject({ chain: RegistryChain, identity: Address, hubCode: HubCode, stake: U64, proposerStake: U64, capped: z.boolean(), effectiveEpoch: Count, joinedEpoch: Count, pendingMove: HubCode.nullable(), pendingLeave: z.boolean(), cooldownUntilEpoch: Count })
+export const Member = z.strictObject({ chain: RegistryChain, identity: Address, hubCode: HubCode, stake: U64, proposerStake: U64, capped: z.boolean(), effectiveEpoch: Count, joinedEpoch: Count, pendingMove: HubCode.nullable(), pendingLeave: z.boolean(), cooldownUntilEpoch: Count,
+  validatorKind: z.enum(['genesis', 'external']).optional(), admittedAtEpoch: Count.nullable().optional() })
 export type Member = z.infer<typeof Member>
 /** ECEF coordinates are integer metres in the WGS84 geocentric reference frame. */
 export const Hub = z.strictObject({ chain: RegistryChain, code: HubCode, name: z.string(), region: z.string(), ecef: z.strictObject({ x: z.number().int(), y: z.number().int(), z: z.number().int() }).describe('Integer metres in WGS84 Earth-centred, Earth-fixed coordinates.'), latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), registrant: Address, depositLamports: U64, members: z.array(Member), stake: U64, proposerStake: U64, proposerStakeCap: U64, status: z.enum(['active', 'pending', 'inactive']), needs: z.strictObject({ members: Count, stake: U64 }), createdEpoch: Count, lastActiveEpoch: Count.nullable(), releasableEpoch: Count.nullable(), releasable: z.boolean() })

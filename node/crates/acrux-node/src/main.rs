@@ -149,6 +149,7 @@ enum HubCommand {
         longitude: f64,
     },
     Join { code: String },
+    Carry { code:String, #[arg(long)] solana_rpc:String },
     Leave { code: String },
     Move { from: String, to: String },
     /// Releases a hub inactive past its period; anyone may send it.
@@ -260,6 +261,7 @@ async fn run() -> anyhow::Result<()> {
             let action = match command {
                 HubCommand::Register { code, latitude, longitude } => cli::HubAction::Register { code, latitude, longitude },
                 HubCommand::Join { code } => cli::HubAction::Join { code },
+                HubCommand::Carry {code,solana_rpc} => return acrux_node::carry::run(&rpc,&solana_rpc,&program,&identity,&code).await,
                 HubCommand::Leave { code } => cli::HubAction::Leave { code },
                 HubCommand::Move { from, to } => cli::HubAction::Move { from, to },
                 HubCommand::Release { code } => cli::HubAction::Release { code },

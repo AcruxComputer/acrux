@@ -123,7 +123,7 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
   function savedProof(proof: Proof): Prisma.InputJsonObject {
     return {
       consensusSlot: proof.consensusSlot, chainId: proof.chainId, epochSlots: proof.epochSlots,
-      feeBurnFromSlot: proof.feeBurnFromSlot ?? null, nativeMint: proof.nativeMint ?? null,
+      feeBurnFromSlot: proof.feeBurnFromSlot ?? null, admissionFromSlot: proof.admissionFromSlot ?? null, nativeMint: proof.nativeMint ?? null,
       hash: proof.hash, outboxRoot: proof.outboxRoot, preimage: proof.preimage.toString('base64'),
       outbox: proof.outbox.map(entry => entry.toString('base64')), validators: proof.validators.map(key => key.toBase58()),
       stakes: proof.stakes, votes: proof.votes,
@@ -400,8 +400,13 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
       return ends.get(epoch)!
     }
     let newestEpoch = Math.max(...sets.map(set => exact(set.value.epoch, 'validator epoch')))
-    while (newestEpoch < currentEpoch) {
-      const relay = firstFeeBurnEpoch !== null && newestEpoch >= firstFeeBurnEpoch ? await epochEnd(newestEpoch) ?? await proof({ epoch: newestEpoch }) : await proof({ epoch: newestEpoch })
+    // Admission freezes the next set halfway through this epoch. Hand it on while the
+    // certifying epoch is still current, so its first new-epoch vote is already verifiable.
+    const preHandNext = latest.admissionFromSlot != null && latest.consensusSlot * 4 >= latest.admissionFromSlot
+      && latest.entries.some(entry => entry.kind === 'set' && entry.epoch === currentEpoch + 1)
+    const handThroughEpoch = currentEpoch + Number(preHandNext)
+    while (newestEpoch < handThroughEpoch) {
+      const relay = newestEpoch === currentEpoch ? latest : firstFeeBurnEpoch !== null && newestEpoch >= firstFeeBurnEpoch ? await epochEnd(newestEpoch) ?? await proof({ epoch: newestEpoch }) : await proof({ epoch: newestEpoch })
       await handOff(relay, newestEpoch + 1)
       newestEpoch++
     }

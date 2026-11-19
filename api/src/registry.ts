@@ -5,7 +5,8 @@
 // code path the node's schedule runs), and writes hubs and members to Postgres in one transaction.
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import type { Hub, Member, RegistryConfig } from '@acrux/contract'
+import { Address, Count, U64, type Hub, type Member, type RegistryConfig } from '@acrux/contract'
+import { z } from 'zod'
 import { fromBase64, toBase58 } from './engines/core/encoding.js'
 import type { PrismaClient } from '@prisma/client'
 import { hubStakes } from './schedule.js'
@@ -32,6 +33,8 @@ class Reader {
 type ChainRegistry = { depositLamports: bigint; registrationFeeBps: number; cooldownEpochs: bigint; inactivityEpochs: bigint; minMembers: number; codeMinLen: number; codeMaxLen: number }
 type ChainHub = { address: string; code: string; x: number; y: number; z: number; registrant: string; depositLamports: bigint; createdEpoch: bigint; lastActiveEpoch: bigint }
 type ChainMembership = { address: string; identity: string; hub: string; joinedEpoch: bigint; effectiveEpoch: bigint; pending: 'none' | 'leave' | 'move'; pendingHub: string; pendingEpoch: bigint; cooldownUntilEpoch: bigint }
+const ValidatorSet = z.object({ epoch: Count, cutoffSlot: Count.nullable(), catalog: z.array(Address), genesisIdentities: z.array(Address),
+  members: z.array(z.object({ identity: Address, hub: z.string().min(1), stake: U64, validatorKind: z.enum(['genesis', 'external']), admittedAtEpoch: Count })) })
 
 function decodeRegistry(b: Uint8Array): ChainRegistry {
   const r = new Reader(b); r.key(); r.key(); r.key()
@@ -111,7 +114,7 @@ export class RegistryIndexer {
   start() { const tick = () => this.refresh().catch(e => { this.state.error = String(e?.message ?? e) }).finally(() => { this.timer = setTimeout(tick, this.pollMs) }); tick() }
   stop() { clearTimeout(this.timer) }
 
-  private async rpc<T>(method: string, params: unknown[]): Promise<T> {
+  private async rpc<T>(method: string, params: unknown): Promise<T> {
     const response = await fetch(this.rpcUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal: AbortSignal.timeout(5000) })
     const body = await response.json() as { result?: T; error?: { message: string } }
     if (body.error) throw new Error(body.error.message)
@@ -123,10 +126,19 @@ export class RegistryIndexer {
       this.rpc<{ epoch: number; absoluteSlot: number }>('getEpochInfo', [{ commitment: 'confirmed' }]),
       this.rpc<{ signature: string }[]>('getSignaturesForAddress', [this.programId, { limit: 1, commitment: 'confirmed' }]),
     ])
-    // Acrux's RPC keeps no signature history, so Acrux's registry is read every tick.
-    const seen = `${epochInfo.epoch}:${newest[0]?.signature ?? epochInfo.absoluteSlot}`
+    // A Stake instruction need not touch the registry, so Acrux's live stake is read every tick.
+    const seen = `${epochInfo.epoch}:${this.chain === 'acrux' ? epochInfo.absoluteSlot : newest[0]?.signature ?? epochInfo.absoluteSlot}`
     if (seen === this.seen) return
-    await this.stake.refresh()
+    const [validatorSet] = await Promise.all([
+      this.chain === 'acrux' ? this.rpc<unknown>('getValidatorSet', { epoch: epochInfo.epoch }).then(value => ValidatorSet.parse(value)) : Promise.resolve(null),
+      this.stake.refresh(),
+    ])
+    if (validatorSet && validatorSet.epoch !== epochInfo.epoch) throw new Error('The node returned a different validator-set epoch.')
+    const admitted = new Map(validatorSet?.members.map(member => [member.identity, member]) ?? [])
+    // Legacy and bootstrap epochs retain Round 9's proposer draw, independently of vote weights.
+    const frozen = validatorSet !== null && validatorSet.cutoffSlot !== null
+    const genesis = new Set(validatorSet?.genesisIdentities ?? [])
+    if (validatorSet && (admitted.size !== validatorSet.members.length || validatorSet.members.some(member => member.validatorKind !== (genesis.has(member.identity) ? 'genesis' : 'external')))) throw new Error('The node returned inconsistent validator identities.')
     const stakeOf = (identity: string) => this.stake.of(identity), totalStake = this.stake.total()
     const accounts = await this.rpc<{ pubkey: string; account: { data: [string, string] } }[]>('getProgramAccounts', [this.programId, { encoding: 'base64', commitment: 'confirmed' }])
     const epoch = BigInt(epochInfo.epoch)
@@ -143,7 +155,9 @@ export class RegistryIndexer {
     const counted = (m: ChainMembership) => m.effectiveEpoch <= epoch && !(m.pending !== 'none' && m.pendingEpoch <= epoch)
     const byAddress = new Map(hubs.map(h => [h.address, h]))
     const effective = hubs.map(h => ({ code: h.code, region: regionOf(geodetic(h.x, h.y, h.z).latitude, geodetic(h.x, h.y, h.z).longitude),
-      members: memberships.filter(m => m.hub === h.address && counted(m) && stakeOf(m.identity) > 0n).map(m => ({ identity: m.identity, stake: Number(stakeOf(m.identity) / UNIT) })) }))
+      members: frozen
+        ? validatorSet!.members.filter(m => m.hub === h.code && BigInt(m.stake) > 0n).map(m => ({ identity: m.identity, stake: Number(BigInt(m.stake) / UNIT) }))
+        : memberships.filter(m => m.hub === h.address && counted(m) && stakeOf(m.identity) > 0n).map(m => ({ identity: m.identity, stake: Number(stakeOf(m.identity) / UNIT) })) }))
     const caps = new Map((await hubStakes(effective)).map(h => [h.code, h]))
     const minimumStake = totalStake / 100n
     const minMembers = config?.minMembers ?? 4
@@ -163,13 +177,17 @@ export class RegistryIndexer {
           createdEpoch: h.createdEpoch, lastActiveEpoch: lastActive, releasableEpoch, indexedSlot: BigInt(epochInfo.absoluteSlot) } })
       }
       for (const m of memberships) {
-        const hub = byAddress.get(m.hub)
+        const fixed = frozen ? admitted.get(m.identity) : undefined
+        const moved = m.pending === 'move' && m.pendingEpoch <= epoch
+        const hub = fixed ? hubs.find(hub => hub.code === fixed.hub) : byAddress.get(moved ? m.pendingHub : m.hub)
         if (!hub) continue
         const capRow = caps.get(hub.code)?.members.find(c => c.identity === m.identity)
         const stake = stakeOf(m.identity)
         await tx.member.create({ data: { chain: this.chain, identity: m.identity, membershipAddress: m.address, hubCode: hub.code, stakeLamports: stake.toString(),
-          proposerStakeLamports: capRow ? (BigInt(capRow.proposerStake) * UNIT).toString() : counted(m) ? stake.toString() : '0',
+          proposerStakeLamports: capRow ? (BigInt(capRow.proposerStake) * UNIT).toString() : frozen ? '0' : counted(m) ? stake.toString() : '0',
           capped: capRow?.capped ?? false, effectiveEpoch: m.effectiveEpoch, cooldownUntilEpoch: m.cooldownUntilEpoch,
+          validatorKind: validatorSet ? genesis.has(m.identity) ? 'genesis' : 'external' : null,
+          admittedAtEpoch: admitted.has(m.identity) ? BigInt(admitted.get(m.identity)!.admittedAtEpoch) : null,
           pendingHubCode: m.pending === 'move' ? byAddress.get(m.pendingHub)?.code ?? null : null,
           leavingEpoch: m.pending === 'leave' ? m.pendingEpoch : null, indexedSlot: BigInt(epochInfo.absoluteSlot),
           joinedEpoch: m.joinedEpoch } })
@@ -217,5 +235,7 @@ export function hubView(row: HubRow, config: RegistryConfig): Hub {
 export function memberView(m: HubRow['members'][number]): Member {
   return { chain: m.chain as Chain, identity: m.identity, hubCode: m.hubCode, stake: m.stakeLamports.toString(), proposerStake: m.proposerStakeLamports.toString(), capped: m.capped,
     effectiveEpoch: Number(m.effectiveEpoch), joinedEpoch: Number(m.joinedEpoch), pendingMove: m.pendingHubCode,
-    pendingLeave: m.leavingEpoch !== null, cooldownUntilEpoch: Number(m.cooldownUntilEpoch) }
+    pendingLeave: m.leavingEpoch !== null, cooldownUntilEpoch: Number(m.cooldownUntilEpoch),
+    ...(m.chain === 'acrux' && m.validatorKind ? { validatorKind: m.validatorKind as 'genesis' | 'external',
+      admittedAtEpoch: m.admittedAtEpoch === null ? null : Number(m.admittedAtEpoch) } : {}) }
 }

@@ -55,6 +55,8 @@ model Member {
   capped              Boolean
   effectiveEpoch      BigInt   @map("effective_epoch")
   joinedEpoch         BigInt   @default(0) @map("joined_epoch")
+  validatorKind       String?  @map("validator_kind") @db.VarChar(8)
+  admittedAtEpoch     BigInt?  @map("admitted_at_epoch")
   cooldownUntilEpoch  BigInt   @map("cooldown_until_epoch")
   pendingHubCode      String?  @map("pending_hub_code") @db.VarChar(16)
   leavingEpoch        BigInt?  @map("leaving_epoch")

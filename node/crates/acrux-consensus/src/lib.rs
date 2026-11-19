@@ -103,10 +103,11 @@ type Result<T> = std::result::Result<T, ConsensusError>;
 type VoteKey = (u64, VoteKind, Option<Hash>);
 type CertificateKey = (u64, CertificateKind, Option<Hash>);
 
+#[derive(Clone, PartialEq, Eq)]
+struct StakeSet { own: Option<usize>, stakes: Vec<u64>, total: u128 }
+
 pub struct Votor {
-    own: usize,
-    stakes: Vec<u64>,
-    total_stake: u128,
+    stake_sets: BTreeMap<u64, StakeSet>,
     blocks: BTreeMap<BlockRef, Block>,
     votes: BTreeMap<VoteKey, BTreeMap<usize, Vote>>,
     certificates: BTreeMap<CertificateKey, Certificate>,
@@ -155,9 +156,7 @@ impl Votor {
         }
         let total_stake = stakes.iter().map(|s| *s as u128).sum();
         Ok(Self {
-            own,
-            stakes,
-            total_stake,
+            stake_sets: BTreeMap::from([(0, StakeSet { own: Some(own), stakes, total: total_stake })]),
             blocks: BTreeMap::new(),
             votes: BTreeMap::new(),
             certificates: BTreeMap::new(),
@@ -173,6 +172,30 @@ impl Votor {
             floor: 0,
         })
     }
+
+    /// Installs the compact voter indices and weights from this consensus slot onward.
+    /// Older slots keep their original set even after later epochs have been installed.
+    pub fn install_stakes(&mut self, from: u64, own: Option<usize>, stakes: Vec<u64>) -> Result<()> {
+        if stakes.is_empty() || stakes.iter().any(|stake| *stake == 0) || own.is_some_and(|own| own >= stakes.len()) {
+            return Err(ConsensusError("validator set must contain positive stake and a valid own index".into()));
+        }
+        let total = stakes.iter().map(|stake| *stake as u128).sum();
+        let set = StakeSet { own, stakes, total };
+        if self.stake_sets.get(&from) == Some(&set) { return Ok(()) }
+        if self.stake_sets.contains_key(&from) && !(from == 0 && !self.started && self.votes.is_empty()) {
+            return Err(ConsensusError("an installed epoch validator set is immutable".into()));
+        }
+        if self.votes.keys().any(|(slot, _, _)| *slot >= from) {
+            return Err(ConsensusError("cannot replace the validator set of an observed vote".into()));
+        }
+        self.stake_sets.insert(from, set);
+        Ok(())
+    }
+    fn stake_set(&self, slot: u64) -> &StakeSet {
+        self.stake_sets.range(..=slot).next_back().expect("genesis stake set").1
+    }
+    pub fn own_at(&self, slot: u64) -> Option<usize> { self.stake_set(slot).own }
+    pub fn stakes_at(&self, slot: u64) -> &[u64] { &self.stake_set(slot).stakes }
 
     /// Call once at startup. Genesis is the sole parent that needs no certificate.
     pub fn genesis(&mut self) -> Vec<Action> {
@@ -228,9 +251,9 @@ impl Votor {
     /// The NewCon validator supplies T(i) relative to its own ParentReady.
     pub fn timeout(&mut self, slot: u64) -> Result<Vec<Action>> {
         let mut actions = Vec::new();
-        if !self.initial.contains_key(&slot) {
+        if let Some(own) = self.own_at(slot).filter(|_| !self.initial.contains_key(&slot)) {
             let vote = Vote {
-                validator: self.own,
+                validator: own,
                 slot,
                 hash: None,
                 kind: VoteKind::Skip,
@@ -292,21 +315,21 @@ impl Votor {
             if !signers.insert(vote.validator) {
                 return Err(ConsensusError("duplicate validator in certificate".into()));
             }
-            stake += self.stakes[vote.validator] as u128;
+            stake += self.stakes_at(certificate.slot)[vote.validator] as u128;
         }
         let percent = if certificate.kind == CertificateKind::FastFinalization {
             80
         } else {
             60
         };
-        if !self.threshold(stake, percent) {
+        if !self.threshold(certificate.slot, stake, percent) {
             return Err(ConsensusError("certificate has insufficient stake".into()));
         }
         Ok(())
     }
 
-    fn threshold(&self, stake: u128, percent: u128) -> bool {
-        stake * 100 >= self.total_stake * percent
+    fn threshold(&self, slot: u64, stake: u128, percent: u128) -> bool {
+        stake * 100 >= self.stake_set(slot).total * percent
     }
     fn certificate_accepts(certificate: CertificateKind, vote: VoteKind) -> bool {
         match certificate {
@@ -321,7 +344,7 @@ impl Votor {
         }
     }
     fn check_vote(&self, vote: &Vote) -> Result<()> {
-        if vote.validator >= self.stakes.len() {
+        if vote.validator >= self.stakes_at(vote.slot).len() {
             return Err(ConsensusError("unknown validator".into()));
         }
         if matches!(vote.kind, VoteKind::Skip | VoteKind::SkipFallback) != vote.hash.is_none() {
@@ -457,19 +480,19 @@ impl Votor {
         signers.into_values().collect()
     }
     fn stake_of(&self, votes: &[Vote]) -> u128 {
-        votes.iter().map(|v| self.stakes[v.validator] as u128).sum()
+        votes.iter().map(|v| self.stakes_at(v.slot)[v.validator] as u128).sum()
     }
     fn initial_stakes(&self, slot: u64) -> (u128, BTreeMap<Hash, u128>) {
         let skip = self
             .votes
             .get(&(slot, VoteKind::Skip, None))
-            .map(|votes| votes.keys().map(|v| self.stakes[*v] as u128).sum())
+            .map(|votes| votes.keys().map(|v| self.stakes_at(slot)[*v] as u128).sum())
             .unwrap_or(0);
         let notar = self
             .votes
             .range((slot, VoteKind::Notar, None)..=(slot, VoteKind::Notar, Some([255; 32])))
             .filter_map(|((_, _, hash), votes)| {
-                hash.map(|hash| (hash, votes.keys().map(|v| self.stakes[*v] as u128).sum()))
+                hash.map(|hash| (hash, votes.keys().map(|v| self.stakes_at(slot)[*v] as u128).sum()))
             })
             .collect();
         (skip, notar)
@@ -548,7 +571,7 @@ impl Votor {
                     } else {
                         60
                     };
-                    if self.threshold(self.stake_of(&votes), percent) {
+                    if self.threshold(*slot, self.stake_of(&votes), percent) {
                         let certificate = Certificate {
                             kind,
                             slot: *slot,
@@ -597,8 +620,9 @@ impl Votor {
                 && !self.bad_slot(id.slot)
                 && self.safe_parent(block)
             {
+                if let Some(own) = self.own_at(id.slot) {
                 let vote = Vote {
-                    validator: self.own,
+                    validator: own,
                     slot: id.slot,
                     hash: Some(id.hash),
                     kind: VoteKind::Finalize,
@@ -607,6 +631,7 @@ impl Votor {
                 self.insert_vote(vote.clone())?;
                 actions.push(Action::SendVote(vote));
                 changed = true;
+                }
             }
             if matches!(
                 certificate.kind,
@@ -653,12 +678,13 @@ impl Votor {
                 .cloned()
                 .collect();
             for block in &blocks {
+                let Some(own) = self.own_at(block.id.slot) else { continue };
                 if !self.initial.contains_key(&block.id.slot)
                     && !self.skipped(block.id.slot)
                     && self.safe_parent(block)
                 {
                     let vote = Vote {
-                        validator: self.own,
+                        validator: own,
                         slot: block.id.slot,
                         hash: Some(block.id.hash),
                         kind: VoteKind::Notar,
@@ -685,10 +711,11 @@ impl Votor {
             changed |= self.process_certificates(&mut actions)?;
             for block in &blocks {
                 let slot = block.id.slot;
+                let Some(own) = self.own_at(slot) else { continue };
                 let (skip, notar) = self.initial_stakes(slot);
                 let target = notar.get(&block.id.hash).copied().unwrap_or(0);
-                let safe_notar_fallback = self.threshold(target, 40)
-                    || (self.threshold(skip + target, 60) && self.threshold(target, 20));
+                let safe_notar_fallback = self.threshold(slot, target, 40)
+                    || (self.threshold(slot, skip + target, 60) && self.threshold(slot, target, 20));
                 if self.initial.contains_key(&slot)
                     && !self.final_votes.contains_key(&slot)
                     && !self.fallback.contains_key(&(slot, Some(block.id.hash)))
@@ -697,7 +724,7 @@ impl Votor {
                     && safe_notar_fallback
                 {
                     let vote = Vote {
-                        validator: self.own,
+                        validator: own,
                         slot,
                         hash: Some(block.id.hash),
                         kind: VoteKind::NotarFallback,
@@ -709,17 +736,18 @@ impl Votor {
                 }
             }
             for slot in &slots {
+                let Some(own) = self.own_at(*slot) else { continue };
                 let (skip, notar) = self.initial_stakes(*slot);
                 let total_notar: u128 = notar.values().sum();
                 let largest_notar = notar.values().copied().max().unwrap_or(0);
-                let safe_skip_fallback = self.threshold(skip + total_notar - largest_notar, 40);
+                let safe_skip_fallback = self.threshold(*slot, skip + total_notar - largest_notar, 40);
                 if self.initial.contains_key(slot)
                     && !self.final_votes.contains_key(slot)
                     && !self.fallback.contains_key(&(*slot, None))
                     && safe_skip_fallback
                 {
                     let vote = Vote {
-                        validator: self.own,
+                        validator: own,
                         slot: *slot,
                         hash: None,
                         kind: VoteKind::SkipFallback,

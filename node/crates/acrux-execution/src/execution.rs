@@ -1,5 +1,7 @@
 //! SVM execution and the account-state commitment used by every validator.
 use crate::selection::{self, Candidate, Selection};
+pub use crate::admission::{AdmissionConfig, AdmissionMember, AdmissionSnapshot, EffectiveMembership};
+use crate::admission::{self, AdmissionState};
 use anyhow::{anyhow, bail, Context, Result};
 use litesvm::LiteSVM;
 use serde::{Deserialize, Serialize};
@@ -265,9 +267,10 @@ struct StakeMarker {
     schedules: Vec<(u64, Vec<u64>)>,
 }
 
-pub fn genesis_vote_address(identity: &Pubkey) -> Pubkey {
+pub fn validator_vote_address(identity: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"acrux_genesis_vote",identity.as_ref()],&solana_sdk::vote::program::id()).0
 }
+pub fn genesis_vote_address(identity: &Pubkey) -> Pubkey { validator_vote_address(identity) }
 
 fn bridge_stake_marker(bridge: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"stake_activation"],bridge).0
@@ -374,6 +377,7 @@ pub struct SvmExecutor {
     bridge_minimums: Option<(u64, Vec<MinimumWithdrawal>)>,
     native_cutover: Option<NativeCutover>,
     stake_config: Option<StakeConfig>,
+    admission_config: Option<AdmissionConfig>,
     fee_burn_config: Option<FeeBurnConfig>,
 }
 
@@ -569,6 +573,7 @@ impl SvmExecutor {
             bridge_minimums: None,
             native_cutover: None,
             stake_config: None,
+            admission_config: None,
             fee_burn_config: None,
         };
         for program in [
@@ -1094,6 +1099,154 @@ impl SvmExecutor {
         self.stake_config = Some(rule);
     }
 
+    pub fn set_admission_config(&mut self, rule: AdmissionConfig) {
+        self.admission_config = Some(rule);
+    }
+
+    fn decode_admission_state(&self, account: &Account) -> Result<AdmissionState> {
+        let bridge = self.bridge.context("Admission requires the bridge")?;
+        anyhow::ensure!(account.owner == bridge && !account.executable && account.data.get(..8) == Some(&Sha256::digest(b"account:Admission")[..8]), "Invalid admission account");
+        let state: AdmissionState = bincode::deserialize(&account.data[8..])?;
+        anyhow::ensure!(self.admission_config.as_ref() == Some(&state.rule), "Admission rule differs from committed state");
+        state.rule.validate()?;
+        anyhow::ensure!(!state.snapshots.is_empty() && state.snapshots.len() <= admission::RETAINED_SNAPSHOTS
+            && state.snapshots.windows(2).all(|pair| pair[0].epoch < pair[1].epoch)
+            && state.snapshots.iter().all(|snapshot| snapshot.members.len() <= admission::MAX_ADMITTED_MEMBERS
+                && snapshot.members.iter().all(|member| member.stake > 0 && member.admitted_at_epoch <= snapshot.epoch)
+                && snapshot.members.iter().map(|member| member.identity).collect::<BTreeSet<_>>().len() == snapshot.members.len()), "Invalid committed admission snapshots");
+        Ok(state)
+    }
+
+    pub fn admission_snapshots(&self, checkpoint: &ExecutorCheckpoint) -> Result<Vec<AdmissionSnapshot>> {
+        let Some(bridge) = self.bridge else { return Ok(vec![]) };
+        let Some(account) = checkpoint.accounts.get(&admission::marker_address(&bridge)) else { return Ok(vec![]) };
+        if native_wallet(account) { return Ok(vec![]) }
+        Ok(self.decode_admission_state(account)?.snapshots)
+    }
+
+    pub fn admission_snapshot(&self, checkpoint: &ExecutorCheckpoint, epoch: u64) -> Result<Option<AdmissionSnapshot>> {
+        Ok(self.admission_snapshots(checkpoint)?.into_iter().find(|snapshot| snapshot.epoch == epoch))
+    }
+
+    pub fn admission_members(&self, epoch: u64) -> Result<Vec<AdmissionMember>> {
+        Ok(self.admission_snapshot(&self.checkpoint(), epoch)?.map_or_else(Vec::new, |snapshot| snapshot.members))
+    }
+
+    pub fn validator_catalog(&self, checkpoint: &ExecutorCheckpoint) -> Result<Vec<Pubkey>> {
+        let Some(bridge) = self.bridge else { return Ok(vec![]) };
+        let Some(account) = checkpoint.accounts.get(&admission::marker_address(&bridge)).filter(|account| !native_wallet(account)) else {
+            return Ok(self.admission_config.as_ref().map_or_else(|| self.stake_config.as_ref().map_or_else(Vec::new, |rule| rule.identities.clone()), |rule| rule.genesis.iter().map(|(identity,_)| *identity).collect()));
+        };
+        admission::catalog(&checkpoint.accounts, &bridge, &self.decode_admission_state(account)?)
+    }
+
+    /// Effective membership includes unstaked validators whose real vote PDA is ready for delegation.
+    pub fn effective_memberships(&self, epoch: u64) -> Result<Vec<EffectiveMembership>> {
+        let rule = self.admission_config.as_ref().context("Admission is not configured")?;
+        Ok(admission::memberships(&self.accounts, &rule.registry_program, epoch))
+    }
+
+    pub fn validator_stake_weights(&self, epoch: u64) -> Result<Vec<(Pubkey,u64)>> {
+        let rule = self.admission_config.as_ref().context("Admission is not configured")?;
+        let catalog = self.validator_catalog(&self.checkpoint())?;
+        let delegated = admission::delegated_weights(&self.accounts, &catalog, epoch)?;
+        let effective = self.effective_memberships(epoch)?.into_iter().map(|member| member.identity).collect::<BTreeSet<_>>();
+        let genesis = rule.genesis.iter().map(|(identity,_)| *identity).collect::<BTreeSet<_>>();
+        catalog.into_iter().map(|identity| {
+            let weight = if effective.contains(&identity) { delegated.get(&identity).copied().unwrap_or(0).checked_add(if genesis.contains(&identity) { rule.genesis_stake_lamports } else { 0 }).context("Admission stake overflow")? } else { 0 };
+            Ok((identity,weight))
+        }).collect()
+    }
+
+    fn prepare_admission_epoch(&mut self, slot: u64) -> Result<()> {
+        use solana_sdk::vote::state::{VoteInit,VoteState,VoteStateVersions};
+        let Some(rule) = self.admission_config.clone().filter(|rule| slot >= rule.from_slot) else { return Ok(()) };
+        rule.validate()?;
+        let stake = self.stake_config.as_ref().context("Admission requires native stake activation")?;
+        anyhow::ensure!(rule.from_slot >= stake.from_slot && rule.epoch_slots == stake.epoch_slots && rule.genesis_stake_lamports == stake.genesis_stake_lamports
+            && rule.genesis.iter().map(|(identity,_)| *identity).eq(stake.identities.iter().copied()), "Admission differs from the configured stake rule");
+        let bridge = self.bridge.context("Admission requires the bridge")?;
+        let marker_key = admission::marker_address(&bridge);
+        let first_epoch = rule.from_slot / rule.epoch_slots;
+        let epoch = slot / rule.epoch_slots;
+        let existing = self.svm.get_account(&marker_key);
+        let mut additions = BTreeMap::<Pubkey,Account>::new();
+        let mut state = match existing.as_ref().filter(|account| !native_wallet(account)) {
+            Some(account) => self.decode_admission_state(account)?,
+            None => AdmissionState { rule:rule.clone(),prepared_epoch:first_epoch.saturating_sub(1),next_cutoff_epoch:first_epoch,catalog_len:rule.genesis.len() as u64,
+                snapshots:vec![AdmissionSnapshot { epoch:first_epoch,cutoff_slot:rule.from_slot,members:rule.genesis.iter().map(|(identity,hub)| AdmissionMember {
+                    identity:*identity,hub:hub.clone(),stake:admission::LEGACY_GENESIS_STAKE,admitted_at_epoch:0,
+                }).collect() }] },
+        };
+        let initial = existing.as_ref().is_none_or(native_wallet);
+        let mut catalog = if initial { rule.genesis.iter().map(|(identity,_)| *identity).collect::<Vec<_>>() } else { admission::catalog(&self.accounts,&bridge,&state)? };
+        if initial {
+            for (index,identity) in catalog.iter().enumerate() {
+                let mut data = Sha256::digest(b"account:ValidatorIdentity")[..8].to_vec();
+                data.extend_from_slice(&(index as u64).to_le_bytes()); data.extend_from_slice(identity.as_ref());
+                let key = admission::catalog_address(&bridge,identity);
+                let previous = self.svm.get_account(&key);
+                anyhow::ensure!(previous.as_ref().is_none_or(native_wallet), "Validator identity address has an incompatible account");
+                additions.insert(key,Account { lamports:previous.map_or(0,|account| account.lamports).max(self.rent_exempt_minimum(data.len())),data,owner:bridge,executable:false,rent_epoch:0 });
+            }
+        }
+        let mut new_votes = false;
+        if initial || epoch > state.prepared_epoch {
+            for entered in (if initial { first_epoch } else { state.prepared_epoch.saturating_add(1) })..=epoch {
+                for member in admission::memberships(&self.accounts,&rule.registry_program,entered) {
+                    if !catalog.contains(&member.identity) {
+                        let index = catalog.len() as u64;
+                        catalog.push(member.identity);
+                        let mut data = Sha256::digest(b"account:ValidatorIdentity")[..8].to_vec();
+                        data.extend_from_slice(&index.to_le_bytes()); data.extend_from_slice(member.identity.as_ref());
+                        let key = admission::catalog_address(&bridge,&member.identity);
+                        let previous = self.svm.get_account(&key);
+                        anyhow::ensure!(previous.as_ref().is_none_or(native_wallet), "Validator identity address has an incompatible account");
+                        additions.insert(key,Account { lamports:previous.map_or(0,|account| account.lamports).max(self.rent_exempt_minimum(data.len())),data,owner:bridge,executable:false,rent_epoch:0 });
+                    }
+                    let key = validator_vote_address(&member.identity);
+                    if additions.contains_key(&key) { continue }
+                    let previous = self.svm.get_account(&key);
+                    if previous.as_ref().is_some_and(|account| account.owner == solana_sdk::vote::program::id()) { continue }
+                    anyhow::ensure!(previous.as_ref().is_none_or(native_wallet), "Validator vote address has an incompatible account");
+                    let init = VoteInit { node_pubkey:member.identity,authorized_voter:member.identity,authorized_withdrawer:member.identity,commission:0 };
+                    let clock = Clock { slot,epoch,..self.svm.get_sysvar::<Clock>() };
+                    let mut data = vec![0;VoteState::size_of()];
+                    VoteState::serialize(&VoteStateVersions::new_current(VoteState::new(&init,&clock)),&mut data)?;
+                    additions.insert(key,Account { lamports:previous.map_or(0,|account| account.lamports).max(self.rent_exempt_minimum(data.len())),data,owner:solana_sdk::vote::program::id(),executable:false,rent_epoch:0 });
+                    new_votes = true;
+                }
+            }
+            state.prepared_epoch = epoch;
+            state.catalog_len = catalog.len() as u64;
+        }
+        let due = if slot % rule.epoch_slots >= rule.epoch_slots / 2 { Some(epoch) } else { epoch.checked_sub(1) };
+        if let Some(due) = due {
+            while state.next_cutoff_epoch <= due {
+                let source = state.next_cutoff_epoch;
+                let cutoff_slot = source.checked_mul(rule.epoch_slots).and_then(|start| start.checked_add(rule.epoch_slots / 2)).context("Admission cutoff overflow")?;
+                let target = source.checked_add(1).context("Admission epoch overflow")?;
+                let frozen = admission::snapshot(&rule,&self.accounts,&catalog,target,cutoff_slot,state.snapshots.last())?;
+                state.snapshots.push(frozen);
+                if state.snapshots.len() > admission::RETAINED_SNAPSHOTS { state.snapshots.remove(0); }
+                state.next_cutoff_epoch = target;
+            }
+        }
+        let mut data = Sha256::digest(b"account:Admission")[..8].to_vec(); data.extend(bincode::serialize(&state)?);
+        let before = existing.as_ref().map_or(0,|account| account.lamports);
+        additions.insert(marker_key,Account { lamports:before.max(self.rent_exempt_minimum(data.len())),data,owner:bridge,executable:false,rent_epoch:0 });
+        let added = additions.iter().try_fold(0u64,|total,(key,account)| {
+            total.checked_add(account.lamports.saturating_sub(self.svm.get_account(key).map_or(0,|current| current.lamports))).context("Admission rent overflow")
+        })?;
+        let mut gate = self.native_gate()?.context("Admission requires native ACRUX")?;
+        let reserve = u64::from_le_bytes(gate.data[64..72].try_into().unwrap()).checked_add(added).context("Admission reserve overflow")?;
+        gate.data[64..72].copy_from_slice(&reserve.to_le_bytes());
+        for (key,account) in additions { if self.svm.get_account(&key).as_ref() != Some(&account) { self.put(key,account)?; } }
+        if added > 0 { self.put(bridge_native(&bridge),gate)?; }
+        if slot % 16 == 0 || new_votes { self.refresh_genesis_votes(&catalog,slot)?; }
+        Ok(())
+    }
+
     fn decode_stake_marker(&self, account: &Account) -> Result<StakeMarker> {
         let bridge = self.bridge.context("Stake activation requires the bridge")?;
         anyhow::ensure!(account.owner == bridge && !account.executable && account.data.get(..8) == Some(&Sha256::digest(b"account:StakeActivation")[..8]), "Invalid stake activation account");
@@ -1226,6 +1379,9 @@ impl SvmExecutor {
                 marker
             }
         };
+        if self.admission_config.as_ref().is_some_and(|admission| slot >= admission.from_slot) {
+            return self.prepare_admission_epoch(slot)
+        }
         if slot % 16 == 0 { self.refresh_genesis_votes(&rule.identities, slot)?; }
         if epoch <= marker.prepared_through_epoch { return Ok(()) }
         for entered in marker.prepared_through_epoch + 1..=epoch {
@@ -2329,6 +2485,155 @@ mod tests {
         send(&mut executor,vec![stake_instruction::withdraw(&stake_key.pubkey(),&owner.pubkey(),&owner.pubkey(),held,None)],None,25);
         assert!(executor.svm.get_account(&stake_key.pubkey()).is_none_or(|account| account.lamports == 0),"empty StakeHistory permits withdrawal after the deactivation epoch");
         assert_eq!(executor.native_supply().unwrap().unwrap().reserve_lamports,supply.reserve_lamports,"fixed snapshot storage allocates no per-epoch rent");
+    }
+
+    // Canonical registry bytes here are the same Anchor-owned PDAs the executor reads on-chain.
+    fn admission_member(executor: &mut SvmExecutor, registry: Pubkey, identity: Pubkey, hub: &str, effective: u64, pending: Option<(&str,u64)>) {
+        let (hub_key,hub_bump) = Pubkey::find_program_address(&[b"hub",hub.as_bytes()],&registry);
+        let mut hub_data = vec![0;113];
+        hub_data[..8].copy_from_slice(&Sha256::digest(b"account:Hub")[..8]);
+        hub_data[8..16].copy_from_slice(&1u64.to_le_bytes());
+        hub_data[16..16+hub.len()].copy_from_slice(hub.as_bytes()); hub_data[112] = hub_bump;
+        executor.put(hub_key,Account { lamports:executor.rent_exempt_minimum(hub_data.len()),data:hub_data,owner:registry,..Account::default() }).unwrap();
+        let (key,bump) = Pubkey::find_program_address(&[b"member",identity.as_ref()],&registry);
+        let mut data = vec![0;154];
+        data[..8].copy_from_slice(&Sha256::digest(b"account:Membership")[..8]);
+        data[8..40].copy_from_slice(identity.as_ref()); data[40..72].copy_from_slice(hub_key.as_ref());
+        data[72..80].copy_from_slice(&1u64.to_le_bytes()); data[80..88].copy_from_slice(&effective.saturating_sub(1).to_le_bytes());
+        data[88..96].copy_from_slice(&effective.to_le_bytes()); data[153] = bump;
+        if let Some((target,epoch)) = pending {
+            data[96] = if target.is_empty() { 1 } else { 2 };
+            if !target.is_empty() {
+                let (next,next_bump) = Pubkey::find_program_address(&[b"hub",target.as_bytes()],&registry);
+                let mut next_data = vec![0;113]; next_data[..8].copy_from_slice(&Sha256::digest(b"account:Hub")[..8]);
+                next_data[8..16].copy_from_slice(&1u64.to_le_bytes()); next_data[16..16+target.len()].copy_from_slice(target.as_bytes()); next_data[112] = next_bump;
+                executor.put(next,Account { lamports:executor.rent_exempt_minimum(next_data.len()),data:next_data,owner:registry,..Account::default() }).unwrap();
+                data[97..129].copy_from_slice(next.as_ref()); data[129..137].copy_from_slice(&1u64.to_le_bytes());
+            }
+            data[137..145].copy_from_slice(&epoch.to_le_bytes());
+        }
+        executor.put(key,Account { lamports:executor.rent_exempt_minimum(data.len()),data,owner:registry,..Account::default() }).unwrap();
+    }
+
+    fn admission_check_executor() -> (SvmExecutor,Keypair,AdmissionConfig,NativeCutover,StakeConfig,Placement) {
+        use base64::Engine;
+        let owner = Keypair::new(); let bridge = Pubkey::new_unique();
+        let identities = (0..12).map(|_| Pubkey::new_unique()).collect::<Vec<_>>();
+        let native = NativeCutover { slot:4,solana_mint:Pubkey::new_unique(),lamports_per_base_unit:1000 };
+        let stake = StakeConfig { from_slot:32,epoch_slots:32,genesis_stake_lamports:200_000_000,identities:identities.clone() };
+        let admission = AdmissionConfig { from_slot:64,epoch_slots:32,registry_program:Pubkey::new_unique(),genesis:identities.iter().enumerate().map(|(index,identity)| (*identity,["FRA","NYC","TYO"][index/4].into())).collect(),genesis_stake_lamports:stake.genesis_stake_lamports };
+        let file:serde_json::Value = serde_json::from_slice(&std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../chain/placements/stake.json")).unwrap()).unwrap();
+        let accounts = file["accounts"].as_array().unwrap().iter().map(|a| (Pubkey::from_str(a["address"].as_str().unwrap()).unwrap(),Account {
+            lamports:a["lamports"].as_u64().unwrap(),data:base64::engine::general_purpose::STANDARD.decode(a["data"].as_str().unwrap()).unwrap(),
+            owner:Pubkey::from_str(a["owner"].as_str().unwrap()).unwrap(),executable:a["executable"].as_bool().unwrap(),rent_epoch:0,
+        })).collect();
+        let placement = Placement { name:"Stake admission check".into(),slot:32,accounts };
+        let mut executor = SvmExecutor::new([(owner.pubkey().to_string(),100_000_000)],&[]).unwrap();
+        executor.set_bridge(bridge); executor.set_native_cutover(native.clone()); executor.set_stake_config(stake.clone());
+        executor.set_admission_config(admission.clone()); executor.set_placements(vec![placement.clone()]);
+        executor.set_proposers(&[(1,identities[1].to_string())]).unwrap();
+        executor.set_credits(vec![BridgeCredit { sequence:0,solana_mint:native.solana_mint.to_string(),decimals:6,recipient:owner.pubkey().to_string(),amount:20_000_000 }]);
+        executor.execute_slot(3,vec![]).unwrap(); executor.execute_slot(4,vec![]).unwrap();
+        for (identity,hub) in &admission.genesis { admission_member(&mut executor,admission.registry_program,*identity,hub,0,None); }
+        executor.execute_slot(32,vec![]).unwrap(); executor.execute_slot(63,vec![]).unwrap();
+        (executor,owner,admission,native,stake,placement)
+    }
+
+    fn admission_send(executor: &mut SvmExecutor, owner: &Keypair, instructions: Vec<solana_sdk::instruction::Instruction>, extra: Option<&Keypair>, slot: u64) {
+        let mut signers = vec![owner]; if let Some(extra) = extra { signers.push(extra); }
+        let tx = Transaction::new_signed_with_payer(&instructions,Some(&owner.pubkey()),&signers,Hash::from_str(&executor.latest_blockhash()).unwrap());
+        let transaction = executor.validate_transaction(&bincode::serialize(&tx).unwrap(),slot).unwrap();
+        let result = executor.execute_slot(slot,vec![ExecutionItem { transaction,source_proposers:vec![1] }]).unwrap().results.remove(0);
+        assert!(result.success,"{result:?}");
+    }
+
+    #[test]
+    fn admission_cutoff_freezes_late_membership_and_stake_for_next_epoch() {
+        use solana_sdk::{stake::{instruction as stake_instruction,state::{Authorized,Lockup,StakeStateV2}},vote::state::VoteState};
+        let (mut executor,owner,rule,_,_,_) = admission_check_executor();
+        let external = Pubkey::new_unique(); let late = Pubkey::new_unique();
+        admission_member(&mut executor,rule.registry_program,external,"FRA",2,None);
+        let supply_before = executor.native_supply().unwrap().unwrap(); let total_before = executor.total_lamports().unwrap();
+        executor.execute_slot(64,vec![]).unwrap();
+        let checkpoint = executor.checkpoint();
+        let bootstrap = executor.admission_snapshot(&checkpoint,2).unwrap().unwrap();
+        assert_eq!(bootstrap.members.len(),12);
+        assert!(bootstrap.members.iter().all(|member| member.stake == 100_000_000),"the already-handed bootstrap epoch keeps its legacy voting weights");
+        let vote = executor.svm.get_account(&validator_vote_address(&external)).unwrap();
+        let vote_state = VoteState::deserialize(&vote.data).unwrap();
+        assert_eq!((vote_state.node_pubkey,vote_state.authorized_withdrawer),(external,external));
+        assert!(!bootstrap.members.iter().any(|member| member.identity == external),"an effective but unstaked member gets a vote PDA without voting weight");
+        let supply_after = executor.native_supply().unwrap().unwrap();
+        assert_eq!(supply_after.circulating_lamports,supply_before.circulating_lamports);
+        assert_eq!(supply_after.reserve_lamports-supply_before.reserve_lamports,executor.total_lamports().unwrap()-total_before);
+        let minimum = executor.get_stake_minimum_delegation().unwrap().unwrap();
+        let delegated = minimum.checked_mul(2).unwrap(); let rent = executor.rent_exempt_minimum(StakeStateV2::size_of());
+        let create = |stake:&Keypair,identity:Pubkey| {
+            let mut instructions = stake_instruction::create_account(&owner.pubkey(),&stake.pubkey(),&Authorized::auto(&owner.pubkey()),&Lockup::default(),rent+delegated);
+            instructions.push(stake_instruction::delegate_stake(&stake.pubkey(),&owner.pubkey(),&validator_vote_address(&identity))); instructions
+        };
+        let early_stake = Keypair::new();
+        admission_send(&mut executor,&owner,create(&early_stake,external),Some(&early_stake),65);
+        admission_member(&mut executor,rule.registry_program,rule.genesis[0].0,"FRA",0,Some(("NYC",3)));
+        admission_member(&mut executor,rule.registry_program,rule.genesis[1].0,"FRA",0,Some(("",3)));
+        let cutoff_stake = Keypair::new();
+        admission_send(&mut executor,&owner,create(&cutoff_stake,rule.genesis[0].0),Some(&cutoff_stake),80);
+        let frozen = executor.admission_snapshot(&executor.checkpoint(),3).unwrap().unwrap();
+        assert_eq!(frozen.cutoff_slot,80);
+        let newcomer = frozen.members.iter().find(|member| member.identity == external).unwrap();
+        assert_eq!((newcomer.stake,newcomer.admitted_at_epoch),(delegated,3));
+        let moved = frozen.members.iter().find(|member| member.identity == rule.genesis[0].0).unwrap();
+        assert_eq!((moved.hub.as_str(),moved.stake),("NYC",rule.genesis_stake_lamports),"cutoff-slot transactions run after the snapshot");
+        assert!(!frozen.members.iter().any(|member| member.identity == rule.genesis[1].0),"pending leave is projected to the target boundary");
+        admission_member(&mut executor,rule.registry_program,late,"FRA",3,None);
+        executor.execute_slot(96,vec![]).unwrap();
+        assert!(executor.svm.get_account(&validator_vote_address(&late)).is_some());
+        let late_stake = Keypair::new();
+        admission_send(&mut executor,&owner,create(&late_stake,late),Some(&late_stake),97);
+        admission_send(&mut executor,&owner,vec![stake_instruction::deactivate_stake(&early_stake.pubkey(),&owner.pubkey())],None,98);
+        assert_eq!(executor.admission_snapshot(&executor.checkpoint(),3).unwrap().unwrap(),frozen,"late joins, stake and deactivation cannot rewrite the fixed next set");
+        executor.execute_slot(112,vec![]).unwrap();
+        let next = executor.admission_snapshot(&executor.checkpoint(),4).unwrap().unwrap();
+        assert!(next.members.iter().any(|member| member.identity == late && member.stake == delegated && member.admitted_at_epoch == 4));
+        assert!(!next.members.iter().any(|member| member.identity == external),"deactivated outsider stake stops at the next eligible cutoff");
+        assert_eq!(next.members.iter().find(|member| member.identity == rule.genesis[0].0).unwrap().stake,rule.genesis_stake_lamports+delegated);
+        let catalog = executor.validator_catalog(&executor.checkpoint()).unwrap();
+        assert_eq!(&catalog[..12],&rule.genesis.iter().map(|(identity,_)| *identity).collect::<Vec<_>>());
+        assert_eq!(&catalog[12..],&[external,late]);
+    }
+
+    #[test]
+    fn admission_skipped_cutoff_and_rollback_replay_identically() {
+        let (mut executor,_,rule,native,stake,placement) = admission_check_executor();
+        // Configuring a future boundary must not change any earlier account hash.
+        let legacy = executor.checkpoint(); executor.admission_config = None;
+        executor.execute_slot(63,vec![]).unwrap(); let legacy_hash = executor.state_hash();
+        executor.restore(legacy).unwrap(); executor.set_admission_config(rule.clone());
+        executor.execute_slot(63,vec![]).unwrap(); assert_eq!(executor.state_hash(),legacy_hash);
+        executor.execute_slot(64,vec![]).unwrap(); executor.execute_slot(79,vec![]).unwrap();
+        let before = executor.checkpoint(); let before_hash = executor.state_hash();
+        executor.execute_slot(81,vec![]).unwrap();
+        let first_hash = executor.state_hash(); let first = executor.admission_snapshot(&executor.checkpoint(),3).unwrap().unwrap();
+        assert_eq!(first.cutoff_slot,80,"a skipped cutoff freezes the ancestor state at the first executed slot after it");
+        assert_ne!(first_hash,before_hash);
+        let marker = executor.svm.get_account(&admission::marker_address(&executor.bridge.unwrap())).unwrap();
+        assert!(marker.data.windows(8).any(|bytes| bytes == 80u64.to_le_bytes()),"the cutoff is committed in hashed account bytes");
+        let supply = executor.native_supply().unwrap().unwrap();
+        executor.restore(before.clone()).unwrap(); executor.execute_slot(81,vec![]).unwrap();
+        assert_eq!(executor.state_hash(),first_hash,"rollback recreates the same cutoff, catalog, vote states and reserve");
+        assert_eq!(executor.native_supply().unwrap().unwrap().reserve_lamports,supply.reserve_lamports);
+        let mut saved = executor.snapshot_meta(&before);
+        saved.accounts = before.account_changes(None).0.into_iter().map(|(key,account)| (key.to_string(),account.as_ref().clone())).collect();
+        saved.executed = before.executed_changes(None).0;
+        let mut loaded = SvmExecutor::from_state(&[],saved).unwrap();
+        loaded.set_bridge(executor.bridge.unwrap()); loaded.set_native_cutover(native); loaded.set_stake_config(stake); loaded.set_admission_config(rule.clone()); loaded.set_placements(vec![placement]);
+        loaded.set_proposers(&[(1,rule.genesis[1].0.to_string())]).unwrap();
+        assert_eq!(loaded.state_hash(),before_hash);
+        loaded.execute_slot(81,vec![]).unwrap();
+        assert_eq!(loaded.state_hash(),first_hash,"loading the pre-cutoff durable checkpoint produces the identical committed snapshot");
+        assert_eq!(loaded.admission_snapshot(&loaded.checkpoint(),3).unwrap(),Some(first));
+        assert_eq!(loaded.validator_catalog(&loaded.checkpoint()).unwrap(),executor.validator_catalog(&executor.checkpoint()).unwrap());
+        let hash = loaded.state_hash(); loaded.prepare_stake_epoch(81).unwrap(); assert_eq!(loaded.state_hash(),hash,"the freeze is idempotent before fees");
     }
 
     #[test]

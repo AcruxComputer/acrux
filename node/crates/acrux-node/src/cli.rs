@@ -209,9 +209,7 @@ pub async fn follow(url: &str, genesis: &str) -> Result<()> {
                 let state = replay.apply(s, &recipients, blocks).with_context(|| format!("re-executing slot {s}"))?;
                 ensure!(view["stateHash"].as_str() == Some(state.as_str()), "slot {s}: re-executed state {} differs from the net's {}", &state[..12], view["stateHash"]);
                 if s % 4 == 3 {
-                    if let Some(proposers) = &mut replay.proposers {
-                        for (epoch, weights) in replay.executor.stake_schedule_snapshots(&replay.executor.checkpoint())? { proposers.learn(epoch, weights)?; }
-                    }
+                    replay.learn_finalized()?;
                 }
                 checked += 1;
                 println!("slot {s} re-executed  agreed {}  state {} matches  checked {checked}", view["agreedSet"], &state[..12]);
@@ -263,6 +261,7 @@ fn validate_proposer_config(config: &crate::protocol::ProposerConfig, genesis: &
     let stake_rule = genesis.bridge.as_ref().map(|bridge| bridge.stake_activation()).transpose()?.flatten();
     ensure!(config.stake_from_slot == stake_rule.map(|rule| rule.0) && config.genesis_stake_lamports == stake_rule.map(|rule| rule.1), "Snapshot stake activation differs from the local rule");
     ensure!(config.epoch_slots == genesis.bridge.as_ref().map_or(432_000, |bridge| bridge.epoch_slots), "Snapshot epoch length differs from the local rule");
+    ensure!(config.admission_from_slot == genesis.bridge.as_ref().and_then(|bridge|bridge.admission_from_slot), "Snapshot admission activation differs from the local rule");
     Ok(())
 }
 
@@ -278,6 +277,13 @@ pub(crate) fn load_follow_snapshot(mut snapshot: Value, genesis: &crate::genesis
     if let Some(config) = &config { validate_proposer_config(config, genesis)?; }
     let mut executor = crate::execution::SvmExecutor::new(Vec::<(String, u64)>::new(), programs)?;
     executor.set_placements(genesis.placements.clone());
+    if let (Some(bridge), Some(config)) = (&genesis.bridge, &config) {
+        let identities = config.identities.iter().map(|identity| {
+            let hub = config.hubs.iter().find(|hub| hub.members.iter().any(|member| &member.identity == identity)).context("Validator has no configured hub")?;
+            Ok((Pubkey::from_str(identity)?, hub.code.clone()))
+        }).collect::<Result<Vec<_>>>()?;
+        if let Some(admission) = bridge.admission_config(&identities)? { executor.set_admission_config(admission); }
+    }
     if let Some(bridge) = &genesis.bridge {
         executor.set_bridge(bridge.program);
         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
@@ -294,7 +300,9 @@ pub(crate) fn load_follow_snapshot(mut snapshot: Value, genesis: &crate::genesis
     if let Some(proposers) = &mut proposers {
         for (epoch, weights) in executor.stake_schedule_snapshots(&executor.checkpoint())? { proposers.learn(epoch, weights)?; }
     }
-    Ok((Replay { executor, threshold: serde_json::from_value(snapshot["threshold"].take())?, window: None, proposers }, last, start_hash))
+    let mut replay = Replay { executor, threshold: serde_json::from_value(snapshot["threshold"].take())?, window: None, proposers };
+    replay.learn_finalized()?;
+    Ok((replay, last, start_hash))
 }
 
 pub(crate) struct Replay {
@@ -304,7 +312,42 @@ pub(crate) struct Replay {
     pub(crate) proposers: Option<crate::protocol::ProposerSchedules>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ReplayCheckpoint {
+    executor: crate::execution::ExecutorCheckpoint,
+    threshold: crate::threshold::ThresholdCache,
+    window: Option<u64>,
+    pub(crate) proposers: Option<crate::protocol::ProposerSchedules>,
+}
 impl Replay {
+    #[cfg(test)]
+    pub(crate) fn for_test(proposers: crate::protocol::ProposerSchedules) -> Result<Self> {
+        Ok(Self {
+            executor: crate::execution::SvmExecutor::new(Vec::<(String,u64)>::new(), &[])?,
+            threshold: crate::threshold::ThresholdCache::new(2400)?,
+            window: None,
+            proposers: Some(proposers),
+        })
+    }
+    pub(crate) fn checkpoint(&self) -> ReplayCheckpoint {
+        ReplayCheckpoint {executor:self.executor.checkpoint(),threshold:self.threshold.clone(),window:self.window,proposers:self.proposers.clone()}
+    }
+    pub(crate) fn restore(&mut self, checkpoint: ReplayCheckpoint) -> Result<()> {
+        self.executor.restore(checkpoint.executor)?;
+        self.threshold = checkpoint.threshold;
+        self.window = checkpoint.window;
+        self.proposers = checkpoint.proposers;
+        Ok(())
+    }
+    pub(crate) fn learn_finalized(&mut self) -> Result<()> {
+        if let Some(proposers) = &mut self.proposers {
+            let checkpoint = self.executor.checkpoint();
+            for (epoch, weights) in self.executor.stake_schedule_snapshots(&checkpoint)? { proposers.learn(epoch, weights)?; }
+            let catalog = self.executor.validator_catalog(&checkpoint)?;
+            for snapshot in self.executor.admission_snapshots(&checkpoint)? { proposers.learn_admission(snapshot, catalog.clone())?; }
+        }
+        Ok(())
+    }
     /// One slot, the way Algorithm 2's TryExecute runs it on a validator.
     pub(crate) fn apply(&mut self, s: u64, recipients: &[(u8, String)], blocks: &Value) -> Result<String> {
         use crate::execution::ExecutionItem;
@@ -401,6 +444,14 @@ impl Replay {
 }
 
 pub(crate) fn check_slot(slot: &Value, signed_attestations: &Value) -> Result<()> {
+    check_slot_agreement(slot, signed_attestations)?;
+    if slot["slot"].as_u64().unwrap() % 4 == 3 {
+        let certificates = slot["cblock"]["certificates"].as_array().context("certificates")?;
+        ensure!(certificates.iter().any(|c| matches!(c["kind"].as_str(), Some("fast_finalization" | "slow_finalization")) && c["stakeShare"].as_f64() >= c["threshold"].as_f64()), "no finalization certificate");
+    }
+    Ok(())
+}
+pub(crate) fn check_slot_agreement(slot: &Value, signed_attestations: &Value) -> Result<()> {
     let proposers = slot["window"]["proposers"].as_array().context("proposers")?;
     let mut attestations = vec![];
     for a in signed_attestations.as_array().context("attestations")? {
@@ -420,13 +471,6 @@ pub(crate) fn check_slot(slot: &Value, signed_attestations: &Value) -> Result<()
     let agreed = agreement::agreed(&attestations, false).context("the attestations do not agree")?;
     let claimed: Vec<usize> = serde_json::from_value(slot["agreedSet"].clone())?;
     ensure!(agreed == claimed, "agreed set {claimed:?} differs from the attestations' {agreed:?}");
-    if slot["slot"].as_u64().unwrap() % 4 == 3 {
-        let certificates = slot["cblock"]["certificates"].as_array().context("certificates")?;
-        ensure!(
-            certificates.iter().any(|c| matches!(c["kind"].as_str(), Some("fast_finalization" | "slow_finalization")) && c["stakeShare"].as_f64() >= c["threshold"].as_f64()),
-            "no finalization certificate"
-        );
-    }
     Ok(())
 }
 

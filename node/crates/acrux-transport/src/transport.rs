@@ -185,6 +185,19 @@ impl LocalTransport {
         *self.external.write().unwrap() = Some((server,slot_of));
     }
 
+    pub fn external_server(&self) -> Option<Arc<crate::external::ExternalServer>> {
+        self.external.read().unwrap().as_ref().map(|(server,_)|server.clone())
+    }
+    /// Already authenticated member votes enter the ordinary receive path without geography.
+    pub fn inject_external(&self,from:usize,to:usize,payload:Vec<u8>)->Result<()> {
+        ensure!(to<self.peers.len() && payload.len()<=MAX_MESSAGE_BYTES,"Invalid member vote delivery");
+        if let Some((server,slot_of))=self.external.read().unwrap().clone() {
+            if server.observes(to) {if let Some(slot)=slot_of(&payload){server.publish(from,to,slot,Arc::new(payload.clone()));}}
+        }
+        self.incoming.try_send(Received{from,to,payload,received_at:Instant::now()}).context("Member vote receive capacity exceeded")?;
+        Ok(())
+    }
+
     pub fn peers(&self) -> &[Peer] {
         &self.peers
     }
@@ -197,10 +210,8 @@ impl LocalTransport {
 
     pub async fn send(&self, from: usize, to: usize, payload: Vec<u8>) -> Result<()> {
         let _whole=self.profile.measure(Some(from),"transport.send");
-        ensure!(
-            from < self.peers.len() && to < self.peers.len(),
-            "unknown transport peer"
-        );
+        ensure!(from<self.peers.len(),"unknown local transport sender");
+        if to>=self.peers.len() {return Ok(())}
         ensure!(
             payload.len() <= MAX_MESSAGE_BYTES,
             "network message exceeds size limit"

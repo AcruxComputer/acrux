@@ -3,7 +3,7 @@
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "info": {
     "title": "Acrux API",
-    "version": "0.1.24",
+    "version": "0.1.25",
     "description": "Round 1 fixture contract. Amounts are decimal integer strings. Times are relative microseconds with UTC slot wallTime."
   },
   "servers": [
@@ -8415,6 +8415,25 @@
                   "type": "integer",
                   "minimum": 0,
                   "maximum": 9007199254740991
+                },
+                "validatorKind": {
+                  "type": "string",
+                  "enum": [
+                    "genesis",
+                    "external"
+                  ]
+                },
+                "admittedAtEpoch": {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
@@ -8677,6 +8696,25 @@
                         "type": "integer",
                         "minimum": 0,
                         "maximum": 9007199254740991
+                      },
+                      "validatorKind": {
+                        "type": "string",
+                        "enum": [
+                          "genesis",
+                          "external"
+                        ]
+                      },
+                      "admittedAtEpoch": {
+                        "anyOf": [
+                          {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
                       }
                     },
                     "required": [
@@ -9468,6 +9506,25 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 9007199254740991
+          },
+          "validatorKind": {
+            "type": "string",
+            "enum": [
+              "genesis",
+              "external"
+            ]
+          },
+          "admittedAtEpoch": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [

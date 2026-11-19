@@ -2,6 +2,7 @@ pub mod bridge;
 pub mod fee_burns;
 pub mod facts;
 pub mod cli;
+pub mod carry;
 pub mod propose;
 pub mod gateway;
 pub mod genesis;

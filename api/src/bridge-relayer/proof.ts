@@ -11,9 +11,10 @@ const wireProof = z.object({
   chainId: z.string().min(1),
   epochSlots: integer.positive().refine(value => value % 4 === 0),
   feeBurnFromSlot: integer.nullable().optional(),
+  admissionFromSlot: integer.nullable().optional(),
   nativeMint: z.string().nullable().optional(),
   hash: z.string().regex(/^[0-9a-f]{64}$/), outboxRoot: z.string().regex(/^[0-9a-f]{64}$/),
-  preimage: base64, outbox: z.array(base64).min(1),
+  preimage: base64, outbox: z.array(base64),
   validators: z.array(z.string()).min(1).max(32), stakes: z.array(decimal).min(1).max(32),
   votes: z.array(z.object({ validator: integer.max(31), kind: z.enum(['notar', 'finalize']), signature: base64 })),
 })
@@ -54,9 +55,12 @@ export function readProof(raw: unknown, epochSlots: number, chainId: Buffer): Pr
   if (sha256(preimage, Buffer.from(wire.outboxRoot, 'hex')).toString('hex') !== wire.hash) throw new Error('Gateway cblock hash is invalid.')
   let level = outbox.map(leaf => sha256(leaf))
   while (level.length > 1) level = Array.from({ length: Math.ceil(level.length / 2) }, (_, i) => i * 2 + 1 < level.length ? sha256(level[i * 2], level[i * 2 + 1]) : level[i * 2])
-  if (level[0].toString('hex') !== wire.outboxRoot) throw new Error('Gateway outbox root is invalid.')
+  if ((level[0] ?? Buffer.alloc(32)).toString('hex') !== wire.outboxRoot) throw new Error('Gateway outbox root is invalid.')
   const next = entries.filter(entry => entry.kind === 'set')
-  if (next.length !== 1 || next[0].epoch !== Math.floor(wire.consensusSlot * 4 / epochSlots) + 1) throw new Error('Gateway outbox epoch is invalid.')
+  if (wire.admissionFromSlot != null && (wire.admissionFromSlot % epochSlots !== 0 || epochSlots % 8 !== 0)) throw new Error('Gateway admission rule is invalid.')
+  const firstSlot = wire.consensusSlot * 4
+  const beforeCutoff = wire.admissionFromSlot != null && firstSlot >= wire.admissionFromSlot && firstSlot % epochSlots < epochSlots / 2
+  if (next.length !== (beforeCutoff ? 0 : 1) || next.some(entry => entry.epoch !== Math.floor(firstSlot / epochSlots) + 1)) throw new Error('Gateway outbox epoch is invalid.')
   const burns = entries.filter(entry => entry.kind === 'feeBurn')
   if (burns.length > 1 || burns.some(entry => entry.epoch !== Math.floor(wire.consensusSlot * 4 / epochSlots) || (wire.consensusSlot + 1) * 4 % epochSlots !== 0)) throw new Error('Gateway fee burn is not the epoch-ending cblock.')
   if (wire.feeBurnFromSlot != null && (wire.feeBurnFromSlot % epochSlots !== 0 || !wire.nativeMint)) throw new Error('Gateway fee burn rule is invalid.')

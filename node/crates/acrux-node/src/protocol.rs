@@ -166,18 +166,24 @@ pub(crate) struct ProposerConfig {
     pub epoch_slots: u64,
     pub stake_from_slot: Option<u64>,
     pub genesis_stake_lamports: Option<u64>,
+    #[serde(default)]
+    pub admission_from_slot: Option<u64>,
 }
 
+#[derive(Clone)]
 pub(crate) struct ProposerSchedules {
     pub config: ProposerConfig,
     legacy: schedule::Schedule,
+    pub catalog: Vec<String>,
+    pub admissions: BTreeMap<u64,crate::execution::AdmissionSnapshot>,
+    admission_draws: BTreeMap<u64,schedule::Schedule>,
     epochs: BTreeMap<u64, (Vec<u64>, schedule::Schedule)>,
 }
 impl ProposerSchedules {
     pub fn new(config: ProposerConfig) -> Result<Self> {
         ensure!(config.windows_per_epoch > 0 && config.epoch_slots > 0 && (config.stake_from_slot.is_none() || config.epoch_slots % 16 == 0), "Invalid proposer schedule lengths");
         let legacy = schedule::build_schedule(0, &config.seed, &config.hubs, config.identities.len() as u64 * 100_000_000, config.windows_per_epoch)?;
-        let mut this = Self { config, legacy, epochs: BTreeMap::new() };
+        let mut this = Self { catalog:config.identities.clone(),config,legacy,epochs:BTreeMap::new(),admissions:BTreeMap::new(),admission_draws:BTreeMap::new() };
         if let (Some(slot), Some(weight)) = (this.config.stake_from_slot, this.config.genesis_stake_lamports) {
             let epoch = slot / this.config.epoch_slots;
             let weights = vec![weight; this.config.identities.len()];
@@ -186,6 +192,37 @@ impl ProposerSchedules {
         }
         Ok(this)
     }
+    pub fn learn_admission(&mut self, snapshot: crate::execution::AdmissionSnapshot, catalog: Vec<solana_sdk::pubkey::Pubkey>) -> Result<()> {
+        let catalog = catalog.iter().map(ToString::to_string).collect::<Vec<_>>();
+        ensure!(catalog.starts_with(&self.catalog)||self.catalog.starts_with(&catalog),"Finalized validator catalog changed existing wire identities");
+        if catalog.len()>self.catalog.len() {self.catalog = catalog;}
+        if let Some(known)=self.admissions.get(&snapshot.epoch) { ensure!(known==&snapshot,"Finalized validator sets disagree");return Ok(()) }
+        let bootstrap = self.config.admission_from_slot.map(|slot|slot/self.config.epoch_slots);
+        if bootstrap.is_some_and(|epoch|snapshot.epoch>epoch) {
+            let mut hubs:BTreeMap<String,schedule::Hub> = BTreeMap::new();
+            for member in &snapshot.members {
+                let hub=hubs.entry(member.hub.clone()).or_insert_with(||schedule::Hub {code:member.hub.clone(),
+                    region:self.config.hubs.iter().find(|hub|hub.code==member.hub).map_or_else(||member.hub.clone(),|hub|hub.region.clone()),members:vec![]});
+                hub.members.push(schedule::Member {identity:member.identity.to_string(),stake:member.stake});
+            }
+            // k=3 requires three distinct co-proposers; this is not the later n_min/rho hub rule.
+            let hubs=hubs.into_values().filter(|hub|hub.members.len()>=3).collect::<Vec<_>>();
+            let total=hubs.iter().flat_map(|hub|&hub.members).try_fold(0u64,|sum,member|sum.checked_add(member.stake)).context("Admission stake overflow")?;
+            let draw=schedule::build_schedule(snapshot.epoch,&self.config.seed,&hubs,total,self.config.windows_per_epoch)?;
+            self.admission_draws.insert(snapshot.epoch,draw);
+        }
+        self.admissions.insert(snapshot.epoch,snapshot);
+        Ok(())
+    }
+    pub fn voting_set(&self,cblock:u64)->Result<(Vec<String>,Vec<u64>)> {
+        let epoch=cblock*4/self.config.epoch_slots;
+        if let Some(from)=self.config.admission_from_slot.filter(|from|cblock*4>=*from) {
+            if let Some(set)=self.admissions.get(&epoch) {return Ok((set.members.iter().map(|member|member.identity.to_string()).collect(),set.members.iter().map(|member|member.stake).collect()))}
+            ensure!(epoch==from/self.config.epoch_slots,"This epoch's validator snapshot is not finalized yet");
+        }
+        Ok((self.config.identities.clone(),vec![100_000_000;self.config.identities.len()]))
+    }
+    fn admission_active(&self,epoch:u64)->bool {self.config.admission_from_slot.is_some_and(|from|epoch>from/self.config.epoch_slots)}
     pub fn learn(&mut self, epoch: u64, weights: Vec<u64>) -> Result<()> {
         ensure!(weights.len() == self.config.identities.len(), "Stake snapshot has another validator count");
         if let Some((known, _)) = self.epochs.get(&epoch) {
@@ -206,10 +243,12 @@ impl ProposerSchedules {
         self.config.stake_from_slot.is_some_and(|slot| window.saturating_mul(16) >= slot)
     }
     pub fn ready(&self, window: u64) -> bool {
-        !self.active(window) || self.epochs.contains_key(&(window * 16 / self.config.epoch_slots))
+        let epoch=window*16/self.config.epoch_slots;
+        if self.admission_active(epoch) {self.admission_draws.contains_key(&epoch)} else {!self.active(window)||self.epochs.contains_key(&epoch)}
     }
     pub fn window(&self, number: u64) -> Result<schedule::Window> {
-        let schedule = if self.active(number) {
+        let epoch=number*16/self.config.epoch_slots;
+        let schedule = if self.admission_active(epoch) {self.admission_draws.get(&epoch).context("Admission schedule is not finalized yet")?} else if self.active(number) {
             &self.epochs.get(&(number * 16 / self.config.epoch_slots)).context("The proposer epoch's stake snapshot is not finalized yet")?.1
         } else { &self.legacy };
         let mut window = schedule.windows[number as usize % schedule.windows.len()].clone();
@@ -217,13 +256,18 @@ impl ProposerSchedules {
         Ok(window)
     }
     pub fn weights(&self, number: u64) -> Result<Vec<u64>> {
-        if self.active(number) { Ok(self.epochs.get(&(number * 16 / self.config.epoch_slots)).context("The proposer epoch's stake snapshot is not finalized yet")?.0.clone()) }
+        if self.admission_active(number*16/self.config.epoch_slots) { Ok(self.voting_set(number*4)?.1) }
+        else if self.active(number) { Ok(self.epochs.get(&(number * 16 / self.config.epoch_slots)).context("The proposer epoch's stake snapshot is not finalized yet")?.0.clone()) }
         else { Ok(vec![100_000_000; self.config.identities.len()]) }
     }
     pub fn ids(&self, number: u64) -> Result<Vec<usize>> {
-        self.window(number)?.proposers.iter().map(|identity| self.config.identities.iter().position(|known| known == identity).context("Unknown drawn proposer")).collect()
+        self.window(number)?.proposers.iter().map(|identity| self.catalog.iter().position(|known| known == identity).context("Unknown drawn proposer")).collect()
     }
     fn epoch(&self, epoch: u64) -> Result<Value> {
+        if self.admission_active(epoch) {
+            let set=self.admissions.get(&epoch).context("Admission snapshot is not finalized yet")?;
+            return Ok(json!({"epoch":epoch,"weights":set.members.iter().map(|member|json!({"identity":member.identity.to_string(),"stake":member.stake.to_string()})).collect::<Vec<_>>(),"schedule":self.admission_draws[&epoch]}));
+        }
         let (weights, schedule) = if self.config.stake_from_slot.is_some_and(|slot| epoch >= slot / self.config.epoch_slots) {
             let (weights, schedule) = self.epochs.get(&epoch).context("The proposer epoch's stake snapshot is not finalized yet")?;
             (weights.clone(), schedule)
@@ -242,7 +286,7 @@ mod proposer_stake_tests {
         let hubs = ["FRA","NYC","TYO"].into_iter().enumerate().map(|(hub,code)| schedule::Hub {
             code:code.into(),region:code.into(),members:identities[hub * 4..hub * 4 + 4].iter().map(|identity| schedule::Member { identity:identity.clone(),stake:100_000_000 }).collect(),
         }).collect();
-        ProposerConfig { seed:"9".into(),windows_per_epoch:96,identities,hubs,epoch_slots:256,stake_from_slot:Some(512),genesis_stake_lamports:Some(100_000_000) }
+        ProposerConfig { seed:"9".into(),windows_per_epoch:96,identities,hubs,epoch_slots:256,stake_from_slot:Some(512),genesis_stake_lamports:Some(100_000_000),admission_from_slot:None }
     }
     fn delegation(executor: &mut SvmExecutor, config: &ProposerConfig, deactivation_epoch: u64) {
         let vote = crate::execution::genesis_vote_address(&config.identities[0].parse().unwrap());
@@ -528,6 +572,7 @@ fn observer_packet_slot(bytes: &[u8]) -> Option<u64> {
         Wire::Handover { shreds,.. } => shreds.iter().map(|shred|shred.meta.slot).max(),
         Wire::Equivocation { first,.. } => Some(first.0.slot),
         Wire::Cblock(witness) => Some(witness.block.slot * 4),
+        Wire::ValidatorEpoch {snapshot,..} => Some(snapshot.cutoff_slot),
         Wire::Submit(_) | Wire::SubmitFragment(_) => None,
     }
 }
@@ -667,6 +712,7 @@ impl Network {
             identities: identities.clone(), hubs: hubs.clone(),
             epoch_slots: genesis.as_ref().and_then(|g| g.bridge.as_ref()).map_or(432_000, |bridge| bridge.epoch_slots),
             stake_from_slot: stake_rule.map(|rule| rule.0), genesis_stake_lamports: stake_rule.map(|rule| rule.1),
+            admission_from_slot:genesis.as_ref().and_then(|g|g.bridge.as_ref()).and_then(|bridge|bridge.admission_from_slot),
         };
         // A net that persists continues from its saved state, when it has one: the last finalized
         // cblock, its accounts, the executed ids and recent blockhashes, and the traffic's keys.
@@ -699,6 +745,7 @@ impl Network {
             state.bridge_program = genesis.as_ref().and_then(|g| g.bridge.as_ref()).map(|rule| rule.program.to_string());
             state.bridge_epoch_slots = genesis.as_ref().and_then(|g| g.bridge.as_ref()).map(|rule| rule.epoch_slots);
             state.fee_burn_from_slot = genesis.as_ref().and_then(|g| g.bridge.as_ref()).and_then(|rule| rule.fee_burn_from_slot);
+            state.admission_from_slot=genesis.as_ref().and_then(|g|g.bridge.as_ref()).and_then(|rule|rule.admission_from_slot);
         }
         let resumed = match &saved {
             Some(saved) => Some(BlockRef {
@@ -774,6 +821,7 @@ impl Network {
         if let Some(genesis) = &genesis {
             programs.extend(genesis.programs.iter().map(|(address, path)| crate::execution::GenesisProgram { address: address.clone(), path: path.clone() }));
         }
+        let admission_genesis=peers.iter().map(|peer|Ok((identities[peer.id].parse()?,peer.hub.clone()))).collect::<Result<Vec<_>>>()?;
         let mut nodes = vec![];
         for id in 0..12 {
             let mut votor = Votor::new(id, stakes.clone())?;
@@ -787,6 +835,7 @@ impl Network {
                         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
                         if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); }
                         if let Some(fee_burn) = bridge.fee_burn_activation()? { executor.set_fee_burn_config(fee_burn); }
+                        if let Some(admission)=bridge.admission_config(&admission_genesis)? {executor.set_admission_config(admission);}
                         if let Some((from_slot, genesis_stake_lamports)) = bridge.stake_activation()? {
                             executor.set_stake_config(crate::execution::StakeConfig { from_slot, epoch_slots: bridge.epoch_slots, genesis_stake_lamports, identities: identities.iter().map(|identity| identity.parse()).collect::<std::result::Result<Vec<_>, _>>()? });
                         }
@@ -803,6 +852,7 @@ impl Network {
                         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
                         if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); }
                         if let Some(fee_burn) = bridge.fee_burn_activation()? { executor.set_fee_burn_config(fee_burn); }
+                        if let Some(admission)=bridge.admission_config(&admission_genesis)? {executor.set_admission_config(admission);}
                         if let Some((from_slot, genesis_stake_lamports)) = bridge.stake_activation()? {
                             executor.set_stake_config(crate::execution::StakeConfig { from_slot, epoch_slots: bridge.epoch_slots, genesis_stake_lamports, identities: identities.iter().map(|identity| identity.parse()).collect::<std::result::Result<Vec<_>, _>>()? });
                         }
@@ -874,7 +924,18 @@ impl Network {
         gateway.write().await.kept = kept.clone();
         let mut proposer_schedules = ProposerSchedules::new(proposer_config)?;
         for (epoch, weights) in nodes[0].executor.as_ref().unwrap().stake_schedule_snapshots(&nodes[0].genesis)? { proposer_schedules.learn(epoch, weights)?; }
+        if let (Some(saved),Some(from))=(&saved,proposer_schedules.config.admission_from_slot) {
+            ensure!(saved.meta.cblock*4+3<from || !nodes[0].executor.as_ref().unwrap().admission_snapshots(&nodes[0].genesis)?.is_empty(),
+                "admissionFromSlot is behind saved state without an admission marker; configure a future boundary");
+        }
+        let catalog=nodes[0].executor.as_ref().unwrap().validator_catalog(&nodes[0].genesis)?;
+        for snapshot in nodes[0].executor.as_ref().unwrap().admission_snapshots(&nodes[0].genesis)? {proposer_schedules.learn_admission(snapshot,catalog.clone())?;}
         let proposers = Arc::new(std::sync::RwLock::new(proposer_schedules));
+        if let Some(server)=transport.external_server() {
+            let (sender,receiver)=mpsc::channel(256);
+            server.set_ingress(sender);
+            tokio::spawn(member_votes(receiver,transport.clone(),proposers.clone(),gateway.clone(),genesis.as_ref().and_then(|g|g.bridge.as_ref()).map(|rule|rule.chain_tag())));
+        }
         let kept_writer = kept.clone().map(crate::history::spawn_writer).transpose()?;
         let keep_from = resumed.map_or(0, |block| block.slot * 4 + 4);
         let built_in = senders
@@ -998,21 +1059,53 @@ impl Network {
             built_in,
         })
     }
+    fn voting_set(&self,cblock:u64)->Result<(Vec<String>,Vec<u64>)> {self.proposers.read().unwrap().voting_set(cblock)}
+    fn voter_key(&self,cblock:u64,index:usize)->Result<ed25519_dalek::VerifyingKey> {
+        let (identities,_)=self.voting_set(cblock)?;
+        let identity=identities.get(index).context("Vote index is outside the epoch's validator set")?;
+        let bytes:[u8;32]=bs58::decode(identity).into_vec()?.try_into().map_err(|_|anyhow::anyhow!("Invalid validator key"))?;
+        Ok(ed25519_dalek::VerifyingKey::from_bytes(&bytes)?)
+    }
+    fn sync_voting(&mut self,id:usize,cblock:u64)->Result<()> {
+        let schedules=self.proposers.read().unwrap();
+        if !schedules.config.admission_from_slot.is_some_and(|from|cblock*4>=from) {return Ok(())}
+        let (identities,stakes)=schedules.voting_set(cblock)?;
+        let own=identities.iter().position(|identity|identity==&self.identities[id]);
+        let from=(cblock*4/schedules.config.epoch_slots)*(schedules.config.epoch_slots/4);
+        if self.nodes[id].votor.stakes_at(from)!=stakes || self.nodes[id].votor.own_at(from)!=own {
+            self.nodes[id].votor.install_stakes(from,own,stakes)?;
+        }
+        Ok(())
+    }
+    fn validator_set_json(&self,epoch:u64)->Result<Value> {
+        let schedules=self.proposers.read().unwrap();
+        let (identities,stakes)=schedules.voting_set(epoch*(schedules.config.epoch_slots/4))?;
+        let frozen=schedules.admissions.get(&epoch);
+        let members=identities.iter().zip(stakes).map(|(identity,stake)| {
+            let entry=frozen.and_then(|set|set.members.iter().find(|member|member.identity.to_string()==*identity));
+            let hub=entry.map(|member|member.hub.clone()).or_else(||schedules.config.hubs.iter().find(|hub|hub.members.iter().any(|member|member.identity==*identity)).map(|hub|hub.code.clone())).unwrap();
+            json!({"identity":identity,"hub":hub,"stake":stake.to_string(),"validatorKind":if schedules.config.identities.contains(identity){"genesis"}else{"external"},"admittedAtEpoch":entry.map_or(0,|member|member.admitted_at_epoch)})
+        }).collect::<Vec<_>>();
+        Ok(json!({"epoch":epoch,"cutoffSlot":frozen.filter(|_|schedules.admission_active(epoch)).map(|set|set.cutoff_slot),"members":members,"catalog":schedules.catalog,"genesisIdentities":schedules.config.identities}))
+    }
     fn window(&self, number: u64) -> Result<schedule::Window> { self.proposers.read().unwrap().window(number) }
     fn proposer_ids(&self, number: u64) -> Result<Vec<usize>> { self.proposers.read().unwrap().ids(number) }
     fn schedule_ready(&self, number: u64) -> bool { self.proposers.read().unwrap().ready(number) }
     /// Cblock `i`'s outbox: every cblock carries the next epoch's validator set, so any one of an
     /// epoch certified on Solana hands its light client on, whichever slots were skipped.
-    fn outbox(&self, i: u64) -> Vec<crate::bridge::OutboxEntry> {
-        let epoch_slots = self.genesis.as_ref().and_then(|g| g.bridge.as_ref()).expect("bridge outbox requires bridge rule").epoch_slots;
-        let validators = self.identities.iter().zip(&self.stakes).map(|(identity, stake)| {
-            let key: [u8; 32] = bs58::decode(identity).into_vec().expect("identity is base58").try_into().expect("identity is 32 bytes");
-            (key, *stake)
-        }).collect();
-        vec![crate::bridge::OutboxEntry::ValidatorSet { epoch: i * 4 / epoch_slots + 1, validators }]
+    fn outbox(&self,id:usize,i:u64)->Result<Vec<crate::bridge::OutboxEntry>> {
+        let rule=self.genesis.as_ref().and_then(|g|g.bridge.as_ref()).expect("bridge outbox requires bridge rule");
+        let epoch=i*4/rule.epoch_slots+1;
+        let validators=if rule.admission_from_slot.is_some_and(|from|i*4>=from) {
+            let checkpoint=self.nodes[id].checkpoints.get(&i).context("Outbox checkpoint missing")?;
+            let Some(next)=self.nodes[id].executor.as_ref().unwrap().admission_snapshot(checkpoint,epoch)? else{return Ok(vec![])};
+            next.members.into_iter().map(|member|(member.identity.to_bytes(),member.stake)).collect()
+        } else {self.identities.iter().zip(&self.stakes).map(|(identity,stake)|{
+            let key:[u8;32]=bs58::decode(identity).into_vec().expect("identity base58").try_into().expect("identity bytes");(key,*stake)
+        }).collect()};
+        Ok(vec![crate::bridge::OutboxEntry::ValidatorSet{epoch,validators}])
     }
-    /// Validator 0, once cblock `c` is final: its hash preimage, outbox and the signed votes that
-    /// finalized it (Finalize, or Notar for a fast finalization), for Solana's light client.
+
     fn prepare_proof(&mut self, c: u64) -> Result<()> {
         let (preimage, outbox) = self.cblock_preimages.remove(&c).context("Finalized bridge cblock is missing its proof material")?;
         let block = self.nodes[0].executed_blocks.get(&c).copied().context("Finalized bridge cblock is missing its executed hash")?;
@@ -1026,10 +1119,11 @@ impl Network {
         let proof = json!({
             "consensusSlot": c, "epochSlots": epoch_slots, "chainId": self.genesis.as_ref().and_then(|g| g.bridge.as_ref()).expect("bridge proof requires bridge rule").chain_id, "hash": hex::encode(block.hash), "preimage": B64.encode(&preimage),
             "feeBurnFromSlot": self.genesis.as_ref().and_then(|g| g.bridge.as_ref()).and_then(|rule| rule.fee_burn_from_slot),
+            "admissionFromSlot":self.genesis.as_ref().and_then(|g|g.bridge.as_ref()).and_then(|rule|rule.admission_from_slot),
             "nativeMint": self.genesis.as_ref().and_then(|g| g.bridge.as_ref()).and_then(|rule| rule.native_mint).map(|mint| mint.to_string()),
             "outboxRoot": hex::encode(crate::bridge::outbox_root(&outbox)),
             "outbox": outbox.iter().map(|e| B64.encode(bincode::serialize(e).expect("outbox entry encodes"))).collect::<Vec<_>>(),
-            "validators": self.identities, "stakes": self.stakes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "validators":self.voting_set(c)?.0, "stakes":self.voting_set(c)?.1.iter().map(|stake|stake.to_string()).collect::<Vec<_>>(),
             "votes": votes,
         });
         let withdrawal = outbox.iter().any(|entry| matches!(entry, crate::bridge::OutboxEntry::Withdrawal { .. }));
@@ -1054,9 +1148,10 @@ impl Network {
         let after = [self.proof_prepared_through, first.checked_sub(1), self.nodes[id].votor.pruned_below().checked_sub(1)].into_iter().flatten().max();
         for c in self.bridge_ancestors(id, block.slot, after)? {
             let ancestor = self.nodes[id].executed_blocks[&c];
-            if bridge_proof_quorum(self.nodes[id].votes.values(), ancestor, &self.stakes) { continue }
+            if bridge_proof_quorum(self.nodes[id].votes.values(), ancestor, &self.voting_set(c)?.1) { continue }
             let hash = ancestor.hash;
-            let vote = consensus::Vote { validator: id, slot: c, hash: Some(hash), kind: consensus::VoteKind::Finalize };
+            let Some(validator)=self.voting_set(c)?.0.iter().position(|identity|identity==&self.identities[id]) else{continue};
+            let vote = consensus::Vote { validator, slot: c, hash: Some(hash), kind: consensus::VoteKind::Finalize };
             if !self.nodes[id].votes.contains_key(&encode(&vote)?) {
                 self.consensus_actions(id, vec![Action::SendVote(vote)], step)?;
             }
@@ -1073,7 +1168,7 @@ impl Network {
         let chain = self.bridge_ancestors(0, cblock, after)?;
         for c in &chain {
             let block = self.nodes[0].executed_blocks[c];
-            if !bridge_proof_quorum(self.nodes[0].votes.values(), block, &self.stakes) { return Ok(false) }
+            if !bridge_proof_quorum(self.nodes[0].votes.values(), block, &self.voting_set(*c)?.1) { return Ok(false) }
         }
         for c in chain { self.prepare_proof(c)?; }
         Ok(true)
@@ -1428,7 +1523,7 @@ impl Network {
                 })
             })
             .await??;
-            for to in message.to {
+            for to in message.to.into_iter().filter(|to|*to<12) {
                 let transport = self.transport.clone();
                 let bytes = bytes.clone();
                 self.io_handle.spawn(async move {
@@ -1699,6 +1794,7 @@ impl Network {
         gateway.follower_retained_block_bytes = bytes;
     }
     async fn tick(&mut self) -> Result<()> {
+        self.identities=self.proposers.read().unwrap().catalog.clone();
         let _phase = self.profile.measure(None, "protocol.tick");
         if self.facts.is_some() {
             self.update_facts().await;
@@ -2308,6 +2404,7 @@ impl Network {
         Ok(())
     }
     async fn receive(&mut self, packet: Received, e: Envelope) -> Result<()> {
+        self.identities=self.proposers.read().unwrap().catalog.clone();
         self.profile.record(
             Some(packet.to),
             "receive.actor_delay",
@@ -2320,7 +2417,7 @@ impl Network {
         match e.body {
             // A commitment witness shares the wire with votes; every existing validator already
             // computed it locally. It is consumed by external replay, never as consensus input.
-            Wire::Cblock(_) => {}
+            Wire::Cblock(_) | Wire::ValidatorEpoch {..} => {}
             Wire::Submit(tx) => {
                 // Judged by the slot it targets: every actor, not only node zero's, admits submissions.
                 if self.native_cutover_slot().is_some_and(|cut| tx.header.target_slot >= cut) && self.built_in.contains(&tx.header.fee_payer) { return Ok(()) }
@@ -2513,17 +2610,12 @@ impl Network {
                 if self.nodes[id].votes.contains_key(&encode(&signed.vote)?) {
                     return Ok(());
                 }
-                ensure!(signed.vote.validator == e.from, "Wrong vote sender");
-                let message = vote_message(&signed.vote, self.genesis.as_ref().and_then(|g| g.bridge.as_ref()))?;
-                let digest = crypto::hash(&[self.keys[e.from].verifying_key().as_bytes().as_slice(), &message, &signed.signature].concat());
-                if !verified_cached(digest) {
-                    crypto::verify_bytes(
-                        &self.keys[e.from].verifying_key(),
-                        &message,
-                        &signed.signature,
-                    )?;
-                    remember_verified(digest);
-                }
+                self.sync_voting(id,signed.vote.slot)?;
+                let key=self.voter_key(signed.vote.slot,signed.vote.validator)?;
+                ensure!(self.proposers.read().unwrap().catalog.get(e.from).is_some_and(|identity|bs58::encode(key.as_bytes()).into_string()==*identity),"Wrong vote sender");
+                let message=vote_message(&signed.vote,self.genesis.as_ref().and_then(|g|g.bridge.as_ref()))?;
+                let digest=crypto::hash(&[key.as_bytes().as_slice(),&message,&signed.signature].concat());
+                if !verified_cached(digest) {crypto::verify_bytes(&key,&message,&signed.signature)?;remember_verified(digest);}
                 self.nodes[id]
                     .votes
                     .insert(encode(&signed.vote)?, signed.clone());
@@ -2547,22 +2639,14 @@ impl Network {
                     certificate.votes.len() == proofs.len(),
                     "Certificate missing proofs"
                 );
-                for (v, p) in certificate.votes.iter().zip(&proofs) {
-                    ensure!(
-                        v == &p.vote && v.validator < 12,
-                        "Mismatched certificate vote"
-                    );
-                    let message = vote_message(v, self.genesis.as_ref().and_then(|g| g.bridge.as_ref()))?;
-                    let digest = crypto::hash(&[self.keys[v.validator].verifying_key().as_bytes().as_slice(), &message, &p.signature].concat());
-                    if !verified_cached(digest) {
-                        crypto::verify_bytes(
-                            &self.keys[v.validator].verifying_key(),
-                            &message,
-                            &p.signature,
-                        )?;
-                        remember_verified(digest);
-                    }
-                    self.nodes[id].votes.insert(encode(v)?, p.clone());
+                self.sync_voting(id,certificate.slot)?;
+                for (v,p) in certificate.votes.iter().zip(&proofs) {
+                    ensure!(v==&p.vote,"Mismatched certificate vote");
+                    let key=self.voter_key(v.slot,v.validator)?;
+                    let message=vote_message(v,self.genesis.as_ref().and_then(|g|g.bridge.as_ref()))?;
+                    let digest=crypto::hash(&[key.as_bytes().as_slice(),&message,&p.signature].concat());
+                    if !verified_cached(digest) {crypto::verify_bytes(&key,&message,&p.signature)?;remember_verified(digest);}
+                    self.nodes[id].votes.insert(encode(v)?,p.clone());
                 }
                 let at = self.consensus_time(id, certificate.slot);
                 step.events.push(Telemetry {
@@ -2572,8 +2656,8 @@ impl Network {
                     kind: "cblock.certificate",
                     data: view::certificate_json(
                         &certificate,
-                        &self.identities,
-                        &self.stakes,
+                        &self.voting_set(certificate.slot)?.0,
+                        &self.voting_set(certificate.slot)?.1,
                         at,
                         self.first_skipped_consensus_slot(id, certificate.slot),
                     ),
@@ -2672,7 +2756,7 @@ impl Network {
                     );
                     let origin = self.proposer_ids(att.slot / 16)?[att.proposer - 1];
                     crypto::verify_bytes(
-                        &self.keys[origin].verifying_key(),
+                        &catalog_key(&self.proposers.read().unwrap(),origin)?,
                         &encode(&Wire::Attest(att.clone()))?,
                         &signature,
                     )?;
@@ -3356,7 +3440,7 @@ impl Network {
                 let preimage = encode(&(i, parent, accepted, &state))?;
                 let mut witness_outbox_root = None;
                 let hash = if self.bridge_open(i * 4) {
-                    let mut outbox = self.outbox(i);
+                    let mut outbox = self.outbox(id,i)?;
                     outbox.extend(self.nodes[id].executor.as_ref().unwrap().withdrawals(i).into_iter().map(|(sequence, solana_mint, recipient, amount)| {
                         crate::bridge::OutboxEntry::Withdrawal { sequence, solana_mint, recipient, amount }
                     }));
@@ -3376,6 +3460,7 @@ impl Network {
                 } else {
                     crypto::hash(&preimage)
                 };
+                self.sync_voting(id,i)?;
                 let block = consensus::Block {
                     id: BlockRef { slot: i, hash },
                     parent,
@@ -3522,7 +3607,7 @@ impl Network {
                         anchor: "consensus",
                         at,
                         kind: "cblock.vote",
-                        data: view::vote_json(&vote, &self.identities, &self.stakes, at),
+                        data: view::vote_json(&vote, &self.voting_set(vote.slot)?.0, &self.voting_set(vote.slot)?.1, at),
                     });
                 }
                 Action::SendCertificate(c) => {
@@ -3556,8 +3641,8 @@ impl Network {
                         kind: "cblock.certificate",
                         data: view::certificate_json(
                             &c,
-                            &self.identities,
-                            &self.stakes,
+                            &self.voting_set(c.slot)?.0,
+                            &self.voting_set(c.slot)?.1,
                             at,
                             self.first_skipped_consensus_slot(id, c.slot),
                         ),
@@ -3568,6 +3653,13 @@ impl Network {
                         let snapshots = self.nodes[id].executor.as_ref().unwrap().stake_schedule_snapshots(checkpoint)?;
                         let mut schedules = self.proposers.write().unwrap();
                         for (epoch, weights) in snapshots { schedules.learn(epoch, weights)?; }
+                        let executor=self.nodes[id].executor.as_ref().unwrap();
+                        let catalog=executor.validator_catalog(checkpoint)?;
+                        for snapshot in executor.admission_snapshots(checkpoint)? {
+                            let publish=id==0 && (!schedules.admissions.contains_key(&snapshot.epoch)||catalog.len()>schedules.catalog.len());
+                            schedules.learn_admission(snapshot.clone(),catalog.clone())?;
+                            if publish {step.out.push(Outbox{from:id,to:(0..12).collect(),body:Wire::ValidatorEpoch{snapshot,catalog:catalog.clone()}});}
+                        }
                     }
                     self.sign_finalized_ancestors(id, block, step)?;
                     let at = self.consensus_time(id, block.slot);
@@ -3701,7 +3793,7 @@ impl Network {
                         "executor": executor,
                         "threshold": threshold,
                         "proposerConfig": self.proposers.read().unwrap().config,
-                        "consensusStakes": self.stakes,
+                        "consensusStakes":self.voting_set(finalized.slot)?.1,
                     }))
                 })();
                 let _ = reply.send(result.map_err(|e| e.to_string()));
@@ -3737,6 +3829,10 @@ impl Network {
             }
             GatewayCommand::Faucet { reply } => {
                 let _ = reply.send(self.faucet_available().map_err(|e| e.to_string()));
+            }
+            GatewayCommand::ValidatorSet {epoch,reply} => {
+                let epoch=epoch.unwrap_or_else(||self.latest_started()/self.proposers.read().unwrap().config.epoch_slots);
+                let result=self.validator_set_json(epoch).map_err(|error|error.to_string());let _=reply.send(result);
             }
             GatewayCommand::ProposerEpoch { epoch, reply } => {
                 let result = self.proposers.read().unwrap().epoch(epoch).map_err(|error| error.to_string());
@@ -4182,7 +4278,7 @@ impl Network {
             let n = &self.nodes[0];
             json!({"gatewaySlots":g.slots.len(),"gatewayTransactions":g.transactions.len(),"gatewayTransactionsByCblock":g.transactions_by_cblock.values().map(|v|v.len()).sum::<usize>(),"gatewayHistory":g.history.len(),"node0Slots":n.slots.len(),"node0Votes":n.votes.len(),"node0Windows":n.windows.len(),"node0ExecutedBlocks":n.executed_blocks.len(),"node0SeenCertificates":n.seen_certificates.len(),"node0Votor":n.votor.sizes(),"node0Checkpoints":n.checkpoints.len(),"node0Mempool":n.mempool.len()})
         };
-        let report = json!({"handoverTrace":handover_trace,"memory":memory,"proposerWithinWindowPacingUs":facts["slotPacingUs"],"proposerHandoverGapUs":facts["handoverUs"],"facts":facts,"slotPacingUs":stats(&self.samples),"withinWindowPacingUs":stats(&self.within_window_samples),"windowHandoverGapUs":stats(&self.handover_samples),"commitSpreadUs":stats(&self.exchange.spreads()),"omittedCommitments":self.exchange.omitted_commitments(),"finalizationUs":stats(&self.final_times),"finalizedCblocks":self.finalized.len(),"skippedCblocks":self.skipped.len(),"validatorLastExecuted":self.nodes.iter().map(|n|n.last_executed).collect::<Vec<_>>(),"validatorDebug":validator_debug,"validatorExecutedCblocks":self.nodes.iter().map(|n|n.executed_blocks.len()).collect::<Vec<_>>(),"validatorFinalizedConsensusSlot":self.nodes.iter().map(|n|n.votor.finalized().map(|block|block.slot)).collect::<Vec<_>>(),"generatedTransactions":self.traffic_seq,"maximumExecutionSkewSlots":maximum_skew,"maximumExecutionLagSlots":maximum_lag,"currentExecutionSkewSlots":current_skew,"comparedStateHashHeights":compared_heights,"mismatchingStateHashHeights":mismatching_heights,"onlineStateHashChecks":self.state_checks.lock().unwrap().checked,"allValidatorsStateHashHeights":all_validators_heights,"receivedPackets":self.received_packets,"observedAttestations":self.nodes.iter().map(|n|n.slots.values().map(|s|s.attest.len()).sum::<usize>()).collect::<Vec<_>>(),"observedShreds":self.nodes.iter().map(|n|n.slots.values().map(|s|s.shreds.values().map(|v|v.len()).sum::<usize>()).sum::<usize>()).collect::<Vec<_>>(),"stateHashes":self.nodes.iter().map(|n|n.executor.as_ref().unwrap().state_hash()).collect::<Vec<_>>(),"recentOwnVotes":self.nodes.iter().map(|n|n.votes.values().filter(|v|v.vote.validator==n.id&&n.windows.keys().next_back().map_or(true,|w|v.vote.slot+4>=w*4)).map(|v|v.vote.clone()).collect::<Vec<_>>()).collect::<Vec<_>>()});
+        let report = json!({"handoverTrace":handover_trace,"memory":memory,"proposerWithinWindowPacingUs":facts["slotPacingUs"],"proposerHandoverGapUs":facts["handoverUs"],"facts":facts,"slotPacingUs":stats(&self.samples),"withinWindowPacingUs":stats(&self.within_window_samples),"windowHandoverGapUs":stats(&self.handover_samples),"commitSpreadUs":stats(&self.exchange.spreads()),"omittedCommitments":self.exchange.omitted_commitments(),"finalizationUs":stats(&self.final_times),"finalizedCblocks":self.finalized.len(),"skippedCblocks":self.skipped.len(),"validatorLastExecuted":self.nodes.iter().map(|n|n.last_executed).collect::<Vec<_>>(),"validatorDebug":validator_debug,"validatorExecutedCblocks":self.nodes.iter().map(|n|n.executed_blocks.len()).collect::<Vec<_>>(),"validatorFinalizedConsensusSlot":self.nodes.iter().map(|n|n.votor.finalized().map(|block|block.slot)).collect::<Vec<_>>(),"generatedTransactions":self.traffic_seq,"maximumExecutionSkewSlots":maximum_skew,"maximumExecutionLagSlots":maximum_lag,"currentExecutionSkewSlots":current_skew,"comparedStateHashHeights":compared_heights,"mismatchingStateHashHeights":mismatching_heights,"onlineStateHashChecks":self.state_checks.lock().unwrap().checked,"allValidatorsStateHashHeights":all_validators_heights,"receivedPackets":self.received_packets,"observedAttestations":self.nodes.iter().map(|n|n.slots.values().map(|s|s.attest.len()).sum::<usize>()).collect::<Vec<_>>(),"observedShreds":self.nodes.iter().map(|n|n.slots.values().map(|s|s.shreds.values().map(|v|v.len()).sum::<usize>()).sum::<usize>()).collect::<Vec<_>>(),"stateHashes":self.nodes.iter().map(|n|n.executor.as_ref().unwrap().state_hash()).collect::<Vec<_>>(),"recentOwnVotes":self.nodes.iter().map(|n|n.votes.values().filter(|v|n.votor.own_at(v.vote.slot)==Some(v.vote.validator)&&n.windows.keys().next_back().map_or(true,|w|v.vote.slot+4>=w*4)).map(|v|v.vote.clone()).collect::<Vec<_>>()).collect::<Vec<_>>()});
         std::fs::write(
             Path::new(&self.config.store_path).join("last-run.json"),
             serde_json::to_vec_pretty(&report)?,
@@ -4228,20 +4324,60 @@ pub fn utc(ms: u64) -> String {
     )
 }
 
+fn catalog_key(schedules:&ProposerSchedules,id:usize)->Result<ed25519_dalek::VerifyingKey> {
+    let identity=schedules.catalog.get(id).context("Unknown wire identity")?;
+    let bytes:[u8;32]=bs58::decode(identity).into_vec()?.try_into().map_err(|_|anyhow::anyhow!("Invalid identity"))?;
+    Ok(ed25519_dalek::VerifyingKey::from_bytes(&bytes)?)
+}
+/// The public link's only consensus input is a signed vote from an effective frozen member.
+async fn member_votes(mut incoming:mpsc::Receiver<acrux_transport::external::ExternalIngress>,transport:Arc<LocalTransport>,
+    schedules:Arc<std::sync::RwLock<ProposerSchedules>>,gateway:crate::gateway::SharedGateway,chain_tag:Option<[u8;32]>) {
+    while let Some(input)=incoming.recv().await {
+        let started=gateway.read().await.current_window["number"].as_u64().unwrap_or(0)*4;
+        let checked=(||->Result<Envelope>{
+            use bincode::Options;
+            ensure!(input.envelope.len()<=2048,"Member vote frame too large");
+            let envelope:Envelope=bincode::DefaultOptions::new().with_fixint_encoding().with_limit(2048).reject_trailing_bytes().deserialize(&input.envelope)?;
+            let Wire::Vote(signed)=&envelope.body else {anyhow::bail!("Only member votes are accepted")};
+            ensure!(signed.vote.slot<=started+4 && signed.vote.slot.saturating_add(600)>=started,"Member vote outside the live window");
+            let schedules=schedules.read().unwrap();
+            let (identities,_)=schedules.voting_set(signed.vote.slot)?;
+            let identity=bs58::encode(input.identity).into_string();
+            ensure!(identities.get(signed.vote.validator)==Some(&identity) && schedules.catalog.get(envelope.from)==Some(&identity),"Identity is not a voter in this epoch");
+            let epoch=signed.vote.slot*4/schedules.config.epoch_slots;
+            let member=schedules.admissions.get(&epoch).and_then(|set|set.members.iter().find(|member|member.identity.to_bytes()==input.identity)).context("Observer is not admitted")?;
+            ensure!(member.hub==input.hub,"Member link names another hub");
+            let key=ed25519_dalek::VerifyingKey::from_bytes(&input.identity)?;
+            crypto::verify_bytes(&key,&encode(&envelope.body)?,&envelope.signature)?;
+            let mut message=vec![];
+            if let Some(tag)=chain_tag {message.extend_from_slice(&tag);}
+            message.extend_from_slice(&encode(&signed.vote)?);
+            crypto::verify_bytes(&key,&message,&signed.signature)?;
+            remember_verified(crypto::hash(&input.envelope));
+            remember_verified(crypto::hash(&[key.as_bytes().as_slice(),&message,&signed.signature].concat()));
+            Ok(envelope)
+        })();
+        match checked {
+            Ok(envelope)=>for to in 0..12 {if transport.inject_external(envelope.from,to,input.envelope.clone()).is_err(){input.reject("Member vote receive capacity exceeded");break}},
+            Err(_)=>input.reject("Unadmitted or invalid member vote"),
+        }
+    }
+}
+
 fn authenticate(
     packet: Received,
-    keys: &[ed25519_dalek::VerifyingKey],
+    _keys: &[ed25519_dalek::VerifyingKey],
     schedule: &std::sync::RwLock<ProposerSchedules>,
 ) -> Result<(Received, Envelope)> {
     let e: Envelope = decode(&packet.payload)?;
     let schedule = schedule.read().unwrap();
     ensure!(
-        e.from == packet.from && e.from < keys.len(),
+        e.from == packet.from && e.from < schedule.catalog.len(),
         "Wrong envelope signer"
     );
     let outer = crypto::hash(&packet.payload);
     if !verified_cached(outer) {
-        crypto::verify_bytes(&keys[e.from], &encode(&e.body)?, &e.signature)?;
+        crypto::verify_bytes(&catalog_key(&schedule,e.from)?, &encode(&e.body)?, &e.signature)?;
         remember_verified(outer);
     }
     match &e.body {
@@ -4264,7 +4400,7 @@ fn authenticate(
                     [shred.meta.proposer - 1];
                 let digest = crypto::hash(&encode(&(signer, shred))?);
                 if !verified_cached(digest) {
-                    crypto::verify_shred(shred, &keys[signer])?;
+                    crypto::verify_shred(shred, &catalog_key(&schedule,signer)?)?;
                     remember_verified(digest);
                 }
             }
@@ -4279,7 +4415,7 @@ fn authenticate(
             );
             let origin = schedule.ids(first.0.slot / 16)?[first.0.proposer - 1];
             for (commitment, signature) in [first, second] {
-                crypto::verify_bytes(&keys[origin], &encode(&Wire::Commit(commitment.clone()))?, signature)?;
+                crypto::verify_bytes(&catalog_key(&schedule,origin)?, &encode(&Wire::Commit(commitment.clone()))?, signature)?;
             }
         }
         _ => {}
@@ -4291,7 +4427,7 @@ fn authenticate(
                 "Invalid handover attestation"
             );
             let q = schedule.ids(a.slot / 16)?[a.proposer - 1];
-            crypto::verify_bytes(&keys[q], &encode(&Wire::Attest(a.clone()))?, sig)?;
+            crypto::verify_bytes(&catalog_key(&schedule,q)?, &encode(&Wire::Attest(a.clone()))?, sig)?;
         }
     }
     Ok((packet, e))
@@ -4512,6 +4648,17 @@ impl Network {
                 json!(out)
             }
             "getVoteAccounts" => {
+                if self.proposers.read().unwrap().config.admission_from_slot.is_some_and(|from|slot>=from) {
+                    let epoch=slot/self.proposers.read().unwrap().config.epoch_slots;
+                    let members=self.voting_set(slot/4)?.0;
+                    let current=executor.validator_stake_weights(epoch)?.into_iter().filter_map(|(identity,stake)| {
+                        let vote=crate::execution::validator_vote_address(&identity);
+                        let account=executor.account(&vote.to_string()).ok().flatten()?;
+                        let state=solana_sdk::vote::state::VoteState::deserialize(&account.data).ok()?;
+                        Some(json!({"nodePubkey":identity.to_string(),"votePubkey":vote.to_string(),"activatedStake":stake,"epochVoteAccount":members.contains(&identity.to_string()),"commission":state.commission,"lastVote":state.votes.back().map_or(0,|vote|vote.slot()),"rootSlot":state.root_slot.unwrap_or(0)}))
+                    }).collect::<Vec<_>>();
+                    return Ok(json!({"current":current,"delinquent":[]}));
+                }
                 let schedules = self.proposers.read().unwrap();
                 let active = schedules.config.stake_from_slot.is_some_and(|from| slot >= from);
                 let weights = if active { executor.stake_weights(slot / schedules.config.epoch_slots)? } else { self.stakes.clone() };

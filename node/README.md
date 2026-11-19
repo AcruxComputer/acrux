@@ -385,7 +385,8 @@ acrux node propose --hub FRA --identity validator.json --genesis chain/genesis/a
 `--identity` is a Solana keypair JSON file. `--net` defaults to
 `https://rpc.acrux.computer`. The genesis, placement manifest and bridge rule
 must match the net, just as for `node follow`. A new identity is an observer;
-this step does not admit it to the registry, vote, submit transactions or propose.
+it sends only link frames until a finalized epoch snapshot admits it. Admitted
+identities vote as described below; block production remains the next step.
 
 The command bootstraps from the gateway's finalized `getExecutionSnapshot` and
 `getHubPeers {hub}`. The latter returns `{hub,address,certificate,peers}`: the
@@ -426,14 +427,20 @@ private. Host firewall instructions are in
 [deploy/host/README.md](../deploy/host/README.md).
 
 There are at most 32 authenticated external identities, one connection per
-identity. TLS and the challenge must finish within five seconds. Control frames
-are limited to 128 bytes and ten pings per second; observers can open no protocol
-input streams. Recent history is bounded at 64 MiB or 8,192 frames, with each
-observer's outgoing queue bounded at 2 MiB or 128 frames and a two-second write
-deadline. The replay process also caps pending block material at 64 MiB. A slow
-observer is disconnected rather than making a validator wait for it. Recent
-signed-message history bridges the snapshot-to-subscription race. A lost link
-or expired history ends the command with an error; rerun it for a fresh snapshot.
+identity. TLS and the challenge must finish within five seconds. Authentication
+and ping frames stay within 128 bytes, with at most ten pings per second. An
+admitted identity can submit only a signed vote envelope, at most 2,048 bytes
+and 32 votes per second; the boundary checks its identity, hub, epoch membership,
+compact voter index, live slot range and both signatures. Other input is refused
+and closes that exact connection, with the existing rate-limited warning.
+
+Every link pulls the same history from its own cursor, woken by `published`.
+History is bounded at 64 MiB and 262,144 frames. There is no per-peer packet queue.
+Validator-set announcements and member votes use that same history path. A peer
+that falls behind held history is closed. The replay process caps pending block
+material at 64 MiB. A lost link or expired history ends the command with an error;
+rerunning loads a fresh snapshot. `propose-observer-check.mjs --far` retains the
+operator's 145 ms each-way RPC and QUIC proxy check.
 
 After a release build and the `propose-peer-probe` example build, run
 `node node/scripts/propose-observer-check.mjs` from `backend/`. It owns only
@@ -441,6 +448,119 @@ loopback ports 5041?5043, validator QUIC 5062?5073 and external QUIC 5074. It
 checks at least 1,000 matching finalized slots, actual link RTT, rejection of a
 bad challenge signature and disconnection of a non-reading peer while finality
 keeps advancing. Its child processes and unique temporary store are cleaned.
+
+## Admission at the bridge epoch boundary
+
+`admissionFromSlot` is optional in the bridge rule. Without it, the 0.4.23
+validator set, certificate weights, execution hashes and two-epoch stake draw
+remain unchanged. Configure it as a bridge-epoch boundary at or after
+`stakeFromSlot`; `epochSlots` must be divisible by 32. There is no default or
+production activation slot in this release. When adding the rule to a running
+chain, choose a future boundary; startup refuses a past activation missing its
+committed marker. Distribute the same rule to every
+validator and RPC/QUIC follower before activation.
+
+Let A be its epoch. A keeps the legacy twelve-voter weights of 100,000,000 each
+and the already frozen proposer draw, since Solana can already hold that set.
+The first unified set is A+1. From A onward the cut-off is the start of the
+middle proposer window, `e * epochSlots + epochSlots / 2`. Registry membership
+(projected to e+1), delegated stake and the configured genesis weight are frozen
+once from the state before that slot's transactions, for epoch e+1. If the slot
+was skipped, the first later execution captures its inherited state before its
+new transactions. A transaction at or after the cut-off waits another epoch.
+The containing cblock must finalize before the snapshot is learned. Rollback
+restores the hashed marker and derives the identical snapshot again.
+
+That one snapshot supplies the epoch's `cap_stakes` / `build_schedule` draw,
+certificate stake, compact vote indices and next-set bridge leaf. It replaces
+the previous e+2 draw lead from A+1; no second stake snapshot is taken. Registry
+joins, moves and leaves are interpreted at their effective epoch. A delegated
+stake counts when `activation_epoch < e` and `deactivation_epoch >= e` for target
+e. Outsiders need positive delegated stake; each genesis identity also keeps
+`genesisStakeLamports`. New hub n_min/rho rules are not applied. Drawing three
+co-proposers requires three eligible identities in a hub; smaller hubs can have
+admitted voters but receive no windows in this step.
+
+The live bridge uses u32 vote bitmaps, so each snapshot admits at most 32 voters.
+Eligible identities are selected by descending stake, then public-key bytes for
+ties; excess identities remain waiting, with no fabricated stake or chain halt.
+The final compact list follows the stable validator catalog. Catalog IDs never
+change or get reused when an identity leaves; these wire IDs are distinct from
+an epoch's compact voter indices.
+
+An effective registry membership installs a rent-exempt Vote account even with
+zero delegated stake. `validator_vote_address(identity)` keeps the existing
+`["acrux_genesis_vote", identity]` seed and address; its neutral name works for
+both genesis and outside identities. New identity/catalog/Vote-account rent
+joins the native reserve. Vote roots and last-vote fields remain current as the
+genesis refresh does, so stock `solana delegate-stake` accepts them. An outside
+identity's first-time order is therefore: join, wait for effective membership
+and its Vote account, delegate with stock tools, then wait for the admission
+boundary after an eligible cut-off. Existing Vote PDAs and Stake accounts need
+no migration.
+
+```text
+acrux hub join FRA --rpc https://rpc.acrux.computer --identity validator.json
+solana --url https://rpc.acrux.computer --keypair wallet.json create-stake-account stake.json 2
+solana --url https://rpc.acrux.computer --keypair wallet.json delegate-stake stake.json VOTE_ACCOUNT
+acrux node propose --hub FRA --identity validator.json --genesis chain/genesis/acrux-net.json
+```
+
+Read the Vote address from `getVoteAccounts` or derive the PDA above.
+`getVoteAccounts.current` includes installed Vote accounts and live delegation
+weights, including those waiting for admission. `getValidatorSet {epoch?}`
+returns the frozen set: `{epoch,cutoffSlot,members,catalog,genesisIdentities}`;
+each member has identity, hub, decimal-string stake, `validatorKind` and
+`admittedAtEpoch`. Omit epoch for the current set. `/hubs` uses this frozen set
+for actual proposer weights and admission metadata.
+
+Before its epoch starts the snapshot is announced as `Wire::ValidatorEpoch`
+through the shared history; replay verifies it against finalized hashed state.
+The voter installs the next set when replay finalizes its mid-epoch cut-off.
+Wire votes, certificates and block material for an unknown set wait within the
+observer's existing memory bounds, then undergo signature checks and counting
+after installation. The bootstrap epoch keeps its identical inherited set.
+`node propose` prints `epoch E observer ...` or `epoch E member ... voting index
+N`, and each signed Notar/Finalize vote. It speculatively re-executes a witness
+before voting, checks its state/outbox and safe parent, then signs with its own
+identity. Finalized slots still print the same matching lines as `node follow`.
+It writes exact signed vote envelopes durably before sending, in
+`<identity-file>.acrux-votes.redb`. Keep that file with the identity across
+restarts; its chain-scoped finalized anchor cannot regress, old finalized votes
+are pruned, and conflicting initial/final votes cannot be signed on restart.
+After a move, stop the old command and rerun it with the new `--hub`; the old
+hub connection becomes an observer at the boundary. No proposal, shred or
+attestation from an outside peer is accepted yet. A drawn
+outside proposer is silent until the next build step; other proposers can agree
+without its block or the window may skip. Its stake is still counted honestly.
+
+A missing outside voter contributes no stake. As outside stake approaches 20%,
+80% fast finalization increasingly needs its participation; slow/fallback paths
+can take longer or miss window deadlines. Without 60% participating stake,
+certificates cannot form. This release does not hide offline stake or cap it to
+keep genesis votes sufficient.
+
+For a Solana registry identity, carry its effective membership with the same key:
+
+```text
+acrux hub carry FRA --rpc https://rpc.acrux.computer --solana-rpc SOLANA_RPC_URL --identity validator.json
+```
+
+The helper reads canonical finalized membership, Clock and hub accounts from
+one Solana bank, checks owner, discriminator, identity, PDA/bump, hub id and the
+requested code, then submits the existing Acrux `join_hub` signed by that same
+identity. The corresponding hub must already exist on Acrux. This grants no
+privileged membership: Acrux already permits any identity to sign its own join.
+It cannot forge another identity's signature or silently carry a different hub.
+No `hub_registry` upgrade or new placement is needed.
+
+The two Rust admission checks cover the cut-off (including later joins, stake
+changes, moves/leaves) and identical rollback/reload hashes. The stand check is
+`chain/scripts/native-admission-check.mjs`; it requires the operator's fresh
+local validator and existing native bridge bytecode at 4990. Its header lists
+all explicit local rule values. It starts only loopback net/observer processes,
+then proves a pre-boundary Solana hand-off, an outside Finalize signature counted
+on Solana, and removal after leave. No validator is started or stopped by it.
 
 ## Measured
 

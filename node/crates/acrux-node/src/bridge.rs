@@ -77,7 +77,7 @@ impl ProofArchive {
                     let proof: Value = serde_json::from_slice(proof.value())?;
                     anyhow::ensure!(proof["epochSlots"].as_u64() == Some(epoch_slots), "saved bridge proofs use a different epochSlots");
                     if finalized_through.is_some_and(|cblock| slot.value() <= cblock) {
-                        archive.epochs.entry(slot.value() * 4 / epoch_slots).or_insert(slot.value());
+                        if handoff_proof(&proof)? {archive.epochs.entry(slot.value()*4/epoch_slots).or_insert(slot.value());}
                         archive.withdrawals.insert(slot.value(), withdrawal_sequences(&proof)?);
                         if fee_burn_epoch_end(&proof)? { archive.fee_burn_cblocks.insert(slot.value()); }
                     } else {
@@ -108,7 +108,8 @@ impl ProofArchive {
     /// durable before their checkpoint, irrespective of the shedding level.
     pub fn keep(&mut self, slot: u64, epoch: u64, withdrawal: bool, proof: &Value) -> Result<bool> {
         let fee_burn_end = fee_burn_epoch_end(proof)?;
-        if !withdrawal && !fee_burn_end && self.epochs.contains_key(&epoch) {
+        let representative=handoff_proof(proof)? && !self.epochs.contains_key(&epoch);
+        if !withdrawal && !fee_burn_end && !representative {
             return Ok(false);
         }
         let sequences = withdrawal_sequences(proof)?;
@@ -120,7 +121,7 @@ impl ProofArchive {
         w.commit()?;
         self.withdrawals.insert(slot, sequences);
         if fee_burn_end { self.fee_burn_cblocks.insert(slot); }
-        self.epochs.entry(epoch).or_insert(slot);
+        if representative {self.epochs.insert(epoch,slot);}
         self.check_capacity();
         Ok(true)
     }
@@ -179,6 +180,18 @@ fn fee_burn_epoch_end(proof: &Value) -> Result<bool> {
     anyhow::ensure!(epoch_slots > 0 && epoch_slots % 4 == 0, "invalid fee-burn proof epoch length");
     let first_slot = slot.checked_mul(4).context("fee-burn proof slot overflow")?;
     Ok(first_slot >= from_slot && first_slot.checked_add(4).context("fee-burn proof end overflow")? % epoch_slots == 0)
+}
+
+/// Admission's pre-cut-off proofs deliberately carry no next set; they cannot hand an epoch on.
+pub fn handoff_proof(proof:&Value)->Result<bool> {
+    let active=proof["admissionFromSlot"].as_u64().is_some_and(|from|proof["consensusSlot"].as_u64().unwrap_or(0)*4>=from);
+    // Before admission every cblock carried the fixed next set, including historical archives.
+    if !active {return Ok(true)}
+    for entry in proof["outbox"].as_array().context("bridge proof outbox")? {
+        let entry:OutboxEntry=bincode::deserialize(&B64.decode(entry.as_str().context("outbox entry")?)?)?;
+        if matches!(entry,OutboxEntry::ValidatorSet{..}) {return Ok(true)}
+    }
+    Ok(false)
 }
 
 fn withdrawal_sequences(proof: &Value) -> Result<Vec<u64>> {

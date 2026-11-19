@@ -126,6 +126,9 @@ pub struct BridgeConfig {
     /// Native burned base fees are committed to Solana from this bridge epoch boundary.
     #[serde(default)]
     pub fee_burn_from_slot: Option<u64>,
+    /// Begin hashed admission snapshots at this bridge epoch; the first new set is the next epoch.
+    #[serde(default)]
+    pub admission_from_slot: Option<u64>,
 }
 impl BridgeConfig {
     pub fn chain_tag(&self) -> [u8; 32] { crate::crypto::hash(self.chain_id.as_bytes()) }
@@ -154,6 +157,19 @@ impl BridgeConfig {
             }
             _ => anyhow::bail!("bridge stakeFromSlot and genesisStakeLamports must be configured together"),
         }
+    }
+    pub fn admission_activation(&self) -> Result<Option<u64>> {
+        let Some(from) = self.admission_from_slot else { return Ok(None) };
+        let (stake_from,_) = self.stake_activation()?.context("admissionFromSlot requires stakeFromSlot")?;
+        ensure!(from >= stake_from && from % self.epoch_slots == 0,"admissionFromSlot must be a bridge epoch boundary at or after stakeFromSlot");
+        ensure!(self.epoch_slots % 32 == 0,"admission requires epochSlots divisible by 32 so the mid-epoch cut-off is a window boundary");
+        Ok(Some(from))
+    }
+    pub fn admission_config(&self, genesis: &[(Pubkey,String)]) -> Result<Option<crate::execution::AdmissionConfig>> {
+        Ok(self.admission_activation()?.map(|from_slot|crate::execution::AdmissionConfig {
+            from_slot,epoch_slots:self.epoch_slots,registry_program:Pubkey::from_str("ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm").unwrap(),
+            genesis:genesis.to_vec(),genesis_stake_lamports:self.genesis_stake_lamports.unwrap(),
+        }))
     }
     pub fn fee_burn_activation(&self) -> Result<Option<crate::execution::FeeBurnConfig>> {
         let Some(slot) = self.fee_burn_from_slot else { return Ok(None) };
@@ -210,6 +226,7 @@ fn bridge(chain: &Path) -> Result<Option<BridgeConfig>> {
     config.native_cutover()?;
     config.stake_activation()?;
     config.fee_burn_activation()?;
+    config.admission_activation()?;
     Ok(Some(config))
 }
 

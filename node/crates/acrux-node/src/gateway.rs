@@ -52,6 +52,7 @@ pub enum GatewayCommand {
         epoch: u64,
         reply: CommandReply,
     },
+    ValidatorSet { epoch:Option<u64>,reply:CommandReply },
     Balance {
         address: String,
         reply: CommandReply,
@@ -120,6 +121,7 @@ pub struct GatewayState {
     pub bridge_program: Option<String>,
     pub bridge_epoch_slots: Option<u64>,
     pub fee_burn_from_slot: Option<u64>,
+    pub admission_from_slot: Option<u64>,
     pub fee_burns: Option<crate::fee_burns::FeeBurnStore>,
     /// Volatile acknowledgement of the relayer's durable Postgres save cursor.
     pub bridge_saved_cursor: Option<u64>,
@@ -160,7 +162,7 @@ impl GatewayState {
             epoch_cblock_proofs: BTreeMap::new(),
             bridge_program: None,
             bridge_epoch_slots: None,
-            fee_burn_from_slot: None,
+            fee_burn_from_slot: None, admission_from_slot: None,
             fee_burns: None,
             bridge_saved_cursor: None,
             counters: json!({"slots":0,"finalizedCblocks":0,"skips":0,"averageCommitSpreadUs":0}),
@@ -349,10 +351,14 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
     if !allowed {
         return (StatusCode::TOO_MANY_REQUESTS, rpc_error(id, -32005, "RATE_LIMITED", "Too many requests from this address; slow down.")).into_response();
     }
+    // A call that leaves `params` out is Solana's form for the methods both sides name: web3.js and
+    // wallets send `getSlot` and `getLatestBlockhash` that way. Acrux-only methods default to `{}`.
+    let omitted = request.get("params").is_none();
     let params = request.get("params").cloned().unwrap_or(json!({}));
     // Solana's methods take array params; Acrux's take an object. Solana-only methods may omit them.
     let solana_only = matches!(method, "getHealth" | "getVersion" | "getGenesisHash" | "getFeeForMessage" | "simulateTransaction" | "getRecentPrioritizationFees" | "getBlockTime" | "getTokenAccountsByOwner" | "getTokenAccountBalance" | "getTokenSupply" | "getSupply" | "getBlockHeight" | "getEpochInfo" | "getAccountInfo" | "getMultipleAccounts" | "getProgramAccounts" | "getMinimumBalanceForRentExemption" | "getSignaturesForAddress" | "getVoteAccounts" | "sendTransaction" | "getSignatureStatuses" | "getRecentPerformanceSamples");
-    if params.is_array() || (solana_only && !params.is_object()) || (solana_only && params.as_object().is_some_and(|o| o.is_empty())) {
+    let dual = matches!(method, "getSlot" | "getLatestBlockhash" | "getBalance" | "getTransaction");
+    if params.is_array() || (omitted && dual) || (solana_only && !params.is_object()) || (solana_only && params.as_object().is_some_and(|o| o.is_empty())) {
         let params = if params.is_array() { params } else { json!([]) };
         // ACRUX_LOG_RPC=1: one line per Solana call, its method and encoding, to see what a wallet asks.
         if std::env::var("ACRUX_LOG_RPC").is_ok_and(|v| v == "1") {
@@ -386,6 +392,11 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
         },
         "getCurrentWindow" => Ok(state.read().await.current_window.clone()),
         "getCounters" => Ok(state.read().await.counters.clone()),
+        "getValidatorSet" => {
+            if params.as_object().is_none_or(|params|params.keys().any(|key|key!="epoch")) || params.get("epoch").is_some_and(|value|safe_integer(value).is_none()) {
+                Err(("INVALID_INPUT","Give an optional nonnegative epoch."))
+            } else {command(&state,|reply|GatewayCommand::ValidatorSet{epoch:params.get("epoch").and_then(safe_integer),reply}).await.map_err(|_|("NET_UNAVAILABLE","This epoch's validator snapshot is not finalized yet."))}
+        },
         "getProposerEpoch" => {
             match params.get("epoch").and_then(safe_integer) {
                 Some(epoch) => match command(&state, |reply| GatewayCommand::ProposerEpoch { epoch, reply }).await {
@@ -421,7 +432,7 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
                     Ok(state.epoch_cblock_proofs.get(&epoch).copied().or_else(|| {
                         state.cblock_proofs.iter().find_map(|(slot, proof)| {
                             let length = proof["epochSlots"].as_u64().filter(|length| *length > 0)?;
-                            (slot * 4 / length == epoch).then_some(*slot)
+                            (slot*4/length==epoch && crate::bridge::handoff_proof(proof).unwrap_or(false)).then_some(*slot)
                         })
                     }))
                 } else if let Some(epoch) = fee_burn_epoch {
