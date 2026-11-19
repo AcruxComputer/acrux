@@ -1,5 +1,5 @@
 //! Authenticated mirrors of a hub's existing QUIC envelopes.
-//! Admitted members may also submit signed consensus votes through bounded ingress.
+//! Admitted members submit signed votes and targeted proposer messages through bounded ingress.
 use anyhow::{bail, ensure, Context, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig};
@@ -18,6 +18,11 @@ const WRITE_DEADLINE: Duration = Duration::from_secs(2);
 const CONTROL_LIMIT: usize = 128;
 const MAX_PACKET_BYTES: usize = 1024 * 1024;
 const MAX_MEMBER_ENVELOPE_BYTES: usize = 2048;
+const MAX_ROUTED_RECIPIENTS: usize = 32;
+const MAX_ROUTED_FRAME_BYTES: usize = MAX_PACKET_BYTES + 2 + 4 * MAX_ROUTED_RECIPIENTS;
+// Rotor sends 64 shreds for 32 data shreds, in groups to the twelve relays, for 20 slots/s.
+const MAX_ROUTED_FRAMES_PER_SECOND: usize = 8192;
+const MAX_ROUTED_BYTES_PER_SECOND: usize = 64 * 1024 * 1024;
 const HISTORY_BYTES: usize = 64 * 1024 * 1024;
 // Bytes bound the history; the packet count only caps the map's overhead. A live net's three hubs
 // fill 8,192 packets in seconds, less than a far observer's snapshot download.
@@ -39,6 +44,8 @@ pub struct ExternalIngress {
     pub identity: [u8; 32],
     pub hub: String,
     pub envelope: Vec<u8>,
+    pub recipients: Option<Vec<usize>>,
+    pub received_at: Instant,
     connection: Connection,
 }
 impl ExternalIngress {
@@ -60,6 +67,7 @@ pub enum ClientFrame {
     Authenticate(Authentication),
     Ping { peer: usize, nonce: u64 },
     Envelope(Vec<u8>),
+    Routed { recipients: Vec<usize>, envelope: Vec<u8> },
 }
 #[derive(Clone, Debug)]
 pub enum ServerFrame {
@@ -132,6 +140,15 @@ pub async fn write_client_frame(stream: &mut SendStream, message: &ClientFrame) 
             ensure!(!envelope.is_empty() && envelope.len() <= MAX_MEMBER_ENVELOPE_BYTES, "member envelope exceeds its limit");
             [vec![2], envelope.clone()].concat()
         }
+        ClientFrame::Routed {recipients,envelope} => {
+            ensure!(!recipients.is_empty() && recipients.len() <= MAX_ROUTED_RECIPIENTS
+                && recipients.iter().collect::<BTreeSet<_>>().len() == recipients.len(), "invalid member recipients");
+            ensure!(!envelope.is_empty() && envelope.len() <= MAX_PACKET_BYTES, "member routed envelope exceeds its limit");
+            let mut body = vec![3,recipients.len() as u8];
+            for recipient in recipients { body.extend_from_slice(&u32::try_from(*recipient)?.to_le_bytes()); }
+            body.extend_from_slice(envelope);
+            body
+        }
     };
     write_bytes(stream, &frame(&body)).await
 }
@@ -139,10 +156,10 @@ async fn read_client_frame(stream: &mut RecvStream) -> Result<ClientFrame> {
     let mut length = [0; 4];
     stream.read_exact(&mut length).await?;
     let length = u32::from_le_bytes(length) as usize;
-    ensure!(length > 0 && length <= MAX_MEMBER_ENVELOPE_BYTES + 1, "member frame exceeds its limit");
+    ensure!(length > 0 && length <= MAX_ROUTED_FRAME_BYTES, "member frame exceeds its limit");
     let mut tag = [0];
     stream.read_exact(&mut tag).await?;
-    ensure!(tag[0] == 2 || length <= CONTROL_LIMIT, "observer control frame exceeds its limit");
+    ensure!(match tag[0] {2 => length <= MAX_MEMBER_ENVELOPE_BYTES + 1,3 => true,_ => length <= CONTROL_LIMIT}, "observer control frame exceeds its limit");
     let mut body = vec![0; length];
     body[0] = tag[0];
     stream.read_exact(&mut body[1..]).await?;
@@ -164,6 +181,15 @@ async fn read_client_frame(stream: &mut RecvStream) -> Result<ClientFrame> {
             nonce: u64::from_le_bytes(body[5..13].try_into().unwrap()),
         }),
         2 if body.len() > 1 => Ok(ClientFrame::Envelope(body[1..].to_vec())),
+        3 if body.len() > 2 => {
+            let count = body[1] as usize;
+            ensure!(count > 0 && count <= MAX_ROUTED_RECIPIENTS, "invalid member recipient count");
+            let offset = 2 + count * 4;
+            ensure!(body.len() > offset && body.len() - offset <= MAX_PACKET_BYTES, "invalid member routed envelope size");
+            let recipients = body[2..offset].chunks_exact(4).map(|bytes|u32::from_le_bytes(bytes.try_into().unwrap()) as usize).collect::<Vec<_>>();
+            ensure!(recipients.iter().collect::<BTreeSet<_>>().len() == count, "duplicate member recipients");
+            Ok(ClientFrame::Routed {recipients,envelope:body[offset..].to_vec()})
+        },
         _ => bail!("observer input must be an identity proof, ping or signed member envelope"),
     }
 }
@@ -227,8 +253,15 @@ impl Identities {
 struct Observer {
     connection: Connection,
 }
+#[derive(Clone, Copy)]
+enum Audience { Hub(usize), Identity([u8;32]) }
+impl Audience {
+    fn includes(self, hub: usize, identity: &[u8;32]) -> bool {
+        match self { Self::Hub(expected) => expected == hub, Self::Identity(expected) => &expected == identity }
+    }
+}
 struct HistoryPacket {
-    hub: usize,
+    audience: Audience,
     slot: u64,
     bytes: Arc<Vec<u8>>,
 }
@@ -240,6 +273,9 @@ struct State {
     next_sequence: u64,
     oldest_slot: Vec<u64>,
     evicted_sequence: Vec<Option<u64>>,
+    catalog: BTreeMap<usize,[u8;32]>,
+    /// (oldest available slot, last evicted sequence) for private identity traffic.
+    targeted_evicted: BTreeMap<[u8;32],(u64,u64)>,
 }
 pub struct ExternalServer {
     endpoint: Endpoint,
@@ -276,8 +312,8 @@ impl ExternalServer {
         transport.max_concurrent_bidi_streams(1_u32.into());
         transport.max_concurrent_uni_streams(0_u32.into());
         transport.datagram_receive_buffer_size(None);
-        transport.stream_receive_window(1024_u32.into());
-        transport.receive_window(4096_u32.into());
+        transport.stream_receive_window((2_u32 * 1024 * 1024).into());
+        transport.receive_window((4_u32 * 1024 * 1024).into());
         transport.send_window(4 * 1024 * 1024);
         transport.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
         transport.keep_alive_interval(Some(Duration::from_secs(5)));
@@ -286,7 +322,7 @@ impl ExternalServer {
         let count = hubs.len();
         let server = Arc::new(Self {
             endpoint, certificate: certificate_bytes, hubs, representatives,
-            state: Mutex::new(State { identities, observers: BTreeMap::new(), history: BTreeMap::new(), history_bytes: 0, next_sequence: 0, oldest_slot: vec![0; count], evicted_sequence: vec![None; count] }),
+            state: Mutex::new(State { identities, observers: BTreeMap::new(), history: BTreeMap::new(), history_bytes: 0, next_sequence: 0, oldest_slot: vec![0; count], evicted_sequence: vec![None; count], catalog:BTreeMap::new(),targeted_evicted:BTreeMap::new() }),
             published: Notify::new(), pending: Arc::new(Semaphore::new(cap)), accept_task: Mutex::new(None), ingress: Mutex::new(None),
         });
         let endpoint = server.endpoint.clone();
@@ -307,30 +343,65 @@ impl ExternalServer {
         }));
         Ok(server)
     }
-    /// The node verifies membership and signed Wire::Vote contents at this bounded boundary.
+    /// The node verifies membership, signatures, proposer roles and recipients at this boundary.
     pub fn set_ingress(&self, ingress: tokio::sync::mpsc::Sender<ExternalIngress>) {
         *self.ingress.lock().unwrap() = Some(ingress);
     }
     pub fn cert_der(&self) -> Vec<u8> { self.certificate.clone() }
     pub fn local_addr(&self) -> Result<SocketAddr> { Ok(self.endpoint.local_addr()?) }
-    pub fn observes(&self, to: usize) -> bool { self.representatives.contains_key(&to) }
+    /// Catalog IDs never change identity. Only hashed finalized membership learns this mapping.
+    pub fn set_catalog(&self, catalog: Vec<(usize,[u8;32])>) -> Result<()> {
+        let count = catalog.len();
+        ensure!(catalog.iter().all(|(id,_)|u32::try_from(*id).is_ok())
+            && catalog.iter().map(|(_,identity)|identity).collect::<BTreeSet<_>>().len() == count, "invalid external validator catalog");
+        let catalog = catalog.into_iter().collect::<BTreeMap<_,_>>();
+        ensure!(catalog.len() == count, "duplicate external catalog IDs");
+        let mut state = self.state.lock().unwrap();
+        ensure!(state.catalog.iter().all(|(id,identity)|catalog.get(id) == Some(identity)), "external validator catalog changed existing IDs");
+        state.catalog = catalog;
+        Ok(())
+    }
+    pub fn observes(&self, to: usize) -> bool {
+        self.representatives.contains_key(&to) || (!self.hubs.iter().any(|(_,peers)|peers.contains(&to)) && self.state.lock().unwrap().catalog.contains_key(&to))
+    }
     pub fn active_connections(&self) -> usize { self.state.lock().unwrap().observers.len() }
+    /// The host may discover an invalid codeword only after enough authenticated shreds arrive.
+    pub fn reject_identity(&self, identity: &[u8;32], reason: &str) {
+        let connection = self.state.lock().unwrap().observers.get(identity).map(|observer|observer.connection.clone());
+        if let Some(connection) = connection {
+            refused(reason,&"invalid member material");
+            connection.close(3_u32.into(),reason.as_bytes());
+        }
+    }
 
     /// A bounded memory operation only: no network await, timer or geography delay.
     pub fn publish(&self, from: usize, to: usize, slot: u64, payload: Arc<Vec<u8>>) {
-        let Some(hub) = self.representatives.get(&to).copied() else { return };
         assert!(u32::try_from(from).is_ok() && u32::try_from(to).is_ok() && payload.len() <= MAX_PACKET_BYTES, "invalid internal observer envelope");
         let bytes = packet_frame(from, to, slot, &payload);
         let mut state = self.state.lock().unwrap();
+        let audience = if let Some(hub) = self.representatives.get(&to) { Audience::Hub(*hub) }
+            else if !self.hubs.iter().any(|(_,peers)|peers.contains(&to)) {
+                let Some(identity) = state.catalog.get(&to).copied() else { return };
+                Audience::Identity(identity)
+            } else { return };
         let sequence = state.next_sequence;
         state.next_sequence = sequence.checked_add(1).expect("observer sequence exhausted");
         state.history_bytes += bytes.len();
-        state.history.insert(sequence, HistoryPacket { hub, slot, bytes: bytes.clone() });
+        state.history.insert(sequence, HistoryPacket { audience, slot, bytes: bytes.clone() });
         while state.history_bytes > HISTORY_BYTES || state.history.len() > HISTORY_PACKETS {
             let (sequence, packet) = state.history.pop_first().unwrap();
             state.history_bytes -= packet.bytes.len();
-            state.oldest_slot[packet.hub] = state.oldest_slot[packet.hub].max(packet.slot.saturating_add(1));
-            state.evicted_sequence[packet.hub] = Some(sequence);
+            match packet.audience {
+                Audience::Hub(hub) => {
+                    state.oldest_slot[hub] = state.oldest_slot[hub].max(packet.slot.saturating_add(1));
+                    state.evicted_sequence[hub] = Some(sequence);
+                }
+                Audience::Identity(identity) => {
+                    let oldest = state.targeted_evicted.entry(identity).or_insert((0,sequence));
+                    oldest.0 = oldest.0.max(packet.slot.saturating_add(1));
+                    oldest.1 = sequence;
+                }
+            }
         }
         drop(state);
         self.published.notify_waiters();
@@ -338,10 +409,11 @@ impl ExternalServer {
     /// The observer's next packet from the shared history, read at the pace its link drains it: one
     /// path for the replay and the live stream, with nothing queued per peer. A peer slower than the
     /// net falls behind the history's start and is closed there.
-    fn next_packet(&self, hub: usize, cursor: u64, from_slot: u64) -> Result<Option<(u64, Arc<Vec<u8>>)>> {
+    fn next_packet(&self, hub: usize, identity: &[u8;32], cursor: u64, from_slot: u64) -> Result<Option<(u64, Arc<Vec<u8>>)>> {
         let state = self.state.lock().unwrap();
-        ensure!(state.evicted_sequence[hub].is_none_or(|evicted| evicted < cursor), "observer fell behind the held history");
-        Ok(state.history.range(cursor..).find(|(_, packet)| packet.hub == hub && packet.slot >= from_slot)
+        ensure!(state.evicted_sequence[hub].is_none_or(|evicted| evicted < cursor)
+            && state.targeted_evicted.get(identity).is_none_or(|(_,evicted)| *evicted < cursor), "observer fell behind the held history");
+        Ok(state.history.range(cursor..).find(|(_, packet)| packet.audience.includes(hub,identity) && packet.slot >= from_slot)
             .map(|(sequence, packet)| (*sequence, packet.bytes.clone())))
     }
     fn remove(&self, identity: &[u8; 32], connection: &Connection) {
@@ -404,9 +476,10 @@ async fn serve(server: Weak<ExternalServer>, incoming: quinn::Incoming, permit: 
         let server = server.upgrade().context("observer endpoint stopped")?;
         let hub = server.hubs.iter().position(|(name, _)| *name == auth.hub).context("unknown observer hub")?;
         let mut state = server.state.lock().unwrap();
-        ensure!(auth.from_slot >= state.oldest_slot[hub], "observer requested history is no longer held");
+        ensure!(auth.from_slot >= state.oldest_slot[hub]
+            && state.targeted_evicted.get(&auth.identity).is_none_or(|(oldest,_)|auth.from_slot >= *oldest), "observer requested history is no longer held");
         state.identities.reserve(auth.identity)?;
-        let cursor = state.history.iter().find(|(_, packet)| packet.hub == hub && packet.slot >= auth.from_slot).map_or(state.next_sequence, |(sequence, _)| *sequence);
+        let cursor = state.history.iter().find(|(_, packet)| packet.audience.includes(hub,&auth.identity) && packet.slot >= auth.from_slot).map_or(state.next_sequence, |(sequence, _)| *sequence);
         state.observers.insert(auth.identity, Observer { connection: connection.clone() });
         Ok::<_, anyhow::Error>((hub, cursor, server.hubs[hub].1.clone()))
     })();
@@ -426,7 +499,7 @@ async fn serve(server: Weak<ExternalServer>, incoming: quinn::Incoming, permit: 
                 let published = server.published.notified();
                 tokio::pin!(published);
                 published.as_mut().enable();
-                let next = server.next_packet(hub, cursor, auth.from_slot);
+                let next = server.next_packet(hub, &auth.identity, cursor, auth.from_slot);
                 let next = match next {
                     Ok(next) => next,
                     Err(error) => { refused("fell behind the held history", &error); return Err(error) }
@@ -443,30 +516,62 @@ async fn serve(server: Weak<ExternalServer>, incoming: quinn::Incoming, permit: 
             let mut window = Instant::now();
             let mut pings = 0;
             let mut envelopes = 0;
+            let mut routed_frames = 0;
+            let mut routed_bytes = 0;
             loop {
-                match read_client_frame(&mut control_recv).await? {
+                let message = match read_client_frame(&mut control_recv).await {
+                    Ok(message) => message,
+                    Err(error) => {
+                        // A normal disconnect is not a malformed protocol message.
+                        if error.downcast_ref::<quinn::ReadExactError>().is_none() { refused("invalid member frame", &error); }
+                        return Err(error)
+                    }
+                };
+                let received_at = Instant::now();
+                if window.elapsed() >= Duration::from_secs(1) {
+                    window = Instant::now(); pings = 0; envelopes = 0; routed_frames = 0; routed_bytes = 0;
+                }
+                let (recipients,envelope) = match message {
                     ClientFrame::Ping { peer, nonce } => {
-                        if window.elapsed() >= Duration::from_secs(1) { window = Instant::now(); pings = 0; envelopes = 0; }
                         pings += 1;
-                        ensure!(pings <= 10, "observer ping rate exceeded");
-                        ensure!(peers.contains(&peer), "observer ping names another hub");
+                        if pings > 10 {
+                            refused("observer ping rate exceeded", &"10 pings per second");
+                            bail!("observer ping rate exceeded")
+                        }
+                        if !peers.contains(&peer) {
+                            refused("observer ping names another hub", &"invalid ping peer");
+                            bail!("observer ping names another hub")
+                        }
                         write_server_frame(&mut control_send, &ServerFrame::Pong { peer, nonce }).await?;
+                        continue;
                     }
                     ClientFrame::Envelope(envelope) => {
-                        if window.elapsed() >= Duration::from_secs(1) { window = Instant::now(); pings = 0; envelopes = 0; }
                         envelopes += 1;
                         if envelopes > 32 {
                             refused("member envelope rate exceeded", &"32 envelopes per second");
                             bail!("member envelope rate exceeded")
                         }
-                        let server = server.upgrade().context("observer endpoint stopped")?;
-                        let ingress = server.ingress.lock().unwrap().clone().context("member vote ingress is not enabled")?;
-                        if let Err(error) = ingress.try_send(ExternalIngress {identity:auth.identity,hub:auth.hub.clone(),envelope,connection:connection.clone()}) {
-                            refused("member vote ingress is full or closed", &error);
-                            return Err(error.into())
-                        }
+                        (None,envelope)
                     }
-                    ClientFrame::Authenticate(_) => bail!("observer cannot authenticate twice"),
+                    ClientFrame::Routed {recipients,envelope} => {
+                        routed_frames += 1;
+                        routed_bytes += envelope.len() + 6 + 4 * recipients.len();
+                        if routed_frames > MAX_ROUTED_FRAMES_PER_SECOND || routed_bytes > MAX_ROUTED_BYTES_PER_SECOND {
+                            refused("member proposing rate exceeded", &"8192 frames or 64 MiB per second");
+                            bail!("member proposing rate exceeded")
+                        }
+                        (Some(recipients),envelope)
+                    }
+                    ClientFrame::Authenticate(_) => {
+                        refused("duplicate identity proof", &"already authenticated");
+                        bail!("observer cannot authenticate twice")
+                    },
+                };
+                let server = server.upgrade().context("observer endpoint stopped")?;
+                let ingress = server.ingress.lock().unwrap().clone().context("member ingress is not enabled")?;
+                if let Err(error) = ingress.try_send(ExternalIngress {identity:auth.identity,hub:auth.hub.clone(),recipients,envelope,received_at,connection:connection.clone()}) {
+                    refused("member ingress is full or closed", &error);
+                    return Err(error.into())
                 }
             }
         };
@@ -493,7 +598,7 @@ pub fn pinned_client_config(cert_der: &[u8]) -> Result<ClientConfig> {
     transport.max_concurrent_uni_streams(1_u32.into());
     transport.stream_receive_window((4_u32 * 1024 * 1024).into());
     transport.receive_window((8_u32 * 1024 * 1024).into());
-    transport.send_window(16 * 1024);
+    transport.send_window(4 * 1024 * 1024);
     transport.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
     transport.keep_alive_interval(Some(Duration::from_secs(5)));
     config.transport_config(Arc::new(transport));
@@ -527,10 +632,15 @@ pub struct ExternalControl {
     streams: Arc<tokio::sync::Mutex<ControlStreams>>,
 }
 impl ExternalControl {
-    /// Only the signed envelope is sent; admission and Wire::Vote validation belong to the node.
+    /// The existing small vote frame; admission and signed vote validation belong to the node.
     pub async fn send_envelope(&self, envelope: &[u8]) -> Result<()> {
         let mut streams = self.streams.lock().await;
         write_client_frame(&mut streams.send, &ClientFrame::Envelope(envelope.to_vec())).await
+    }
+    /// The node authenticates the envelope and validates these recipients against its role.
+    pub async fn send_to(&self, recipients: &[usize], envelope: &[u8]) -> Result<()> {
+        let mut streams = self.streams.lock().await;
+        write_client_frame(&mut streams.send, &ClientFrame::Routed {recipients:recipients.to_vec(),envelope:envelope.to_vec()}).await
     }
     pub async fn ping(&self, peer: usize) -> Result<Duration> {
         let mut streams = self.streams.lock().await;

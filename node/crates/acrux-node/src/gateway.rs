@@ -53,6 +53,7 @@ pub enum GatewayCommand {
         reply: CommandReply,
     },
     ValidatorSet { epoch:Option<u64>,reply:CommandReply },
+    ExecutionAgreement {slot:u64,reply:CommandReply},
     Balance {
         address: String,
         reply: CommandReply,
@@ -634,6 +635,10 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
             _ => Err(("INVALID_INPUT", "from must be a slot and count 1 to 64.")),
         },
         "getFinalizedCblock" => Ok(finalized_head(&*state.read().await)),
+        "getExecutionAgreement" => match params.get("slot").and_then(safe_integer) {
+            Some(slot)=>command(&state,|reply|GatewayCommand::ExecutionAgreement {slot,reply}).await.map_err(|_|("NET_UNAVAILABLE","Execution agreement could not be read.")),
+            None=>Err(("INVALID_INPUT","slot must be a nonnegative safe integer.")),
+        },
         "getFollowerPage" => match (params.get("from").and_then(safe_integer), params.get("count").and_then(safe_integer)) {
             (Some(from), Some(count @ 1..=256)) => {
                 let (finalized, views) = {

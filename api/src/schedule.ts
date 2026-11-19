@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process'
 import type { SchedulePreview } from '@acrux/contract'
 import { env } from './config.js'
 
-type HubInput = { code: string; region: string; members: { identity: string; stake: number }[] }
+type HubInput = { code: string; region: string; members: { identity: string; stake: number; validatorKind?: 'genesis' | 'external' }[] }
 type HubStake = { code: string; region: string; cap: number; stake: number; members: { identity: string; stake: number; proposerStake: number; capped: boolean }[] }
 type NodeSchedule = { epoch: number; seed: string; alpha: number; shares: SchedulePreview['shares']; regionalRuns: SchedulePreview['regionalRuns']; windows: { number: number; hubCode: string; region: string; proposers: string[] }[] }
 
@@ -41,7 +41,8 @@ export async function schedulePreview(epoch: number, hubs: HubInput[], totalStak
     windows: schedule.windows.map(w => ({
       number: w.number, hubCode: w.hubCode, firstSlot: w.number * 16, lastSlot: w.number * 16 + 15,
       consensusSlots: [0, 1, 2, 3].map(i => w.number * 4 + i),
-      proposers: w.proposers.map((identity, i) => ({ index: i + 1, identity, stake: lamports(member(w.hubCode, identity).proposerStake), status: 'online' as const })),
+      proposers: w.proposers.map((identity, i) => ({ index: i + 1, identity, stake: lamports(member(w.hubCode, identity).proposerStake), status: 'online' as const,
+        validatorKind: hubs.find(hub => hub.code === w.hubCode)?.members.find(member => member.identity === identity)?.validatorKind })),
     })),
   }
 }

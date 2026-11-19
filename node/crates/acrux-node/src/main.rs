@@ -119,7 +119,7 @@ enum ClusterCommand {
 #[derive(Subcommand)]
 enum NodeCommand {
     /// Connects to a hub over QUIC and independently re-executes its finalized wire stream.
-    /// Admission and block submission arrive in later build-5 steps.
+    /// An admitted member proposes through the same authenticated link.
     Propose {
         #[arg(long)]
         hub: String,
@@ -129,6 +129,9 @@ enum NodeCommand {
         net: String,
         #[arg(long, default_value = "../chain/genesis/acrux-net.json")]
         genesis: String,
+        /// Optional local JSON-RPC listener for clients submitting directly to this proposer.
+        #[arg(long)]
+        rpc_port: Option<u16>,
     },
     /// Follows a net from its latest finalized cblock: decrypts, merges and re-executes every
     /// finalized slot and checks the state hashes against the net's and its certificates.
@@ -255,7 +258,7 @@ async fn run() -> anyhow::Result<()> {
         Command::Replay { block, rpc, slot, save, rows, json } => return acrux_node::replay::run(block.as_deref(), rpc.as_deref(), slot, save.as_deref(), rows, json.as_deref()).await,
         Command::Send { rpc, keypair, to, lamports, n, t, priority } => return cli::send(&rpc, &keypair, &to, lamports, n, t, priority).await,
         Command::Node { command: NodeCommand::Follow { url, genesis } } => return cli::follow(&url, &genesis).await,
-        Command::Node { command: NodeCommand::Propose { hub, identity, net, genesis } } => return acrux_node::propose::run(&net, &hub, &identity, &genesis).await,
+        Command::Node { command: NodeCommand::Propose { hub, identity, net, genesis, rpc_port } } => return acrux_node::propose::run(&net, &hub, &identity, &genesis, rpc_port).await,
         Command::Net { command: NetCommand::Import { url, store, genesis } } => return cli::import(&url, &store, &genesis).await,
         Command::Hub { command, rpc, program, identity } => {
             let action = match command {

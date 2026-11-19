@@ -131,7 +131,8 @@ export function createNodeApi() {
     const query = readQuery(c, epochQuery), chain = query.chain ?? 'solana'
     const config = readyRegistry(chain), epoch = query.epoch ?? config.currentEpoch + 1
     const hubs = (await hubRows(chain)).map(row => ({ code: row.code, region: regionOf(row.latitude, row.longitude),
-      members: row.members.filter(m => BigInt(m.proposerStakeLamports.toString()) > 0n).map(m => ({ identity: m.identity, stake: Number(BigInt(m.stakeLamports.toString()) / 1_000n) })) }))
+      members: row.members.filter(m => BigInt(m.proposerStakeLamports.toString()) > 0n).map(m => ({ identity: m.identity, stake: Number(BigInt(m.stakeLamports.toString()) / 1_000n),
+        ...(m.validatorKind === 'genesis' || m.validatorKind === 'external' ? { validatorKind: m.validatorKind as 'genesis' | 'external' } : {}) })) }))
     return c.json(await schedulePreview(epoch, hubs, Number(registries[chain].stake.total() / 1_000n)))
   })
 

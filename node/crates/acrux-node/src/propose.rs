@@ -23,6 +23,7 @@ const MAX_PENDING_MATERIAL_BYTES: usize = 64 * 1024 * 1024;
 type Accepted = (u64, Option<Vec<usize>>, Vec<Option<[u8; 32]>>);
 type Preimage = (u64, Option<BlockRef>, Vec<Accepted>, String);
 
+const AUTHORED_SLOTS: TableDefinition<&str, u64> = TableDefinition::new("authored_through");
 const VOTE_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("consensus_votes");
 #[derive(Serialize, Deserialize)]
 struct KeptVote { vote: crate::consensus::Vote, envelope: Vec<u8> }
@@ -45,6 +46,17 @@ impl VoteJournal {
         let mut journal = Self {db,chain,state};
         journal.finalize(anchor)?;
         Ok(journal)
+    }
+    fn reserve_author(&mut self, slot:u64)->Result<bool> {
+        let mut write=self.db.begin_write()?;
+        write.set_durability(Durability::Immediate);
+        {
+            let mut table=write.open_table(AUTHORED_SLOTS)?;
+            if table.get(self.chain.as_str())?.is_some_and(|old|old.value()>=slot) {return Ok(false)}
+            table.insert(self.chain.as_str(),slot)?;
+        }
+        write.commit()?;
+        Ok(true)
     }
     fn existing(&self, vote: &crate::consensus::Vote) -> Result<Option<Vec<u8>>> {
         use crate::consensus::VoteKind;
@@ -84,7 +96,7 @@ impl VoteJournal {
     }
 }
 
-fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     Ok(bincode::DefaultOptions::new().with_fixint_encoding().with_limit(MAX_WIRE_BYTES)
         .reject_trailing_bytes().deserialize(bytes)?)
 }
@@ -130,12 +142,17 @@ struct Observer {
     outgoing: Vec<Vec<u8>>,
     epoch_updates: BTreeMap<u64, (crate::execution::AdmissionSnapshot, Vec<solana_sdk::pubkey::Pubkey>)>,
     reported_epoch: Option<u64>,
+    control: Option<std::sync::Arc<crate::external::ExternalControl>>,
+    member: Option<crate::external_proposer::MemberProposer>,
+    fast_lane: crate::external_proposer::FastLane,
+    certified: BTreeSet<BlockRef>,
+    window_notices: BTreeMap<u64,(Option<BlockRef>,u64)>,
     bridge: Option<crate::genesis::BridgeConfig>,
     slots: BTreeMap<u64, Slot>,
     witnesses: BTreeMap<BlockRef, Witness>,
     finalized: BTreeMap<u64, Finalized>,
     seen: BTreeMap<[u8; 32], u64>,
-    pending: BTreeMap<[u8; 32], (u64, Envelope)>,
+    pending: BTreeMap<[u8; 32], (u64, std::time::Instant, usize, Envelope)>,
     checked: u64,
     buffered_bytes: usize,
 }
@@ -213,6 +230,15 @@ impl Observer {
                 self.votor.install_stakes(from,own,stakes)?;
             }
         }
+        if self.member.is_none() {
+            if let (Some(control),Some(id)) = (&self.control,proposers.catalog.iter().position(|identity|identity==&self.identity)) {
+                if id>=proposers.config.identities.len() {
+                    self.member=Some(crate::external_proposer::MemberProposer::new(id,self.signer.clone(),self.identity.clone(),control.clone(),proposers.config.seed.parse()?));
+                }
+            }
+        }
+        if let Some(member)=&mut self.member {member.finalized(&self.replay.executor);}
+        self.fast_lane.update(proposers.clone(),self.keys.clone(),self.member.as_ref().map(|member|member.inbox()),self.identity.clone(),self.hub.clone());
         for checkpoint in self.checkpoints.values_mut() { checkpoint.proposers = self.replay.proposers.clone(); }
         let ready = self.epoch_updates.iter().filter(|(epoch,_)|proposers.admissions.contains_key(epoch)).map(|(epoch,_)|*epoch).collect::<Vec<_>>();
         for epoch in ready {
@@ -301,6 +327,9 @@ impl Observer {
             ensure!(vote == &proof.vote, "Certificate proof names another vote");
             self.verify_vote(proof)?;
         }
+        if certificate.kind!=CertificateKind::Skip {
+            self.certified.insert(BlockRef{slot:certificate.slot,hash:certificate.hash.context("Certificate hash")?});
+        }
         self.record_finality(&certificate)?;
         let actions = self.votor.receive(crate::consensus::Message::Certificate(certificate))?;
         self.actions(actions)
@@ -348,30 +377,60 @@ impl Observer {
         } else { self.witnesses.insert(wire.block, Witness { wire, accepted }); }
         Ok(())
     }
+    fn recipient_ready(&self,to:usize)->Result<bool> {
+        let proposers=self.replay.proposers.as_ref().context("Missing proposer configuration")?;
+        let Some(identity)=proposers.catalog.get(to) else{return Ok(false)};
+        let mirrored=proposers.config.hubs.iter().find(|hub|hub.code==self.hub).is_some_and(|hub|hub.members.iter().any(|member|&member.identity==identity));
+        ensure!(identity==&self.identity||mirrored,"Mirrored packet is addressed to another hub or identity");
+        Ok(true)
+    }
+    #[cfg(test)]
     fn packet(&mut self, packet: crate::external::Packet, recipients: &BTreeSet<usize>) -> Result<()> {
-        ensure!(recipients.contains(&packet.to), "Mirrored packet is addressed to another hub");
+        self.packet_at(packet,recipients,std::time::Instant::now())
+    }
+    fn packet_at(&mut self, packet: crate::external::Packet, recipients: &BTreeSet<usize>, received_at:std::time::Instant) -> Result<()> {
+        let target_ready=recipients.contains(&packet.to)||self.recipient_ready(packet.to)?;
         let digest = crypto::hash(&packet.payload);
         if self.seen.contains_key(&digest) { return Ok(()) }
         let envelope: Envelope = decode(&packet.payload)?;
         ensure!(envelope.from == packet.from, "Mirrored envelope has another sender");
-        if !self.epoch_ready(&envelope.body)? {
+        if !target_ready || !self.epoch_ready(&envelope.body)? {
             if !self.pending.contains_key(&digest) {
                 ensure!(self.pending.len() + self.seen.len() < MAX_SEEN_ENVELOPES
                     && self.buffered_bytes.checked_add(packet.payload.len()).is_some_and(|bytes| bytes <= MAX_PENDING_MATERIAL_BYTES),
                     "Observer pending material exceeded its window; restart from a fresh snapshot");
                 self.buffered_bytes += packet.payload.len();
-                // These bytes are not trusted yet. The epoch's hashed catalog supplies the
-                // sender and voter keys; verify both signatures when replay catches up.
-                self.pending.insert(digest,(packet.slot,envelope));
+                self.pending.insert(digest,(packet.slot,received_at,packet.to,envelope));
             }
-        } else {
-            self.envelope(envelope,digest,packet.slot)?;
-        }
+        } else { self.envelope(envelope,digest,packet.slot,received_at,packet.to)?; }
         loop {
+            self.start_windows()?;
             self.speculate()?;
             self.replay_ready()?;
             if !self.drain_pending()? { return Ok(()) }
         }
+    }
+    fn start_windows(&mut self)->Result<()> {
+        let Some(proposers)=&self.replay.proposers else{return Ok(())};
+        let Some(member)=&mut self.member else{return Ok(())};
+        for (number,(parent,unix_us)) in &self.window_notices {
+            if !parent.is_some_and(|parent|self.certified.contains(&parent)||parent==self.anchor) {continue}
+            if self.votor.own_at(number*4).is_none() {continue}
+            let window=proposers.window(*number)?;
+            if window.hub_code!=self.hub||!window.proposers.contains(&self.identity){continue}
+            let ids=proposers.ids(*number)?;
+            let (identities,stakes)=proposers.voting_set(number*4)?;
+            let view=crate::view::window_json(*number,&window,&identities,&stakes,None,&proposers.config.identities);
+            member.start_window(*number,*parent,*unix_us,ids,view)?;
+        }
+        Ok(())
+    }
+    async fn member_tick(&mut self)->Result<()> {
+        if let Some(member)=&mut self.member {
+            let journal=&mut self.journal;
+            member.tick(&self.replay.executor,|slot|journal.reserve_author(slot)).await?;
+        }
+        Ok(())
     }
     fn epoch_ready(&self, wire: &Wire) -> Result<bool> {
         let proposers = self.replay.proposers.as_ref().context("Missing proposer configuration")?;
@@ -391,28 +450,35 @@ impl Observer {
                 && attestations.iter().all(|(attestation,_)|known(attestation.slot / 4)),
             Wire::Equivocation {first,second} => known(first.0.slot / 4) && known(second.0.slot / 4),
             Wire::Cblock(witness) => known(witness.block.slot),
+            Wire::WindowStart {number,..} => known(number*4),
             Wire::ValidatorEpoch {..} | Wire::Submit(_) | Wire::SubmitFragment(_) => true,
         })
     }
     fn drain_pending(&mut self) -> Result<bool> {
         let mut ready = vec![];
-        for (digest,(_,envelope)) in &self.pending {
-            if self.epoch_ready(&envelope.body)? { ready.push(*digest); }
+        for (digest,(_,_,to,envelope)) in &self.pending {
+            if self.recipient_ready(*to)? && self.epoch_ready(&envelope.body)? { ready.push(*digest); }
         }
         for digest in &ready {
-            let (slot,envelope) = self.pending.remove(digest).unwrap();
+            let (slot,received_at,to,envelope) = self.pending.remove(digest).unwrap();
             self.buffered_bytes -= usize::try_from(bincode::serialized_size(&envelope)?)?;
-            self.envelope(envelope,*digest,slot)?;
+            self.envelope(envelope,*digest,slot,received_at,to)?;
         }
         Ok(!ready.is_empty())
     }
-    fn envelope(&mut self, envelope: Envelope, digest: [u8;32], slot: u64) -> Result<()> {
+    fn envelope(&mut self, envelope: Envelope, digest: [u8;32], slot: u64, received_at:std::time::Instant, to:usize) -> Result<()> {
         let key = self.keys.get(envelope.from).context("Envelope from an unknown validator")?;
         crypto::verify_bytes(key, &bincode::serialize(&envelope.body)?, &envelope.signature).context("Invalid wire envelope signature")?;
         self.seen.insert(digest, slot);
         match envelope.body {
             Wire::Shreds(shreds) | Wire::Relay(shreds) => for shred in shreds { self.shred(shred)?; },
-            Wire::Commit(commitment) => self.commitment(commitment, None, Some(envelope.from))?,
+            Wire::Commit(commitment) => {
+                self.commitment(commitment.clone(), None, Some(envelope.from))?;
+                if let Some(member)=&self.member {
+                    let inbox=member.inbox();let signature=envelope.signature;
+                    tokio::spawn(async move{inbox.receive(envelope.from,commitment,signature,received_at).await;});
+                }
+            },
             Wire::Attest(attestation) => self.attest(attestation, envelope.signature, Some(envelope.from))?,
             Wire::Vote(vote) => {
                 self.verify_vote(&vote)?;
@@ -437,8 +503,24 @@ impl Observer {
                 if let Some((known,known_catalog)) = self.epoch_updates.get(&snapshot.epoch) { ensure!(known == &snapshot && known_catalog == &catalog, "Conflicting validator epoch messages"); }
                 self.epoch_updates.insert(snapshot.epoch,(snapshot,catalog));
             },
-            // Observing an application's submission is not its admission or execution.
-            Wire::Submit(_) | Wire::SubmitFragment(_) => {},
+            Wire::WindowStart {number,parent,started_at_unix_us} => {
+                let proposers=self.replay.proposers.as_ref().context("Missing proposer configuration")?;
+                let window=proposers.window(number)?;
+                let hub=proposers.config.hubs.iter().find(|hub|hub.code==window.hub_code).context("Window hub")?;
+                ensure!(proposers.catalog.get(envelope.from)==hub.members.first().map(|member|&member.identity),"Window notice is not from the fixed hub representative");
+                if window.hub_code==self.hub && window.proposers.contains(&self.identity) && self.votor.own_at(number*4).is_some() {
+                    if let Some(known)=self.window_notices.get(&number) {ensure!(*known==(parent,started_at_unix_us),"Conflicting window notice");}
+                    self.window_notices.insert(number,(parent,started_at_unix_us));
+                }
+            },
+            Wire::Submit(transaction) => {
+                let own=self.replay.proposers.as_ref().and_then(|proposers|proposers.catalog.iter().position(|identity|identity==&self.identity));
+                if own==Some(to) {if let Some(member)=&mut self.member {member.transaction(&self.replay.executor,transaction)?;}}
+            },
+            Wire::SubmitFragment(fragment) => {
+                let own=self.replay.proposers.as_ref().and_then(|proposers|proposers.catalog.iter().position(|identity|identity==&self.identity));
+                if own==Some(to) {if let Some(member)=&mut self.member {member.fragment(fragment)?;}}
+            },
         }
         ensure!(self.slots.len() <= MAX_PENDING_SLOTS && self.witnesses.len() <= MAX_PENDING_SLOTS / 4
             && self.seen.len() + self.pending.len() <= MAX_SEEN_ENVELOPES, "Observer data exceeded its window; restart from a fresh snapshot");
@@ -562,13 +644,15 @@ impl Observer {
             self.finalized.retain(|slot,_| *slot > block.slot);
             self.seen.retain(|_,slot| *slot / 4 > block.slot);
             self.votor.prune(block.slot.saturating_sub(8));
+            self.certified.retain(|known|known.slot>=block.slot.saturating_sub(8));
+            self.window_notices.retain(|number,_|*number>=block.slot/4);
             self.speculate()?;
         }
     }
 
 }
 
-pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str) -> Result<()> {
+pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_port:Option<u16>) -> Result<()> {
     let genesis = crate::genesis::Genesis::load(std::path::Path::new(genesis_path))?;
     let programs = genesis.programs.iter().map(|(address,path)|crate::execution::GenesisProgram {address:address.clone(),path:path.clone()}).collect::<Vec<_>>();
     let snapshot = cli::rpc(url,"getExecutionSnapshot",json!({})).await?;
@@ -601,33 +685,48 @@ pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str) -> Re
     let journal = VoteJournal::open(identity,hex::encode(chain),anchor)?;
     let from_slot = last.checked_mul(4).and_then(|slot|slot.checked_add(4)).context("Snapshot slot overflow")?;
     let mut client = crate::external::ExternalClient::connect(address,&cert,hub,&signer,from_slot).await?;
-    let control = client.control.clone();
+    let control = std::sync::Arc::new(client.control.clone());
     let connection = client.connection.clone();
-    let (sender,mut packets) = tokio::sync::mpsc::channel(256);
-    // A dedicated reader owns frame decoding. Cancelling read_exact in select would lose framing.
-    let reader = tokio::spawn(async move {
-        loop {
-            let packet = client.next_packet().await;
-            let failed = packet.is_err();
-            if sender.send(packet).await.is_err() || failed { break }
-        }
-    });
     println!("from cblock {last}: {} accounts loaded, state {} matches",replay.executor.account_count(),&start_hash[..12]);
     let identity = bs58::encode(signer.verifying_key().to_bytes()).into_string();
     let legacy_stakes = vec![100_000_000;config.identities.len()];
     let mut votor = Votor::new(0,legacy_stakes.clone())?;
     votor.install_stakes(0,None,legacy_stakes)?;
-    let mut observer = Observer {checkpoints:BTreeMap::from([(anchor,replay.checkpoint())]),replay,anchor,keys,votor,signer,journal,identity,hub:hub.to_owned(),outgoing:vec![],epoch_updates:BTreeMap::new(),reported_epoch:None,bridge:genesis.bridge.clone(),slots:BTreeMap::new(),witnesses:BTreeMap::new(),finalized:BTreeMap::new(),seen:BTreeMap::new(),pending:BTreeMap::new(),checked:0,buffered_bytes:0};
+    let fast_lane=crate::external_proposer::FastLane::default();
+    let mut observer = Observer {checkpoints:BTreeMap::from([(anchor,replay.checkpoint())]),replay,anchor,keys,votor,signer,journal,identity,hub:hub.to_owned(),outgoing:vec![],epoch_updates:BTreeMap::new(),reported_epoch:None,control:Some(control.clone()),member:None,fast_lane:fast_lane.clone(),certified:BTreeSet::from([anchor]),window_notices:BTreeMap::new(),bridge:genesis.bridge.clone(),slots:BTreeMap::new(),witnesses:BTreeMap::new(),finalized:BTreeMap::new(),seen:BTreeMap::new(),pending:BTreeMap::new(),checked:0,buffered_bytes:0};
     observer.learn_finalized()?;
     observer.votor.resume(anchor);
     observer.status(last);
+    let (sender,mut packets) = tokio::sync::mpsc::channel(256);
+    // A dedicated reader owns frame decoding. Cancelling read_exact in select would lose framing.
+    let reader = tokio::spawn(async move {
+        loop {
+            let packet = client.next_packet().await;
+            let received_at=std::time::Instant::now();
+            let packet=match packet {Ok(packet)=>match fast_lane.receive(&packet,received_at).await{Ok(())=>Ok((received_at,packet)),Err(error)=>Err(error)},Err(error)=>Err(error)};
+            let failed=packet.is_err();
+            if sender.send(packet).await.is_err() || failed {break}
+        }
+    });
+
+    let (mut rpc_requests,rpc_task)=match rpc_port {Some(port)=>{let (receiver,task)=crate::external_proposer::bind_rpc(port).await?;(Some(receiver),Some(task))},None=>(None,None)};
+    let mut member_tick=tokio::time::interval(Duration::from_millis(1));
+    member_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     let outcome = async {
         loop {
             tokio::select! {
                 packet = packets.recv() => {
-                    observer.packet(packet.context("Hub wire stream ended")??,&recipients)?;
+                    let (received_at,packet)=packet.context("Hub wire stream ended")??;
+                    observer.packet_at(packet,&recipients,received_at)?;
                     for envelope in observer.outgoing.drain(..) { control.send_envelope(&envelope).await?; }
+                },
+                _=member_tick.tick()=>observer.member_tick().await?,
+                request=async{match &mut rpc_requests{Some(receiver)=>receiver.recv().await,None=>std::future::pending().await}}=>{
+                    if let Some(request)=request {
+                        let slot=observer.member.as_ref().and_then(|member|member.current_slot()).unwrap_or(0).max(observer.anchor.slot*4+3);
+                        crate::external_proposer::rpc(request,observer.member.as_mut(),&mut observer.replay.executor,slot);
+                    }
                 },
                 _ = heartbeat.tick() => for peer in &peers.peers {
                     let rtt = control.ping(peer.id).await?;
@@ -640,6 +739,7 @@ pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str) -> Re
     connection.close(0u32.into(),b"observer stopped");
     reader.abort();
     let _ = reader.await;
+    if let Some(task)=rpc_task {task.abort();let _=task.await;}
     outcome
 }
 
@@ -674,7 +774,7 @@ mod tests {
         let mut observer = Observer {
             checkpoints:BTreeMap::from([(anchor,replay.checkpoint())]),replay,anchor,
             keys:signers.iter().map(SigningKey::verifying_key).collect(),votor,signer,journal,identity,
-            hub:"FRA".into(),outgoing:vec![],epoch_updates:BTreeMap::new(),reported_epoch:None,bridge:None,
+            hub:"FRA".into(),outgoing:vec![],epoch_updates:BTreeMap::new(),reported_epoch:None,control:None,member:None,fast_lane:crate::external_proposer::FastLane::default(),certified:BTreeSet::from([anchor]),window_notices:BTreeMap::new(),bridge:None,
             slots:BTreeMap::new(),witnesses:BTreeMap::new(),finalized:BTreeMap::new(),seen:BTreeMap::new(),
             pending:BTreeMap::new(),checked:0,buffered_bytes:0,
         };

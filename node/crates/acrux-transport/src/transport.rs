@@ -38,6 +38,7 @@ pub struct Received {
 
 pub struct LocalTransport {
     peers: Vec<Peer>,
+    relay_stakes: Vec<u64>,
     endpoints: Vec<Endpoint>,
     connections: Vec<Vec<Mutex<Option<Connection>>>>,
     incoming: mpsc::Sender<Received>,
@@ -98,6 +99,7 @@ impl LocalTransport {
             .map(|_| (0..peers.len()).map(|_| AtomicU64::new(0)).collect())
             .collect();
         let local = Arc::new(Self {
+            relay_stakes:peers.iter().map(|peer|peer.stake).collect(),
             peers,
             endpoints,
             connections,
@@ -190,11 +192,14 @@ impl LocalTransport {
     }
     /// Already authenticated member votes enter the ordinary receive path without geography.
     pub fn inject_external(&self,from:usize,to:usize,payload:Vec<u8>)->Result<()> {
+        self.inject_external_at(from,to,payload,Instant::now())
+    }
+    pub fn inject_external_at(&self,from:usize,to:usize,payload:Vec<u8>,received_at:Instant)->Result<()> {
         ensure!(to<self.peers.len() && payload.len()<=MAX_MESSAGE_BYTES,"Invalid member vote delivery");
         if let Some((server,slot_of))=self.external.read().unwrap().clone() {
             if server.observes(to) {if let Some(slot)=slot_of(&payload){server.publish(from,to,slot,Arc::new(payload.clone()));}}
         }
-        self.incoming.try_send(Received{from,to,payload,received_at:Instant::now()}).context("Member vote receive capacity exceeded")?;
+        self.incoming.try_send(Received{from,to,payload,received_at}).context("Member receive capacity exceeded")?;
         Ok(())
     }
 
@@ -211,7 +216,6 @@ impl LocalTransport {
     pub async fn send(&self, from: usize, to: usize, payload: Vec<u8>) -> Result<()> {
         let _whole=self.profile.measure(Some(from),"transport.send");
         ensure!(from<self.peers.len(),"unknown local transport sender");
-        if to>=self.peers.len() {return Ok(())}
         ensure!(
             payload.len() <= MAX_MESSAGE_BYTES,
             "network message exceeds size limit"
@@ -223,6 +227,8 @@ impl LocalTransport {
                 if let Some(slot) = slot_of(&payload) { server.publish(from,to,slot,Arc::new(payload.clone())); }
             }
         }
+        // An outside target receives this exact envelope through the shared pull history.
+        if to>=self.peers.len() {return Ok(())}
         let serial = self.serial[from][to].fetch_add(1, Ordering::Relaxed);
         let delay=self.link_delay(from,to,serial);
         let delay_started=Instant::now();
@@ -277,21 +283,7 @@ impl LocalTransport {
 
     /// Rotor samples a stake-weighted relay independently for each slot, slice, proposer and shred.
     pub fn relay(&self, slot: u64, slice: u32, proposer: usize, shred: u8) -> usize {
-        let total: u64 = self.peers.iter().map(|peer| peer.stake).sum();
-        assert!(total > 0, "relay sampling requires positive stake");
-        let mut point = mix(self.seed
-            ^ slot.rotate_left(11)
-            ^ ((slice as u64) << 32)
-            ^ ((proposer as u64) << 8)
-            ^ shred as u64)
-            % total;
-        for peer in &self.peers {
-            if point < peer.stake {
-                return peer.id;
-            }
-            point -= peer.stake;
-        }
-        unreachable!()
+        stake_relay(self.seed,slot,slice,proposer,shred,&self.relay_stakes)
     }
 
     pub async fn close(&self) {
@@ -307,6 +299,19 @@ impl LocalTransport {
             endpoint.wait_idle().await;
         }
     }
+}
+
+/// The same Rotor draw on an in-process or outside proposer. Relay IDs keep their
+/// stable genesis order until relays themselves become independent operators.
+pub fn stake_relay(seed:u64,slot:u64,slice:u32,proposer:usize,shred:u8,stakes:&[u64])->usize {
+    let total:u64=stakes.iter().sum();
+    assert!(total>0,"relay sampling requires positive stake");
+    let mut point=mix(seed ^ slot.rotate_left(11) ^ ((slice as u64)<<32) ^ ((proposer as u64)<<8) ^ shred as u64)%total;
+    for (id,stake) in stakes.iter().enumerate() {
+        if point<*stake {return id}
+        point-=*stake;
+    }
+    unreachable!()
 }
 
 fn mix(mut n: u64) -> u64 {

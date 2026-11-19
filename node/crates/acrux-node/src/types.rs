@@ -67,6 +67,9 @@ pub enum Wire {
     Cblock(CblockWitness),
     /// A finalized hashed admission snapshot, carried through the same shared history.
     ValidatorEpoch { snapshot: crate::execution::AdmissionSnapshot, catalog: Vec<solana_sdk::pubkey::Pubkey> },
+    /// The hub representative's monotonic window start expressed on its public wall clock.
+    /// A member maps it once to its own Instant; link delay never moves the deadline.
+    WindowStart { number: u64, parent: Option<consensus::BlockRef>, started_at_unix_us: u64 },
 }
 /// A Fault Lab scenario: the faulty behaviour of one proposer role in one window.
 #[derive(Clone, Debug, Serialize, Deserialize)]

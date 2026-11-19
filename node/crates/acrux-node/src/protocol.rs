@@ -76,11 +76,8 @@ struct WindowRun {
     next_slot: usize,
     skipped_from: Option<u64>,
 }
-struct EarlyBlock {
-    key: [u8; 32],
-    roots: Vec<[u8; 32]>,
-    next_slice: u32,
-}
+use crate::proposer::EarlyBlock;
+
 struct Node {
     id: usize,
     key: SigningKey,
@@ -466,23 +463,7 @@ const VALIDATOR_START_LAMPORTS: u64 = 10_000_000_000;
 /// A block carries at most this many bytes of transactions and fragments; what is due beyond it
 /// stays in the mempool for the next slots. Kept well under the 1 MiB block and network message
 /// limits, with room for the window handover that carries four slots of shreds.
-pub const BLOCK_BYTES: u64 = 64 * 1024;
-
-/// The due items that fit `budget`, highest priority fee per CU first, then by key.
-fn within_budget<K: Ord + Clone>(mut due: Vec<(K, u128, u64)>, budget: u64) -> Vec<K> {
-    due.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let mut used = 0;
-    due.into_iter()
-        .filter(|(_, _, size)| {
-            let fits = used + size <= budget;
-            if fits {
-                used += size;
-            }
-            fits
-        })
-        .map(|(key, _, _)| key)
-        .collect()
-}
+pub use crate::proposer::BLOCK_BYTES;
 
 /// Splits a handover's shreds into parts of at most `HANDOVER_PART_BYTES` each; always at least one.
 const HANDOVER_PART_BYTES: u64 = 768 * 1024;
@@ -501,63 +482,8 @@ fn handover_parts(shreds: Vec<Shred>) -> Vec<Vec<Shred>> {
     parts
 }
 
-fn pack(
-    node: &mut Node,
-    s: u64,
-    q: usize,
-    censored: Option<&String>,
-) -> (Vec<ValidatedTx>, Vec<crate::threshold::VerifiedFragment>) {
-    let executor = node.executor.as_ref().unwrap();
-    let priority = |h: &crate::execution::TxHeader| h.priority_fee_per_cu.parse::<u128>().unwrap_or(0);
-    let due = node
-        .mempool
-        .iter()
-        .filter(|(id, tx)| tx.header.target_slot <= s && Some(*id) != censored)
-        .map(|(id, tx)| (id.clone(), priority(&tx.header), bincode::serialized_size(tx).unwrap_or(u64::MAX)))
-        .collect::<Vec<_>>();
-    let due_fragments = node
-        .fragment_mempool
-        .iter()
-        .filter(|(_, f)| f.header.target_slot <= s)
-        .map(|(key, f)| (key.clone(), priority(&f.header), bincode::serialized_size(f).unwrap_or(u64::MAX)))
-        .collect::<Vec<_>>();
-    // Fragments first: a threshold transaction needs t of them together, so they take the budget's
-    // first half and plain transactions the rest of it.
-    let fragment_keys = within_budget(due_fragments, BLOCK_BYTES / 2);
-    let used = fragment_keys
-        .iter()
-        .map(|key| bincode::serialized_size(&node.fragment_mempool[key]).unwrap_or(0))
-        .sum::<u64>();
-    let txs = within_budget(due, BLOCK_BYTES - used)
-        .into_iter()
-        .filter_map(|id| node.mempool.remove(&id))
-        .filter(|tx| !executor.is_executed(&tx.header.id) && executor.blockhash_valid(&tx.bytes))
-        .collect::<Vec<_>>();
-    let fragments = fragment_keys
-        .into_iter()
-        .filter_map(|key| node.fragment_mempool.remove(&key))
-        .collect::<Vec<_>>();
-    let items = txs
-        .iter()
-        .map(|tx| (tx.header.fee_payer.clone(), q as u8, 1u64))
-        .chain(fragments.iter().map(|f| (f.header.fee_payer.clone(), q as u8, 1u64)))
-        .collect::<Vec<_>>();
-    let mut admitted = executor
-        .admit_inclusions(&items, s / 16)
-        .unwrap_or_else(|_| vec![false; items.len()])
-        .into_iter();
-    let txs = txs
-        .into_iter()
-        .filter(|_| admitted.next().unwrap())
-        .collect::<Vec<_>>();
-    let fragments = fragments
-        .into_iter()
-        .filter(|_| admitted.next().unwrap())
-        .collect();
-    for tx in &txs {
-        node.in_flight.insert(tx.header.id.clone(), (s, q, tx.clone()));
-    }
-    (txs, fragments)
+fn pack(node:&mut Node,s:u64,q:usize,censored:Option<&String>)->(Vec<ValidatedTx>,Vec<crate::threshold::VerifiedFragment>) {
+    crate::proposer::pack(node.executor.as_ref().unwrap(),&mut node.mempool,&mut node.fragment_mempool,&mut node.in_flight,s,q,censored)
 }
 /// This callback sees only our own signed envelopes before LocalTransport applies geography.
 /// Mempool submissions are not needed for replay: their transactions/fragments ride in blocks.
@@ -573,7 +499,9 @@ fn observer_packet_slot(bytes: &[u8]) -> Option<u64> {
         Wire::Equivocation { first,.. } => Some(first.0.slot),
         Wire::Cblock(witness) => Some(witness.block.slot * 4),
         Wire::ValidatorEpoch {snapshot,..} => Some(snapshot.cutoff_slot),
-        Wire::Submit(_) | Wire::SubmitFragment(_) => None,
+        Wire::WindowStart {number,..} => Some(number*16),
+        Wire::Submit(tx) => Some(tx.header.target_slot),
+        Wire::SubmitFragment(fragment) => Some(fragment.header.target_slot),
     }
 }
 
@@ -932,6 +860,9 @@ impl Network {
         for snapshot in nodes[0].executor.as_ref().unwrap().admission_snapshots(&nodes[0].genesis)? {proposer_schedules.learn_admission(snapshot,catalog.clone())?;}
         let proposers = Arc::new(std::sync::RwLock::new(proposer_schedules));
         if let Some(server)=transport.external_server() {
+            server.set_catalog(proposers.read().unwrap().catalog.iter().enumerate().map(|(id,identity)| {
+                let bytes:[u8;32]=bs58::decode(identity).into_vec().expect("committed identity").try_into().expect("identity size");(id,bytes)
+            }).collect())?;
             let (sender,receiver)=mpsc::channel(256);
             server.set_ingress(sender);
             tokio::spawn(member_votes(receiver,transport.clone(),proposers.clone(),gateway.clone(),genesis.as_ref().and_then(|g|g.bridge.as_ref()).map(|rule|rule.chain_tag())));
@@ -1201,16 +1132,21 @@ impl Network {
         self.bridge_deposits.lock().unwrap().range(next..).take(16).map(|(_, c)| c.clone()).collect()
     }
     fn window_json(&self, number: u64) -> Result<Value> {
+        let schedules=self.proposers.read().unwrap();
+        let identities=if schedules.admission_active(number*16/schedules.config.epoch_slots) {
+            schedules.voting_set(number*4)?.0
+        } else {schedules.config.identities.clone()};
         Ok(view::window_json(
             number,
-            &self.window(number)?,
-            &self.identities,
-            &self.proposers.read().unwrap().weights(number)?,
+            &schedules.window(number)?,
+            &identities,
+            &schedules.weights(number)?,
             if self.config.crash_window == Some(number) {
                 Some(self.config.crash_proposer)
             } else {
                 None
             },
+            &schedules.config.identities,
         ))
     }
     pub async fn run(mut self) -> Result<()> {
@@ -1523,7 +1459,7 @@ impl Network {
                 })
             })
             .await??;
-            for to in message.to.into_iter().filter(|to|*to<12) {
+            for to in message.to {
                 let transport = self.transport.clone();
                 let bytes = bytes.clone();
                 self.io_handle.spawn(async move {
@@ -2025,6 +1961,19 @@ impl Network {
         );
         let w = self.window_json(number)?;
         let mut step = Step::new();
+        if self.config.peer_port.is_some() {
+            let schedules=self.proposers.read().unwrap();
+            let drawn=schedules.window(number)?;
+            let hub=schedules.config.hubs.iter().find(|hub|hub.code==drawn.hub_code);
+            if hub.and_then(|hub|hub.members.first()).is_some_and(|member|member.identity==self.identities[id]) {
+                let targets=schedules.ids(number)?.into_iter().filter(|target|*target>=12).collect::<Vec<_>>();
+                if !targets.is_empty() {
+                    let started_at_unix_us=SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64
+                        - Instant::now().saturating_duration_since(start).as_micros() as u64;
+                    step.out.push(Outbox {from:id,to:targets,body:Wire::WindowStart {number,parent,started_at_unix_us}});
+                }
+            }
+        }
         // A transaction this node carried two windows ago that has still not executed went down
         // with a skipped slot: it goes to this window's proposer in the role that carried it.
         let first = number * 16;
@@ -2100,7 +2049,6 @@ impl Network {
                 return self.complete_early(id, s, q, early).await;
             }
         }
-        let key = crypto::fresh_key();
         // Censorship scenario: every proposer of the window but the honest one omits the marked transaction.
         let censored = self
             .config
@@ -2124,111 +2072,14 @@ impl Network {
             None
         };
         let signer = node.key.clone();
-        let (commit, packets) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let chunks = payload
-                .chunks(38_000)
-                .map(|c| c.to_vec())
-                .collect::<Vec<_>>();
-            let count = chunks.len();
-            let mut roots = vec![];
-            let mut packets = vec![];
-            for (slice, plain) in chunks.into_iter().enumerate() {
-                let cipher = crypto::encrypt_slice(&key, s, q, slice as u32, &plain)?;
-                let meta = ShredMeta {
-                    slot: s,
-                    proposer: q,
-                    slice: slice as u32,
-                    final_slice: slice + 1 == count,
-                    key_hash: crypto::hash(&key),
-                    parent: if slice + 1 == count {
-                        parent.map(|p| (p.slot, p.hash))
-                    } else {
-                        None
-                    },
-                    encrypted_len: cipher.len() as u32,
-                };
-                let shreds = crypto::encode_slice(&signer, &meta, &cipher)?;
-                roots.push(shreds[0].root);
-                packets.push(shreds);
-            }
-            let commit = Commitment {
-                slot: s,
-                proposer: q,
-                hash: crypto::hash(&encode(&BlockCommitment {
-                    slot: s,
-                    proposer: q,
-                    key_hash: crypto::hash(&key),
-                    parent,
-                    roots,
-                })?),
-                key_hash: crypto::hash(&key),
-            };
-
-            Ok((commit, packets))
-        })
-        .await??;
-        let node = &mut self.nodes[id];
-        let local = node.slots.entry(s).or_default();
-        local.key = Some(key);
-        local.own_commit = Some(commit.clone());
-        let transport = self.transport.clone();
-        let signer = node.key.clone();
-        // A task streams each slice before the final commitment boundary, without waiting for votes.
-        let start =
-            node.windows[&(s / 16)].start + std::time::Duration::from_micros(s % 16 * 50000);
-        self.exchange
-            .launch(id, s, q, commit, key, start, self.proposer_ids(s / 16)?);
-        let mut pending = vec![];
-        for (index, shreds) in packets.into_iter().enumerate() {
-            pending.push((index, shreds));
-        }
-        let gateway = self.gateway.clone();
-        let identity = self.identities[id].clone();
-        let total = pending.len();
-        tokio::spawn(async move {
-            for (index, shreds) in pending {
-                let when = start
-                    + std::time::Duration::from_micros(
-                        ((index + 1) as u64 * 50000 / total as u64).saturating_sub(1000),
-                    );
-                tokio::time::sleep_until(when.into()).await;
-                let mut groups: BTreeMap<usize, Vec<Shred>> = BTreeMap::new();
-                for shred in &shreds {
-                    groups
-                        .entry(transport.relay(s, index as u32, q, shred.index))
-                        .or_default()
-                        .push(shred.clone());
-                }
-                for (to, group) in groups {
-                    let body = Wire::Shreds(group);
-                    let signature = crypto::sign_bytes(&signer, &encode(&body).unwrap());
-                    let bytes = encode(&Envelope {
-                        from: id,
-                        body,
-                        signature,
-                    })
-                    .unwrap();
-                    let t = transport.clone();
-                    tokio::spawn(async move {
-                        let _ = t.send(id, to, bytes).await;
-                    });
-                }
-                let first = &shreds[0];
-                let data = json!({"proposer":q,"slice":{"index":index,"shredCount":64,"rebuildShreds":32,"bytes":first.meta.encrypted_len,"sentUs":offset(Instant::now(),start),"arrivedUs":0,"merkleRoot":hex::encode(first.root)}});
-                let mut g = gateway.write().await;
-                if let Some(view) = g.slots.get_mut(&s) {
-                    crate::projection::apply(view, "block.slice", &data);
-                }
-                g.emit(
-                    Some(identity.clone()),
-                    Some(s),
-                    "slot",
-                    offset(Instant::now(), start),
-                    "block.slice",
-                    data,
-                );
-            }
-        });
+        let block = tokio::task::spawn_blocking(move || crate::proposer::build_block(&signer,s,q,parent,payload)).await??;
+        let node=&mut self.nodes[id];
+        let local=node.slots.entry(s).or_default();
+        local.key=Some(block.key);
+        local.own_commit=Some(block.commitment.clone());
+        let start=node.windows[&(s/16)].start+std::time::Duration::from_micros(s%16*50_000);
+        self.exchange.launch(id,s,q,block.commitment.clone(),block.key,start,self.proposer_ids(s/16)?);
+        crate::proposer::stream_block(crate::proposer::ProposalLink::Local(self.transport.clone()),id,self.keys[id].clone(),block,start,self.gateway.clone(),self.identities[id].clone());
         Ok(())
     }
     async fn prepare_early(&mut self, id: usize, window: u64) -> Result<()> {
@@ -2248,7 +2099,6 @@ impl Network {
             return Ok(());
         }
         let slot = window * 16;
-        let key = crypto::fresh_key();
         self.retire_builtin(id, slot);
         let node = &mut self.nodes[id];
         let (transactions, fragments) = pack(node, slot, q, None);
@@ -2258,149 +2108,19 @@ impl Network {
             payload.len() <= 1024 * 1024,
             "Proposer block exceeds local size limit"
         );
-        let mut roots = vec![];
-        let mut next_slice = 0;
-        for plain in payload.chunks(38000) {
-            let cipher = crypto::encrypt_slice(&key, slot, q, next_slice, plain)?;
-            let meta = ShredMeta {
-                slot,
-                proposer: q,
-                slice: next_slice,
-                final_slice: false,
-                key_hash: crypto::hash(&key),
-                parent: None,
-                encrypted_len: cipher.len() as u32,
-            };
-            let shreds = crypto::encode_slice(&self.keys[id], &meta, &cipher)?;
-            roots.push(shreds[0].root);
-            self.send_slice(id, slot, q, next_slice, shreds).await?;
-            next_slice += 1;
-        }
-        self.nodes[id].early.insert(
-            window,
-            EarlyBlock {
-                key,
-                roots,
-                next_slice,
-            },
-        );
+        let (early,slices)=crate::proposer::prepare_early_block(&self.keys[id],slot,q,payload)?;
+        let link=crate::proposer::ProposalLink::Local(self.transport.clone());
+        for shreds in slices {crate::proposer::send_slice(&link,id,&self.keys[id],shreds).await?;}
+        self.nodes[id].early.insert(window,early);
         Ok(())
     }
-    async fn complete_early(
-        &mut self,
-        id: usize,
-        s: u64,
-        q: usize,
-        mut early: EarlyBlock,
-    ) -> Result<()> {
-        let run = self.nodes[id].windows[&(s / 16)];
-        let cipher = crypto::encrypt_slice(&early.key, s, q, early.next_slice, &[])?;
-        let meta = ShredMeta {
-            slot: s,
-            proposer: q,
-            slice: early.next_slice,
-            final_slice: true,
-            key_hash: crypto::hash(&early.key),
-            parent: run.parent.map(|p| (p.slot, p.hash)),
-            encrypted_len: cipher.len() as u32,
-        };
-        let shreds = crypto::encode_slice(&self.keys[id], &meta, &cipher)?;
-        early.roots.push(shreds[0].root);
-        let commit = Commitment {
-            slot: s,
-            proposer: q,
-            key_hash: crypto::hash(&early.key),
-            hash: crypto::hash(&encode(&BlockCommitment {
-                slot: s,
-                proposer: q,
-                key_hash: crypto::hash(&early.key),
-                parent: run.parent,
-                roots: early.roots,
-            })?),
-        };
-        self.nodes[id].slots.get_mut(&s).unwrap().own_commit = Some(commit.clone());
-        self.nodes[id].slots.get_mut(&s).unwrap().key = Some(early.key);
-        self.exchange.launch(
-            id,
-            s,
-            q,
-            commit,
-            early.key,
-            run.start,
-            self.proposer_ids(s / 16)?,
-        );
-        let transport = self.transport.clone();
-        let signer = self.keys[id].clone();
-        let gateway = self.gateway.clone();
-        let identity = self.identities[id].clone();
-        tokio::spawn(async move {
-            tokio::time::sleep_until((run.start + std::time::Duration::from_micros(49000)).into())
-                .await;
-            let mut groups: BTreeMap<usize, Vec<Shred>> = BTreeMap::new();
-            for shred in &shreds {
-                groups
-                    .entry(transport.relay(s, early.next_slice, q, shred.index))
-                    .or_default()
-                    .push(shred.clone());
-            }
-            for (to, group) in groups {
-                let t = transport.clone();
-                let body = Wire::Shreds(group);
-                let sig = crypto::sign_bytes(&signer, &encode(&body).unwrap());
-                let bytes = encode(&Envelope {
-                    from: id,
-                    body,
-                    signature: sig,
-                })
-                .unwrap();
-                tokio::spawn(async move {
-                    let _ = t.send(id, to, bytes).await;
-                });
-            }
-            let data = json!({"proposer":q,"slice":{"index":early.next_slice,"shredCount":64,"rebuildShreds":32,"bytes":shreds[0].meta.encrypted_len,"sentUs":offset(Instant::now(),run.start),"arrivedUs":0,"merkleRoot":hex::encode(shreds[0].root)}});
-            let mut g = gateway.write().await;
-            if let Some(view) = g.slots.get_mut(&s) {
-                crate::projection::apply(view, "block.slice", &data);
-            }
-            g.emit(
-                Some(identity),
-                Some(s),
-                "slot",
-                offset(Instant::now(), run.start),
-                "block.slice",
-                data,
-            );
-        });
-        Ok(())
-    }
-    async fn send_slice(
-        &self,
-        id: usize,
-        slot: u64,
-        q: usize,
-        index: u32,
-        shreds: Vec<Shred>,
-    ) -> Result<()> {
-        let mut groups: BTreeMap<usize, Vec<Shred>> = BTreeMap::new();
-        for shred in shreds {
-            groups
-                .entry(self.transport.relay(slot, index, q, shred.index))
-                .or_default()
-                .push(shred);
-        }
-        for (to, group) in groups {
-            let body = Wire::Shreds(group);
-            let signature = crypto::sign_bytes(&self.keys[id], &encode(&body)?);
-            let bytes = encode(&Envelope {
-                from: id,
-                body,
-                signature,
-            })?;
-            let transport = self.transport.clone();
-            tokio::spawn(async move {
-                let _ = transport.send(id, to, bytes).await;
-            });
-        }
+    async fn complete_early(&mut self,id:usize,s:u64,q:usize,early:EarlyBlock)->Result<()> {
+        let run=self.nodes[id].windows[&(s/16)];
+        let block=crate::proposer::complete_early_block(&self.keys[id],s,q,run.parent,early)?;
+        let local=self.nodes[id].slots.get_mut(&s).unwrap();
+        local.own_commit=Some(block.commitment.clone());local.key=Some(block.key);
+        self.exchange.launch(id,s,q,block.commitment.clone(),block.key,run.start,self.proposer_ids(s/16)?);
+        crate::proposer::stream_block(crate::proposer::ProposalLink::Local(self.transport.clone()),id,self.keys[id].clone(),block,run.start,self.gateway.clone(),self.identities[id].clone());
         Ok(())
     }
     async fn receive(&mut self, packet: Received, e: Envelope) -> Result<()> {
@@ -2417,7 +2137,7 @@ impl Network {
         match e.body {
             // A commitment witness shares the wire with votes; every existing validator already
             // computed it locally. It is consumed by external replay, never as consensus input.
-            Wire::Cblock(_) | Wire::ValidatorEpoch {..} => {}
+            Wire::Cblock(_) | Wire::ValidatorEpoch {..} | Wire::WindowStart {..} => {}
             Wire::Submit(tx) => {
                 // Judged by the slot it targets: every actor, not only node zero's, admits submissions.
                 if self.native_cutover_slot().is_some_and(|cut| tx.header.target_slot >= cut) && self.built_in.contains(&tx.header.fee_payer) { return Ok(()) }
@@ -2469,6 +2189,11 @@ impl Network {
                     let s = shred.meta.slot;
                     let q = shred.meta.proposer;
                     ensure!((1..=3).contains(&q), "Invalid proposer");
+                    let origin=self.proposer_ids(s/16)?[q-1];
+                    if id==0 && origin>=12 && self.nodes[id].slots.get(&s).is_none_or(|local|!local.shreds.contains_key(&(q,shred.meta.slice))) {
+                        let at=self.nodes[id].windows.get(&(s/16)).map_or(0,|run|offset(packet.received_at,run.start+std::time::Duration::from_micros(s%16*50_000)));
+                        step.event(s,at,"block.slice",json!({"proposer":q,"slice":{"index":shred.meta.slice,"shredCount":64,"rebuildShreds":32,"bytes":shred.meta.encrypted_len,"sentUs":0,"arrivedUs":at,"merkleRoot":hex::encode(shred.root)}}));
+                    }
 
                     let local = self.nodes[id].slots.entry(s).or_default();
                     let index = (q, shred.meta.slice);
@@ -2501,7 +2226,20 @@ impl Network {
                         let cipher = tokio::task::spawn_blocking(move || {
                             crypto::reconstruct_verified_slice(&pieces)
                         })
-                        .await??;
+                        .await?;
+                        let cipher=match cipher {
+                            Ok(cipher)=>cipher,
+                            Err(error)=>{
+                                local.invalid_reason=Some(error.to_string());local.equivocation=true;
+                                if origin>=12 {
+                                    if let Some(server)=self.transport.external_server() {
+                                        let key:[u8;32]=bs58::decode(&self.identities[origin]).into_vec()?.try_into().unwrap();
+                                        server.reject_identity(&key,"Invalid member codeword");
+                                    }
+                                }
+                                continue;
+                            }
+                        };
                         local.cipher.insert(index, cipher);
                         let meta = shred.meta.clone();
                         local.meta.insert(index, shred.meta);
@@ -3237,7 +2975,10 @@ impl Network {
                 } else {
                     entry.1 |= 1u16 << id;
                     if entry.1 == 4095 {
-                        checks.checked += 1;
+                            let hash=entry.0.clone();
+                            checks.checked += 1;
+                            checks.completed.insert(s,hash);
+                            while checks.completed.len()>FOLLOWER_SLOTS as usize {checks.completed.pop_first();}
                         checks.pending.remove(&s);
                     }
                 }
@@ -3660,6 +3401,11 @@ impl Network {
                             schedules.learn_admission(snapshot.clone(),catalog.clone())?;
                             if publish {step.out.push(Outbox{from:id,to:(0..12).collect(),body:Wire::ValidatorEpoch{snapshot,catalog:catalog.clone()}});}
                         }
+                        if let Some(server)=self.transport.external_server() {
+                            server.set_catalog(schedules.catalog.iter().enumerate().map(|(id,identity)| {
+                                let bytes:[u8;32]=bs58::decode(identity).into_vec().expect("committed identity").try_into().expect("identity size");(id,bytes)
+                            }).collect())?;
+                        }
                     }
                     self.sign_finalized_ancestors(id, block, step)?;
                     let at = self.consensus_time(id, block.slot);
@@ -3833,6 +3579,11 @@ impl Network {
             GatewayCommand::ValidatorSet {epoch,reply} => {
                 let epoch=epoch.unwrap_or_else(||self.latest_started()/self.proposers.read().unwrap().config.epoch_slots);
                 let result=self.validator_set_json(epoch).map_err(|error|error.to_string());let _=reply.send(result);
+            }
+            GatewayCommand::ExecutionAgreement {slot,reply} => {
+                let checks=self.state_checks.lock().unwrap();
+                let value=checks.completed.get(&slot).map_or(Value::Null,|hash|json!({"slot":slot,"stateHash":hash,"validators":12,"matching":true,"mismatches":checks.mismatches}));
+                let _=reply.send(Ok(value));
             }
             GatewayCommand::ProposerEpoch { epoch, reply } => {
                 let result = self.proposers.read().unwrap().epoch(epoch).map_err(|error| error.to_string());
@@ -4329,37 +4080,88 @@ fn catalog_key(schedules:&ProposerSchedules,id:usize)->Result<ed25519_dalek::Ver
     let bytes:[u8;32]=bs58::decode(identity).into_vec()?.try_into().map_err(|_|anyhow::anyhow!("Invalid identity"))?;
     Ok(ed25519_dalek::VerifyingKey::from_bytes(&bytes)?)
 }
-/// The public link's only consensus input is a signed vote from an effective frozen member.
+/// Members submit the same signed proposer envelopes as genesis actors. The link boundary
+/// validates the frozen identity, scheduled role and recipients before any validator sees them.
 async fn member_votes(mut incoming:mpsc::Receiver<acrux_transport::external::ExternalIngress>,transport:Arc<LocalTransport>,
     schedules:Arc<std::sync::RwLock<ProposerSchedules>>,gateway:crate::gateway::SharedGateway,chain_tag:Option<[u8;32]>) {
     while let Some(input)=incoming.recv().await {
         let started=gateway.read().await.current_window["number"].as_u64().unwrap_or(0)*4;
-        let checked=(||->Result<Envelope>{
-            use bincode::Options;
-            ensure!(input.envelope.len()<=2048,"Member vote frame too large");
-            let envelope:Envelope=bincode::DefaultOptions::new().with_fixint_encoding().with_limit(2048).reject_trailing_bytes().deserialize(&input.envelope)?;
-            let Wire::Vote(signed)=&envelope.body else {anyhow::bail!("Only member votes are accepted")};
-            ensure!(signed.vote.slot<=started+4 && signed.vote.slot.saturating_add(600)>=started,"Member vote outside the live window");
-            let schedules=schedules.read().unwrap();
-            let (identities,_)=schedules.voting_set(signed.vote.slot)?;
+        let checked=(||->Result<(usize,Vec<usize>)>{
+            ensure!(input.envelope.len()<=1024*1024,"Member frame too large");
+            let envelope:Envelope=decode(&input.envelope)?;
+            let frozen=schedules.read().unwrap();
             let identity=bs58::encode(input.identity).into_string();
-            ensure!(identities.get(signed.vote.validator)==Some(&identity) && schedules.catalog.get(envelope.from)==Some(&identity),"Identity is not a voter in this epoch");
-            let epoch=signed.vote.slot*4/schedules.config.epoch_slots;
-            let member=schedules.admissions.get(&epoch).and_then(|set|set.members.iter().find(|member|member.identity.to_bytes()==input.identity)).context("Observer is not admitted")?;
+            ensure!(frozen.catalog.get(envelope.from)==Some(&identity),"Wrong member envelope identity");
+            let (slot,allowed)=match &envelope.body {
+                Wire::Vote(signed)=> {
+                    ensure!(input.envelope.len()<=2048 && input.recipients.is_none(),"Invalid vote route");
+                    ensure!(signed.vote.slot<=started+4 && signed.vote.slot.saturating_add(600)>=started,"Member vote outside the live window");
+                    let (identities,_)=frozen.voting_set(signed.vote.slot)?;
+                    ensure!(identities.get(signed.vote.validator)==Some(&identity),"Identity is not a voter in this epoch");
+                    let key=ed25519_dalek::VerifyingKey::from_bytes(&input.identity)?;
+                    let mut message=chain_tag.map_or_else(Vec::new,|tag|tag.to_vec());message.extend_from_slice(&encode(&signed.vote)?);
+                    crypto::verify_bytes(&key,&message,&signed.signature)?;
+                    remember_verified(crypto::hash(&[key.as_bytes().as_slice(),&message,&signed.signature].concat()));
+                    (signed.vote.slot*4,(0..12).collect::<Vec<_>>())
+                },
+                Wire::Commit(commitment)=> {
+                    let ids=frozen.ids(commitment.slot/16)?;
+                    ensure!((1..=3).contains(&commitment.proposer)&&ids[commitment.proposer-1]==envelope.from,"Unscheduled commitment");
+                    (commitment.slot,ids.into_iter().filter(|id|*id!=envelope.from).collect())
+                },
+                Wire::Attest(attestation)=> {
+                    let ids=frozen.ids(attestation.slot/16)?;
+                    ensure!((1..=3).contains(&attestation.proposer)&&ids[attestation.proposer-1]==envelope.from&&attestation.pi.len()==3,"Unscheduled attestation");
+                    (attestation.slot,(0..12).collect())
+                },
+                Wire::Shreds(shreds)=> {
+                    let first=shreds.first().context("Empty member shred group")?;
+                    ensure!(first.meta.slice<(1024usize*1024).div_ceil(38_000)as u32+1,"Member block has too many slices");
+                    let ids=frozen.ids(first.meta.slot/16)?;
+                    ensure!((1..=3).contains(&first.meta.proposer)&&ids[first.meta.proposer-1]==envelope.from,"Unscheduled block");
+                    let relay=transport.relay(first.meta.slot,first.meta.slice,first.meta.proposer,first.index);
+                    let mut indices=BTreeSet::new();
+                    ensure!(shreds.len()<=64 && shreds.iter().all(|shred|indices.insert(shred.index)&&shred.meta==first.meta&&shred.root==first.root&&transport.relay(shred.meta.slot,shred.meta.slice,shred.meta.proposer,shred.index)==relay),"Invalid member shred route");
+                    (first.meta.slot,vec![relay])
+                },
+                _=>anyhow::bail!("Invalid member proposer frame"),
+            };
+            if !matches!(envelope.body,Wire::Vote(_)) {
+                ensure!(slot.saturating_add(64)>=started*4 && slot<=started*4+32,"Member block outside the live window");
+            }
+            let epoch=slot/frozen.config.epoch_slots;
+            let member=frozen.admissions.get(&epoch).and_then(|set|set.members.iter().find(|member|member.identity.to_bytes()==input.identity)).context("Observer is not admitted")?;
             ensure!(member.hub==input.hub,"Member link names another hub");
-            let key=ed25519_dalek::VerifyingKey::from_bytes(&input.identity)?;
-            crypto::verify_bytes(&key,&encode(&envelope.body)?,&envelope.signature)?;
-            let mut message=vec![];
-            if let Some(tag)=chain_tag {message.extend_from_slice(&tag);}
-            message.extend_from_slice(&encode(&signed.vote)?);
-            crypto::verify_bytes(&key,&message,&signed.signature)?;
-            remember_verified(crypto::hash(&input.envelope));
-            remember_verified(crypto::hash(&[key.as_bytes().as_slice(),&message,&signed.signature].concat()));
-            Ok(envelope)
+            let targets=if let Some(targets)=&input.recipients {
+                ensure!(!targets.is_empty()&&targets.iter().all(|to|allowed.contains(to)),"Invalid member recipients");targets.clone()
+            }else {allowed};
+            drop(frozen);
+            authenticate(Received {from:envelope.from,to:0,payload:input.envelope.clone(),received_at:input.received_at},&[],&schedules)?;
+            Ok((envelope.from,targets))
         })();
         match checked {
-            Ok(envelope)=>for to in 0..12 {if transport.inject_external(envelope.from,to,input.envelope.clone()).is_err(){input.reject("Member vote receive capacity exceeded");break}},
-            Err(_)=>input.reject("Unadmitted or invalid member vote"),
+            Ok((from,targets))=>{
+                // The outside send clock is not a measured host timestamp. Publish its
+                // signed commitment with an unknown (zero) send offset; arrivals below
+                // retain the actual socket time used by the common exchange deadline.
+                if let Wire::Commit(commitment)=decode::<Envelope>(&input.envelope).unwrap().body {
+                    let mut g=gateway.write().await;
+                    if let Some(view)=g.slots.get_mut(&commitment.slot) {
+                        if view["blocks"][commitment.proposer-1]["commitment"].is_null() {
+                            let data=json!({"slot":commitment.slot,"proposer":commitment.proposer,"hash":hex::encode(commitment.hash),"keyHash":hex::encode(commitment.key_hash),"signature":bs58::encode(decode::<Envelope>(&input.envelope).unwrap().signature).into_string(),"sentUs":0,"arrivals":[]});
+                            crate::projection::apply(view,"commitment.sent",&data);
+                            g.emit(Some(bs58::encode(input.identity).into_string()),Some(commitment.slot),"slot",0,"commitment.sent",data);
+                        }
+                    }
+                }
+                for to in targets {
+                let result=if to<12 {transport.inject_external_at(from,to,input.envelope.clone(),input.received_at)} else {
+                    if let Some(server)=transport.external_server() {server.publish(from,to,observer_packet_slot(&input.envelope).unwrap(),Arc::new(input.envelope.clone()));} Ok(())
+                };
+                if result.is_err(){input.reject("Member receive capacity exceeded");break}
+                }
+            },
+            Err(error)=>{tracing::debug!(%error,"member frame rejected");input.reject("Unadmitted or invalid member proposer frame");},
         }
     }
 }
@@ -4484,6 +4286,7 @@ fn threshold_transaction(
 #[derive(Default)]
 struct StateChecks {
     pending: BTreeMap<u64, (String, u16)>,
+    completed: BTreeMap<u64,String>,
     checked: u64,
     mismatches: u64,
 }

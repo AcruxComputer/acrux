@@ -4,6 +4,8 @@ pub mod facts;
 pub mod cli;
 pub mod carry;
 pub mod propose;
+pub mod proposer;
+pub mod external_proposer;
 pub mod gateway;
 pub mod genesis;
 pub mod lab;

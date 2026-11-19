@@ -3,7 +3,7 @@
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "info": {
     "title": "Acrux API",
-    "version": "0.1.25",
+    "version": "0.1.26",
     "description": "Round 1 fixture contract. Amounts are decimal integer strings. Times are relative microseconds with UTC slot wallTime."
   },
   "servers": [
@@ -9732,6 +9732,13 @@
                         "late",
                         "crashed"
                       ]
+                    },
+                    "validatorKind": {
+                      "type": "string",
+                      "enum": [
+                        "genesis",
+                        "external"
+                      ]
                     }
                   },
                   "required": [
@@ -9829,6 +9836,13 @@
                               "online",
                               "late",
                               "crashed"
+                            ]
+                          },
+                          "validatorKind": {
+                            "type": "string",
+                            "enum": [
+                              "genesis",
+                              "external"
                             ]
                           }
                         },
@@ -10149,6 +10163,13 @@
                           {
                             "type": "null"
                           }
+                        ]
+                      },
+                      "validatorKind": {
+                        "type": "string",
+                        "enum": [
+                          "genesis",
+                          "external"
                         ]
                       }
                     },
@@ -10964,6 +10985,13 @@
                           "late",
                           "crashed"
                         ]
+                      },
+                      "validatorKind": {
+                        "type": "string",
+                        "enum": [
+                          "genesis",
+                          "external"
+                        ]
                       }
                     },
                     "required": [
@@ -11419,6 +11447,13 @@
               "late",
               "crashed"
             ]
+          },
+          "validatorKind": {
+            "type": "string",
+            "enum": [
+              "genesis",
+              "external"
+            ]
           }
         },
         "required": [
@@ -11710,6 +11745,13 @@
               {
                 "type": "null"
               }
+            ]
+          },
+          "validatorKind": {
+            "type": "string",
+            "enum": [
+              "genesis",
+              "external"
             ]
           }
         },
@@ -13141,6 +13183,13 @@
                           "late",
                           "crashed"
                         ]
+                      },
+                      "validatorKind": {
+                        "type": "string",
+                        "enum": [
+                          "genesis",
+                          "external"
+                        ]
                       }
                     },
                     "required": [
@@ -13437,6 +13486,13 @@
                         "online",
                         "late",
                         "crashed"
+                      ]
+                    },
+                    "validatorKind": {
+                      "type": "string",
+                      "enum": [
+                        "genesis",
+                        "external"
                       ]
                     }
                   },
@@ -13757,6 +13813,13 @@
                     {
                       "type": "null"
                     }
+                  ]
+                },
+                "validatorKind": {
+                  "type": "string",
+                  "enum": [
+                    "genesis",
+                    "external"
                   ]
                 }
               },
@@ -14875,6 +14938,13 @@
                     "late",
                     "crashed"
                   ]
+                },
+                "validatorKind": {
+                  "type": "string",
+                  "enum": [
+                    "genesis",
+                    "external"
+                  ]
                 }
               },
               "required": [
@@ -15369,6 +15439,13 @@
                     "late",
                     "crashed"
                   ]
+                },
+                "validatorKind": {
+                  "type": "string",
+                  "enum": [
+                    "genesis",
+                    "external"
+                  ]
                 }
               },
               "required": [
@@ -15520,6 +15597,13 @@
                                 "late",
                                 "crashed"
                               ]
+                            },
+                            "validatorKind": {
+                              "type": "string",
+                              "enum": [
+                                "genesis",
+                                "external"
+                              ]
                             }
                           },
                           "required": [
@@ -15617,6 +15701,13 @@
                                       "online",
                                       "late",
                                       "crashed"
+                                    ]
+                                  },
+                                  "validatorKind": {
+                                    "type": "string",
+                                    "enum": [
+                                      "genesis",
+                                      "external"
                                     ]
                                   }
                                 },
@@ -15937,6 +16028,13 @@
                                   {
                                     "type": "null"
                                   }
+                                ]
+                              },
+                              "validatorKind": {
+                                "type": "string",
+                                "enum": [
+                                  "genesis",
+                                  "external"
                                 ]
                               }
                             },
@@ -16752,6 +16850,13 @@
                                   "late",
                                   "crashed"
                                 ]
+                              },
+                              "validatorKind": {
+                                "type": "string",
+                                "enum": [
+                                  "genesis",
+                                  "external"
+                                ]
                               }
                             },
                             "required": [
@@ -17090,6 +17195,13 @@
                                     "late",
                                     "crashed"
                                   ]
+                                },
+                                "validatorKind": {
+                                  "type": "string",
+                                  "enum": [
+                                    "genesis",
+                                    "external"
+                                  ]
                                 }
                               },
                               "required": [
@@ -17187,6 +17299,13 @@
                                           "online",
                                           "late",
                                           "crashed"
+                                        ]
+                                      },
+                                      "validatorKind": {
+                                        "type": "string",
+                                        "enum": [
+                                          "genesis",
+                                          "external"
                                         ]
                                       }
                                     },
@@ -17507,6 +17626,13 @@
                                       {
                                         "type": "null"
                                       }
+                                    ]
+                                  },
+                                  "validatorKind": {
+                                    "type": "string",
+                                    "enum": [
+                                      "genesis",
+                                      "external"
                                     ]
                                   }
                                 },
@@ -18322,6 +18448,13 @@
                                       "late",
                                       "crashed"
                                     ]
+                                  },
+                                  "validatorKind": {
+                                    "type": "string",
+                                    "enum": [
+                                      "genesis",
+                                      "external"
+                                    ]
                                   }
                                 },
                                 "required": [
@@ -18898,6 +19031,13 @@
                             "late",
                             "crashed"
                           ]
+                        },
+                        "validatorKind": {
+                          "type": "string",
+                          "enum": [
+                            "genesis",
+                            "external"
+                          ]
                         }
                       },
                       "required": [
@@ -19053,6 +19193,13 @@
                                 "online",
                                 "late",
                                 "crashed"
+                              ]
+                            },
+                            "validatorKind": {
+                              "type": "string",
+                              "enum": [
+                                "genesis",
+                                "external"
                               ]
                             }
                           },
@@ -19373,6 +19520,13 @@
                             {
                               "type": "null"
                             }
+                          ]
+                        },
+                        "validatorKind": {
+                          "type": "string",
+                          "enum": [
+                            "genesis",
+                            "external"
                           ]
                         }
                       },
@@ -21624,6 +21778,13 @@
                                 "late",
                                 "crashed"
                               ]
+                            },
+                            "validatorKind": {
+                              "type": "string",
+                              "enum": [
+                                "genesis",
+                                "external"
+                              ]
                             }
                           },
                           "required": [
@@ -21943,6 +22104,13 @@
                             {
                               "type": "null"
                             }
+                          ]
+                        },
+                        "validatorKind": {
+                          "type": "string",
+                          "enum": [
+                            "genesis",
+                            "external"
                           ]
                         }
                       },
@@ -23713,6 +23881,13 @@
                             "late",
                             "crashed"
                           ]
+                        },
+                        "validatorKind": {
+                          "type": "string",
+                          "enum": [
+                            "genesis",
+                            "external"
+                          ]
                         }
                       },
                       "required": [
@@ -24911,6 +25086,13 @@
                                       "late",
                                       "crashed"
                                     ]
+                                  },
+                                  "validatorKind": {
+                                    "type": "string",
+                                    "enum": [
+                                      "genesis",
+                                      "external"
+                                    ]
                                   }
                                 },
                                 "required": [
@@ -25008,6 +25190,13 @@
                                             "online",
                                             "late",
                                             "crashed"
+                                          ]
+                                        },
+                                        "validatorKind": {
+                                          "type": "string",
+                                          "enum": [
+                                            "genesis",
+                                            "external"
                                           ]
                                         }
                                       },
@@ -25328,6 +25517,13 @@
                                         {
                                           "type": "null"
                                         }
+                                      ]
+                                    },
+                                    "validatorKind": {
+                                      "type": "string",
+                                      "enum": [
+                                        "genesis",
+                                        "external"
                                       ]
                                     }
                                   },
@@ -26143,6 +26339,13 @@
                                         "late",
                                         "crashed"
                                       ]
+                                    },
+                                    "validatorKind": {
+                                      "type": "string",
+                                      "enum": [
+                                        "genesis",
+                                        "external"
+                                      ]
                                     }
                                   },
                                   "required": [
@@ -26481,6 +26684,13 @@
                                           "late",
                                           "crashed"
                                         ]
+                                      },
+                                      "validatorKind": {
+                                        "type": "string",
+                                        "enum": [
+                                          "genesis",
+                                          "external"
+                                        ]
                                       }
                                     },
                                     "required": [
@@ -26578,6 +26788,13 @@
                                                 "online",
                                                 "late",
                                                 "crashed"
+                                              ]
+                                            },
+                                            "validatorKind": {
+                                              "type": "string",
+                                              "enum": [
+                                                "genesis",
+                                                "external"
                                               ]
                                             }
                                           },
@@ -26898,6 +27115,13 @@
                                             {
                                               "type": "null"
                                             }
+                                          ]
+                                        },
+                                        "validatorKind": {
+                                          "type": "string",
+                                          "enum": [
+                                            "genesis",
+                                            "external"
                                           ]
                                         }
                                       },
@@ -27713,6 +27937,13 @@
                                             "late",
                                             "crashed"
                                           ]
+                                        },
+                                        "validatorKind": {
+                                          "type": "string",
+                                          "enum": [
+                                            "genesis",
+                                            "external"
+                                          ]
                                         }
                                       },
                                       "required": [
@@ -28289,6 +28520,13 @@
                                   "late",
                                   "crashed"
                                 ]
+                              },
+                              "validatorKind": {
+                                "type": "string",
+                                "enum": [
+                                  "genesis",
+                                  "external"
+                                ]
                               }
                             },
                             "required": [
@@ -28444,6 +28682,13 @@
                                       "online",
                                       "late",
                                       "crashed"
+                                    ]
+                                  },
+                                  "validatorKind": {
+                                    "type": "string",
+                                    "enum": [
+                                      "genesis",
+                                      "external"
                                     ]
                                   }
                                 },
@@ -28764,6 +29009,13 @@
                                   {
                                     "type": "null"
                                   }
+                                ]
+                              },
+                              "validatorKind": {
+                                "type": "string",
+                                "enum": [
+                                  "genesis",
+                                  "external"
                                 ]
                               }
                             },
@@ -31015,6 +31267,13 @@
                                       "late",
                                       "crashed"
                                     ]
+                                  },
+                                  "validatorKind": {
+                                    "type": "string",
+                                    "enum": [
+                                      "genesis",
+                                      "external"
+                                    ]
                                   }
                                 },
                                 "required": [
@@ -31334,6 +31593,13 @@
                                   {
                                     "type": "null"
                                   }
+                                ]
+                              },
+                              "validatorKind": {
+                                "type": "string",
+                                "enum": [
+                                  "genesis",
+                                  "external"
                                 ]
                               }
                             },
@@ -33104,6 +33370,13 @@
                                   "late",
                                   "crashed"
                                 ]
+                              },
+                              "validatorKind": {
+                                "type": "string",
+                                "enum": [
+                                  "genesis",
+                                  "external"
+                                ]
                               }
                             },
                             "required": [
@@ -34592,6 +34865,13 @@
                           "late",
                           "crashed"
                         ]
+                      },
+                      "validatorKind": {
+                        "type": "string",
+                        "enum": [
+                          "genesis",
+                          "external"
+                        ]
                       }
                     },
                     "required": [
@@ -34688,6 +34968,13 @@
                                 "online",
                                 "late",
                                 "crashed"
+                              ]
+                            },
+                            "validatorKind": {
+                              "type": "string",
+                              "enum": [
+                                "genesis",
+                                "external"
                               ]
                             }
                           },
@@ -35008,6 +35295,13 @@
                             {
                               "type": "null"
                             }
+                          ]
+                        },
+                        "validatorKind": {
+                          "type": "string",
+                          "enum": [
+                            "genesis",
+                            "external"
                           ]
                         }
                       },
@@ -35822,6 +36116,13 @@
                             "late",
                             "crashed"
                           ]
+                        },
+                        "validatorKind": {
+                          "type": "string",
+                          "enum": [
+                            "genesis",
+                            "external"
+                          ]
                         }
                       },
                       "required": [
@@ -36096,6 +36397,13 @@
                           "online",
                           "late",
                           "crashed"
+                        ]
+                      },
+                      "validatorKind": {
+                        "type": "string",
+                        "enum": [
+                          "genesis",
+                          "external"
                         ]
                       }
                     },
@@ -36416,6 +36724,13 @@
                       {
                         "type": "null"
                       }
+                    ]
+                  },
+                  "validatorKind": {
+                    "type": "string",
+                    "enum": [
+                      "genesis",
+                      "external"
                     ]
                   }
                 },
@@ -37258,6 +37573,13 @@
                             "late",
                             "crashed"
                           ]
+                        },
+                        "validatorKind": {
+                          "type": "string",
+                          "enum": [
+                            "genesis",
+                            "external"
+                          ]
                         }
                       },
                       "required": [
@@ -37577,6 +37899,13 @@
                         {
                           "type": "null"
                         }
+                      ]
+                    },
+                    "validatorKind": {
+                      "type": "string",
+                      "enum": [
+                        "genesis",
+                        "external"
                       ]
                     }
                   },
@@ -38398,6 +38727,13 @@
                       "late",
                       "crashed"
                     ]
+                  },
+                  "validatorKind": {
+                    "type": "string",
+                    "enum": [
+                      "genesis",
+                      "external"
+                    ]
                   }
                 },
                 "required": [
@@ -38496,6 +38832,13 @@
                         "online",
                         "late",
                         "crashed"
+                      ]
+                    },
+                    "validatorKind": {
+                      "type": "string",
+                      "enum": [
+                        "genesis",
+                        "external"
                       ]
                     }
                   },
@@ -38700,6 +39043,13 @@
                       "online",
                       "late",
                       "crashed"
+                    ]
+                  },
+                  "validatorKind": {
+                    "type": "string",
+                    "enum": [
+                      "genesis",
+                      "external"
                     ]
                   }
                 },
@@ -40031,6 +40381,13 @@
                                         "late",
                                         "crashed"
                                       ]
+                                    },
+                                    "validatorKind": {
+                                      "type": "string",
+                                      "enum": [
+                                        "genesis",
+                                        "external"
+                                      ]
                                     }
                                   },
                                   "required": [
@@ -40127,6 +40484,13 @@
                                               "online",
                                               "late",
                                               "crashed"
+                                            ]
+                                          },
+                                          "validatorKind": {
+                                            "type": "string",
+                                            "enum": [
+                                              "genesis",
+                                              "external"
                                             ]
                                           }
                                         },
@@ -40447,6 +40811,13 @@
                                           {
                                             "type": "null"
                                           }
+                                        ]
+                                      },
+                                      "validatorKind": {
+                                        "type": "string",
+                                        "enum": [
+                                          "genesis",
+                                          "external"
                                         ]
                                       }
                                     },
@@ -41261,6 +41632,13 @@
                                           "late",
                                           "crashed"
                                         ]
+                                      },
+                                      "validatorKind": {
+                                        "type": "string",
+                                        "enum": [
+                                          "genesis",
+                                          "external"
+                                        ]
                                       }
                                     },
                                     "required": [
@@ -41597,6 +41975,13 @@
                                             "late",
                                             "crashed"
                                           ]
+                                        },
+                                        "validatorKind": {
+                                          "type": "string",
+                                          "enum": [
+                                            "genesis",
+                                            "external"
+                                          ]
                                         }
                                       },
                                       "required": [
@@ -41693,6 +42078,13 @@
                                                   "online",
                                                   "late",
                                                   "crashed"
+                                                ]
+                                              },
+                                              "validatorKind": {
+                                                "type": "string",
+                                                "enum": [
+                                                  "genesis",
+                                                  "external"
                                                 ]
                                               }
                                             },
@@ -42013,6 +42405,13 @@
                                               {
                                                 "type": "null"
                                               }
+                                            ]
+                                          },
+                                          "validatorKind": {
+                                            "type": "string",
+                                            "enum": [
+                                              "genesis",
+                                              "external"
                                             ]
                                           }
                                         },
@@ -42827,6 +43226,13 @@
                                               "late",
                                               "crashed"
                                             ]
+                                          },
+                                          "validatorKind": {
+                                            "type": "string",
+                                            "enum": [
+                                              "genesis",
+                                              "external"
+                                            ]
                                           }
                                         },
                                         "required": [
@@ -43401,6 +43807,13 @@
                                     "late",
                                     "crashed"
                                   ]
+                                },
+                                "validatorKind": {
+                                  "type": "string",
+                                  "enum": [
+                                    "genesis",
+                                    "external"
+                                  ]
                                 }
                               },
                               "required": [
@@ -43555,6 +43968,13 @@
                                         "online",
                                         "late",
                                         "crashed"
+                                      ]
+                                    },
+                                    "validatorKind": {
+                                      "type": "string",
+                                      "enum": [
+                                        "genesis",
+                                        "external"
                                       ]
                                     }
                                   },
@@ -43875,6 +44295,13 @@
                                     {
                                       "type": "null"
                                     }
+                                  ]
+                                },
+                                "validatorKind": {
+                                  "type": "string",
+                                  "enum": [
+                                    "genesis",
+                                    "external"
                                   ]
                                 }
                               },
@@ -46125,6 +46552,13 @@
                                         "late",
                                         "crashed"
                                       ]
+                                    },
+                                    "validatorKind": {
+                                      "type": "string",
+                                      "enum": [
+                                        "genesis",
+                                        "external"
+                                      ]
                                     }
                                   },
                                   "required": [
@@ -46444,6 +46878,13 @@
                                     {
                                       "type": "null"
                                     }
+                                  ]
+                                },
+                                "validatorKind": {
+                                  "type": "string",
+                                  "enum": [
+                                    "genesis",
+                                    "external"
                                   ]
                                 }
                               },
@@ -48212,6 +48653,13 @@
                                     "online",
                                     "late",
                                     "crashed"
+                                  ]
+                                },
+                                "validatorKind": {
+                                  "type": "string",
+                                  "enum": [
+                                    "genesis",
+                                    "external"
                                   ]
                                 }
                               },

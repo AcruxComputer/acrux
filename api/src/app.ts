@@ -9,7 +9,7 @@ import {
 } from '@acrux/contract'
 import {
   facts, faucetGrant, faucetStatus, fixtureErrors, hubs, labRuns, labRunsByState,
-  makeFixtureTransaction, makeLabReplay, makeSchedulePreview, registryConfig, scenarios,
+  makeFixtureTransaction, makeLabReplay, makeSchedulePreview, registryConfig, scenarios, externalBlockTransaction,
   specMap, transactionsByState, replayRange, replaySlot, burnNoEpochs, burnPending, burnBurned, burnRunning, bridgeFixture, bridgeWaitingFixture, bridgeTransfersFixture,
 } from '@acrux/contract/fixtures'
 import { createApi } from './engines/server/app.js'
@@ -112,6 +112,7 @@ export function createFixtureApi() {
   app.get('/v1/spec', c => c.json(specMap))
   app.get('/v1/transactions/:id', async c => {
     const id = readParam(c, 'id', TxId), state = c.get('scenario')
+    if (id === externalBlockTransaction.header.id) return c.json(externalBlockTransaction)
     if (state && Object.hasOwn(transactionsByState, state)) return c.json(makeFixtureTransaction(state as Transaction['state'], 64, id))
     if (id === transactionsByState.finalized.header.id) return c.json(transactionsByState.finalized)
     try { return c.json(await gateway.call('getTransaction', { id })) }

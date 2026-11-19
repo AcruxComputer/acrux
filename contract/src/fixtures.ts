@@ -48,6 +48,7 @@ function makeHub(code: string, name: string, region: string, latitude: number, l
     chain: 'acrux', identity: fixtureAddress(`${code}-validator-${i + 1}`), hubCode: code, stake: stake.toString(),
     proposerStake: (stake > cap ? cap : stake).toString(), capped: stake > cap,
     effectiveEpoch: 41, joinedEpoch: 40, pendingMove: null, pendingLeave: false, cooldownUntilEpoch: 41,
+    validatorKind: ['FRA', 'NYC', 'TYO'].includes(code) ? 'genesis' : 'external', admittedAtEpoch: ['FRA', 'NYC', 'TYO'].includes(code) ? 41 : null,
   }))
   return { chain: 'acrux', code, name, region, latitude, longitude, ecef: ecef(latitude, longitude),
     registrant: fixtureAddress(`${code}-registrant`), depositLamports: '1000000000', members,
@@ -90,7 +91,7 @@ function proposers(hub: Hub, seed: string | number): Proposer[] {
     cumulative += Number(member.proposerStake)
     if (next < cumulative && chosen.length < 3) { chosen.push(member); next += cap }
   }
-  return shuffle(chosen, rng).map((member, i) => ({ index: i + 1, identity: member.identity, stake: member.stake, status: 'online' }))
+  return shuffle(chosen, rng).map((member, i) => ({ index: i + 1, identity: member.identity, stake: member.stake, status: 'online', validatorKind: member.validatorKind }))
 }
 export function makeFixtureWindow(number: number): Window {
   const hub = hubs[number % 3]!
@@ -194,9 +195,14 @@ function fixtureSchedule(txs: MergedTransaction[]): ExecutionSchedule {
   return { algorithm: 4, tracks: 4, capacityCu: 500000, placements,
     gaps: spaces.sort((a, b) => a.track - b.track || a.start - b.start).map(s => ({ track: s.track, startCu: s.start, lengthCu: s.end - s.start })) }
 }
-export type FixtureSlotOptions = { crashedProposer?: number; skipReason?: NonNullable<Slot['skip']>['reason'] }
+export type FixtureSlotOptions = { crashedProposer?: number; externalProposer?: number; skipReason?: NonNullable<Slot['skip']>['reason'] }
 export function makeFixtureSlot(slot = 64, status: Slot['status'] = 'finalized', options: FixtureSlotOptions = {}): Slot {
   const window = makeFixtureWindow(Math.floor(slot / 16)), consensusSlot = Math.floor(slot / 4)
+  if (options.externalProposer) {
+    const proposer = window.proposers[options.externalProposer - 1]!
+    proposer.identity = fixtureAddress(`external-validator-${window.hubCode}`)
+    proposer.validatorKind = 'external'
+  }
   const skipReason = options.skipReason ?? 'disagreeing_vectors', crashed = options.crashedProposer
   if (crashed) window.proposers[crashed - 1]!.status = 'crashed'
   if (status === 'skipped' && !crashed) window.proposers[2]!.status = 'late'
@@ -207,7 +213,7 @@ export function makeFixtureSlot(slot = 64, status: Slot['status'] = 'finalized',
   const arrivalTime = (sender: number, receiver: number) => sends[sender - 1]! + 1400 + receiver * 600
   const starts = [1, 2, 3].map(receiver => Math.min(sends[receiver - 1]!, ...sources.filter(s => s !== receiver).map(s => arrivalTime(s, receiver))))
   const blocks: Slot['blocks'] = window.proposers.map(p => {
-    if (p.index === crashed) return { proposer: p.index, identity: p.identity, status: 'missing', bytes: 0, slices: [], commitment: null, attestation: null, parent: null }
+    if (p.index === crashed) return { proposer: p.index, identity: p.identity, validatorKind: p.validatorKind, status: 'missing', bytes: 0, slices: [], commitment: null, attestation: null, parent: null }
     const sentUs = sends[p.index - 1]!, startUs = starts[p.index - 1]!
     const arrivals = sources.filter(q => q !== p.index).map(receiver => {
       const arrivedUs = arrivalTime(p.index, receiver), receiverStartUs = starts[receiver - 1]!
@@ -219,7 +225,7 @@ export function makeFixtureSlot(slot = 64, status: Slot['status'] = 'finalized',
     const attestedUs = Math.max(sentUs, crashed ? startUs + 20000 : Math.min(startUs + 20000, Math.max(sentUs, ...allArrivals)))
     const attestation = { slot, proposer: p.index, pi, key: toBase64(sampleBytes(`key-${slot}-${p.index}`, 32)), signature: fixtureSignature(`attestation-${slot}-${p.index}`),
       sentUs: attestedUs, validatorArrivals: validators.map((identity, i) => ({ identity, arrivedUs: attestedUs + 12000 + (i % 4) * 1500 + Math.floor(i / 4) * 58000 })) }
-    return { proposer: p.index, identity: p.identity, status: status === 'pending' ? 'streaming' : status === 'skipped' ? 'dropped' : 'accepted', bytes: 115200,
+    return { proposer: p.index, identity: p.identity, validatorKind: p.validatorKind, status: status === 'pending' ? 'streaming' : status === 'skipped' ? 'dropped' : 'accepted', bytes: 115200,
       slices: (status === 'pending' ? [0] : [0, 1, 2]).map(index => ({ index, shredCount: 64 as const, rebuildShreds: 32 as const, bytes: 38400, sentUs: sentUs - (2 - index) * 16000,
         arrivedUs: sentUs - (2 - index) * 16000 + 170000, merkleRoot: fixtureHash(`slice-${slot}-${p.index}-${index}`) })),
       commitment: status === 'pending' ? null : commitment, attestation: status === 'pending' ? null : attestation,
@@ -269,6 +275,7 @@ export const slotsByState = {
   missing_attestation: makeFixtureSlot(70, 'skipped', { skipReason: 'missing_attestation' }),
   equivocation: makeFixtureSlot(70, 'skipped', { skipReason: 'equivocation' }),
   majority_lost: makeFixtureSlot(70, 'skipped', { skipReason: 'majority_lost' }),
+  external: makeFixtureSlot(96, 'finalized', { externalProposer: 1 }),
 }
 export function makeFixtureTransaction(state: Transaction['state'] = 'finalized', slot = 64, id = fixtureHash(`tx-${slot}-0`)): Transaction {
   const target = makeFixtureSlot(slot), first = target.mergedOrder[0]!
@@ -285,6 +292,10 @@ export function makeFixtureTransaction(state: Transaction['state'] = 'finalized'
 }
 export const transactionsByState = Object.fromEntries((['unknown', 'sent', 'partly_included', 'executed', 'finalized', 'failed', 'expired'] as const)
   .map(state => [state, makeFixtureTransaction(state)])) as Record<Transaction['state'], Transaction>
+/** A finalized transaction carried by the accepted external block in the same slot. */
+export const externalBlockSlot = slotsByState.external
+export const externalBlockTransaction: Transaction = { ...makeFixtureTransaction('finalized', externalBlockSlot.slot), receivers: externalBlockSlot.window.proposers }
+export const externalBlockFixture = { slot: externalBlockSlot, transaction: externalBlockTransaction }
 export const scenarios: z.infer<typeof LabScenario>[] = [
   { id: 'last-look', title: 'Last look', description: 'A proposer delays its commitment until the others reveal their keys.', seed: 'acrux-last-look-1', parameters: { attacker: 3, commitmentDelayUs: 28000 }, lemma: 'Lemma 2.3 — Proposal hiding', expectedOutcome: 'The late proposal is dropped and disagreeing vectors produce a skip certificate.' },
   { id: 'censorship', title: 'Censorship', description: 'Two proposers omit a transaction carried by the third.', seed: 'acrux-censorship-1', parameters: { censoringProposers: '1,2', honestProposer: 3 }, lemma: 'Lemma 2.2 — Selective-censorship resistance', expectedOutcome: 'The honest proposer’s transaction enters the agreed xblock and finalizes.' },
@@ -453,7 +464,7 @@ export function makeNetSnapshot(status: NetSnapshot['status'] = 'live'): NetSnap
 
 /** Named entry points for the frontend's at-rest state controls. */
 export const FIXTURE_IDS = {
-  slot: 64, skippedSlot: 70, crashedWindowSlot: 80,
+  slot: 64, skippedSlot: 70, crashedWindowSlot: 80, externalSlot: 96, externalTransaction: fixtureHash('tx-96-0'),
   transaction: fixtureHash('tx-64-0'), sender: fixtureAddress('sender'),
   hub: 'FRA', pendingHub: 'LHR', inactiveHub: 'SIN', run: 'run-last-look',
 } as const

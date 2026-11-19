@@ -10,12 +10,14 @@ pub fn window_json(
     identities: &[String],
     stakes: &[u64],
     crashed: Option<usize>,
+    genesis_identities: &[String],
 ) -> Value {
     let proposers: Vec<Value> = window.proposers.iter().enumerate().map(|(index, identity)| {
         let validator = identities.iter().position(|candidate| candidate == identity)
             .expect("the schedule must contain only configured validators");
         json!({ "index": index + 1, "identity": identity, "stake": stakes[validator].to_string(),
-            "status": if crashed == Some(index + 1) { "crashed" } else { "online" } })
+            "status": if crashed == Some(index + 1) { "crashed" } else { "online" },
+            "validatorKind": if genesis_identities.contains(identity) {"genesis"} else {"external"} })
     }).collect();
     json!({ "number": number, "hubCode": window.hub_code, "firstSlot": number * 16,
         "lastSlot": number * 16 + 15, "consensusSlots": [number * 4, number * 4 + 1, number * 4 + 2, number * 4 + 3],
@@ -31,7 +33,7 @@ pub fn pending_slot(slot: u64, window: Value, wall_time: String) -> Value {
         .expect("window has proposers")
         .iter()
         .map(|proposer| {
-            json!({ "proposer": proposer["index"], "identity": proposer["identity"],
+            json!({ "proposer": proposer["index"], "identity": proposer["identity"], "validatorKind":proposer["validatorKind"],
             "status": if proposer["status"] == "crashed" { "missing" } else { "streaming" },
             "bytes": 0, "slices": [], "commitment": null, "attestation": null, "parent": null })
         })

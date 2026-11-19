@@ -529,10 +529,9 @@ It writes exact signed vote envelopes durably before sending, in
 restarts; its chain-scoped finalized anchor cannot regress, old finalized votes
 are pruned, and conflicting initial/final votes cannot be signed on restart.
 After a move, stop the old command and rerun it with the new `--hub`; the old
-hub connection becomes an observer at the boundary. No proposal, shred or
-attestation from an outside peer is accepted yet. A drawn
-outside proposer is silent until the next build step; other proposers can agree
-without its block or the window may skip. Its stake is still counted honestly.
+hub connection becomes an observer at the boundary. A drawn, admitted member
+builds and signs its own blocks over that same link; admission alone does not
+let it propose in another identity's role.
 
 A missing outside voter contributes no stake. As outside stake approaches 20%,
 80% fast finalization increasingly needs its participation; slow/fallback paths
@@ -561,6 +560,65 @@ local validator and existing native bridge bytecode at 4990. Its header lists
 all explicit local rule values. It starts only loopback net/observer processes,
 then proves a pre-boundary Solana hand-off, an outside Finalize signature counted
 on Solana, and removal after leave. No validator is started or stopped by it.
+
+## Proposing from an outside machine
+
+Node 0.4.26 runs the same `proposer` packer, slice encryption/sealing, Rotor draw
+and `ExchangeEngine` on the member's machine. The gateway routes submissions to
+every selected role, including a direct identity-targeted record in the existing
+64 MiB pull history. Those records enter only that member's own mempool. The
+first twelve validators remain the Rotor relay pool in this step; they forward
+outside shreds through the ordinary validator path. Fees and merge rules are
+unchanged. Slot windows, blocks and transaction receivers explicitly report
+`validatorKind: "genesis" | "external"`.
+
+The hub's fixed genesis representative sends a signed `WindowStart` with the
+window, certified parent and its Unix-microsecond start time. A member maps it
+once to its local monotonic clock. Synchronize the member's system clock with
+NTP: clock error and real link delay both spend its timing budget. The notice's
+arrival never moves the start or extends a deadline. Blocks already past their
+commit point are skipped. Finalized replay still verifies every state hash;
+a separate authenticated commit lane keeps replay work off the hash exchange.
+
+For FRA, delta-local is **10 ms**, so **2 delta-local is 20 ms**, inclusive from
+the first authenticated commitment arrival or the proposer's own actual send.
+Commit is scheduled at slot start + 50 ms. An arrival at +20.000 ms is on time;
++20.001 ms is late. A far operator does not receive a larger budget, and a late
+block follows the same exclusion/skip rules as a late genesis block. This step
+does not publish measured delta-local. Outside send offsets in the explorer's
+slice and commitment records are zero (unknown); their host arrival offsets and
+on-time decisions use actual socket receipt times.
+
+The same identity journal also durably reserves each authored slot before its
+commitment or shreds are sent. Restarting cannot seal a second block for that
+slot. Keep the journal with the identity.
+
+Clients normally use the public gateway. To accept direct submissions as well:
+
+```text
+acrux node propose --hub FRA --identity validator.json --genesis chain/genesis/acrux-net.json --rpc-port 5044
+```
+
+The optional listener uses `ACRUX_BIND` (loopback by default), bounded requests
+and the same transaction validation. It accepts Solana `sendTransaction` and
+Acrux plain/fragment submissions into this member's own mempool. Read executed
+transactions and confirmations from the net's gateway. The public peer port is
+still UDP 4940; no new host port is needed unless the operator exposes its own
+submission listener.
+
+`getExecutionAgreement {slot}` returns null until all twelve hosted validators
+have executed that slot with one state hash, then
+`{slot,stateHash,validators:12,matching:true,mismatches}`. It retains the last
+2,400 completed slots and is an observation, outside consensus state.
+
+The operator-run check is `chain/scripts/native-external-block-check.mjs`, next
+to the admission check. Its header gives explicit local rule values. It admits a
+member, waits up to 120 seconds for a drawn live window, submits a transfer via
+the normal Solana surface, opens the accepted external block, checks both
+co-proposer commitment arrivals, all twelve validator hashes and an independent
+RPC follower. It uses only its own loopback processes and leaves the operator's
+local Solana validator alone. No program rebuild or new placement is needed for this
+step.
 
 ## Measured
 

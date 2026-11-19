@@ -28,7 +28,7 @@ export const PROTOCOL_PARAMETERS: Parameters = {
   timeoutUs: 750000, tracks: 4, reserveLamports: '1000000', trackCapacityCu: null,
   fragmentExpirySlots: null, alpha: null, minimumHubMembers: null, minimumHubStake: null,
 }
-export const Proposer = z.strictObject({ index: ProposerIndex, identity: Address, stake: U64, status: z.enum(['online', 'late', 'crashed']) })
+export const Proposer = z.strictObject({ index: ProposerIndex, identity: Address, stake: U64, status: z.enum(['online', 'late', 'crashed']), validatorKind: z.enum(['genesis', 'external']).optional() })
 export type Proposer = z.infer<typeof Proposer>
 export const Window = z.strictObject({ number: Count, hubCode: HubCode, firstSlot: SlotNumber, lastSlot: SlotNumber, consensusSlots: z.array(Count), proposers: z.array(Proposer).length(3) })
 export type Window = z.infer<typeof Window>
@@ -38,7 +38,7 @@ export const Commitment = z.strictObject({ slot: SlotNumber, proposer: ProposerI
 export type Commitment = z.infer<typeof Commitment>
 export const Attestation = z.strictObject({ slot: SlotNumber, proposer: ProposerIndex, pi: z.array(Hash.nullable()).length(3), key: Base64, signature: Signature, sentUs: Count, validatorArrivals: z.array(z.strictObject({ identity: Address, arrivedUs: Count })) })
 export type Attestation = z.infer<typeof Attestation>
-export const ProposerBlock = z.strictObject({ proposer: ProposerIndex, identity: Address, status: z.enum(['streaming', 'sealed', 'accepted', 'dropped', 'missing']), bytes: Count, slices: z.array(Slice), commitment: Commitment.nullable(), attestation: Attestation.nullable(), parent: z.strictObject({ consensusSlot: Count, hash: Hash }).nullable() })
+export const ProposerBlock = z.strictObject({ proposer: ProposerIndex, identity: Address, status: z.enum(['streaming', 'sealed', 'accepted', 'dropped', 'missing']), bytes: Count, slices: z.array(Slice), commitment: Commitment.nullable(), attestation: Attestation.nullable(), parent: z.strictObject({ consensusSlot: Count, hash: Hash }).nullable(), validatorKind: z.enum(['genesis', 'external']).optional() })
 export type ProposerBlock = z.infer<typeof ProposerBlock>
 /** priorityFeePerCu is an unsigned decimal string of micro-lamports per compute unit. */
 export const TxHeader = z.strictObject({ id: TxId, feePayer: Address, priorityFeePerCu: U64.describe('Micro-lamports per compute unit, encoded as an unsigned decimal string.'), computeLimit: Count.min(1), writableAccounts: z.array(Address), targetSlot: SlotNumber })

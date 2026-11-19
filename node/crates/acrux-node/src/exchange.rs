@@ -16,41 +16,66 @@ use std::{
 };
 use tokio::sync::{Notify, RwLock};
 
+/// Algorithm 1's hash-exchange state, independent of which link carries a commitment.
+#[derive(Clone, Default)]
+pub(crate) struct LocalExchange {
+    pub start: Option<Instant>,
+    pub received: BTreeMap<usize, (Instant, Commitment)>,
+    pub sent: bool,
+}
+impl LocalExchange {
+    /// The first authenticated commitment anchors the same inclusive 2-delta-local deadline.
+    pub fn observe(&mut self, commitment: Commitment, at: Instant) -> bool {
+        if self.received.contains_key(&commitment.proposer) { return false }
+        self.start = Some(self.start.map_or(at,|first| first.min(at)));
+        self.received.insert(commitment.proposer,(at,commitment));
+        true
+    }
+    pub fn sent(&mut self, own: usize, commitment: Commitment, at: Instant) -> bool {
+        if self.sent { return false }
+        self.sent = true;
+        self.start = Some(self.start.map_or(at,|first| first.min(at)));
+        self.received.insert(own,(at,commitment));
+        true
+    }
+    pub fn deadline(&self) -> Option<Instant> { self.start.map(|start| start + Duration::from_millis(20)) }
+    pub fn vector(&self, own: usize, proposers: usize) -> Option<Vec<Option<[u8;32]>>> {
+        if !self.sent { return None }
+        let deadline = self.deadline()?;
+        Some((1..=proposers).map(|role| self.received.get(&role)
+            .filter(|(at,_)| role == own || *at <= deadline)
+            .map(|(_,commitment)|commitment.hash)).collect())
+    }
+}
 #[derive(Default)]
 struct Exchange {
-    start: Option<Instant>,
-    received: BTreeMap<usize, (Instant, Commitment)>,
+    local: LocalExchange,
     signatures: BTreeMap<usize, Vec<u8>>,
     equivocated: bool,
     notify: Arc<Notify>,
-    sent: bool,
     done: bool,
     role: Option<usize>,
 }
 
-impl Exchange {
-    fn attestation_vector(&self, own: usize, proposers: usize) -> Option<Vec<Option<[u8; 32]>>> {
-        if !self.sent {
-            return None;
+#[derive(Clone)]
+enum ExchangeLink {
+    Local(Arc<LocalTransport>),
+    Member(Arc<crate::external::ExternalControl>),
+}
+impl ExchangeLink {
+    async fn send(&self, from: usize, to: usize, bytes: Vec<u8>) -> anyhow::Result<()> {
+        match self {
+            Self::Local(transport) => transport.send(from,to,bytes).await,
+            Self::Member(control) => control.send_to(&[to],&bytes).await,
         }
-        let deadline = self.start? + Duration::from_millis(20);
-        Some(
-            (1..=proposers)
-                .map(|i| {
-                    self.received
-                        .get(&i)
-                        .filter(|(at, _)| i == own || *at <= deadline)
-                        .map(|(_, commitment)| commitment.hash)
-                })
-                .collect(),
-        )
     }
 }
 
 pub struct ExchangeEngine {
     timer_handle: tokio::runtime::Handle,
-    transport: Arc<LocalTransport>,
-    keys: Vec<SigningKey>,
+    transport: ExchangeLink,
+    keys: BTreeMap<usize,SigningKey>,
+    targets: Vec<usize>,
     gateway: Arc<RwLock<GatewayState>>,
     slots: Mutex<BTreeMap<(usize, u64), Exchange>>,
     spreads: Mutex<SpreadMeasurements>,
@@ -77,8 +102,9 @@ impl ExchangeEngine {
     ) -> Arc<Self> {
         Arc::new(Self {
             timer_handle: tokio::runtime::Handle::current(),
-            transport,
-            keys,
+            transport: ExchangeLink::Local(transport),
+            targets: (0..keys.len()).collect(),
+            keys: keys.into_iter().enumerate().collect(),
             gateway,
             slots: Mutex::new(BTreeMap::new()),
             spreads: Mutex::new(SpreadMeasurements::default()),
@@ -87,6 +113,30 @@ impl ExchangeEngine {
             sent_at: Mutex::new(BTreeMap::new()),
             profile,
             fault,
+        })
+    }
+
+    /// Runs the identical commitment/key-release engine on an admitted outside validator.
+    pub fn new_member(
+        id: usize,
+        key: SigningKey,
+        control: Arc<crate::external::ExternalControl>,
+        gateway: Arc<RwLock<GatewayState>>,
+        profile: Arc<Profiling>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            timer_handle: tokio::runtime::Handle::current(),
+            transport: ExchangeLink::Member(control),
+            keys: BTreeMap::from([(id,key)]),
+            targets: (0..12).collect(),
+            gateway,
+            slots: Mutex::new(BTreeMap::new()),
+            spreads: Mutex::new(SpreadMeasurements::default()),
+            omitted: Mutex::new(Vec::new()),
+            commit_times: Mutex::new(BTreeMap::new()),
+            sent_at: Mutex::new(BTreeMap::new()),
+            profile,
+            fault: None,
         })
     }
 
@@ -125,18 +175,13 @@ impl ExchangeEngine {
                 this.profile.record(Some(id),"exchange.state_lock_wait",lock_started.elapsed());
                 slots.retain(|(owner, old), value| *owner!=id || !value.done || *old + 64 >= slot);
                 let exchange = slots.entry((id, slot)).or_default();
-                if exchange.sent {
-                    return;
-                }
-                exchange.sent = true;
+                if !exchange.local.sent(q,commitment.clone(),sent) { return }
                 exchange.role = Some(q);
-                exchange.start = Some(exchange.start.map_or(sent, |first| first.min(sent)));
-                exchange.received.insert(q, (sent, commitment.clone()));
                 exchange.notify.clone()
             };
             let body = Wire::Commit(commitment.clone());
             let bytes = bincode::serialize(&body).unwrap();
-            let signature = crypto::sign_bytes(&this.keys[id], &bytes);
+            let signature = crypto::sign_bytes(&this.keys[&id], &bytes);
             let packet = bincode::serialize(&Envelope {
                 from: id,
                 body,
@@ -156,7 +201,7 @@ impl ExchangeEngine {
                 let mut conflicting = commitment.clone();
                 conflicting.hash[0] ^= 0xff;
                 let body = Wire::Commit(conflicting);
-                let signature = crypto::sign_bytes(&this.keys[id], &bincode::serialize(&body).unwrap());
+                let signature = crypto::sign_bytes(&this.keys[&id], &bincode::serialize(&body).unwrap());
                 let packet = bincode::serialize(&Envelope { from: id, body, signature }).unwrap();
                 for to in recipients.iter().copied() {
                     let transport = this.transport.clone();
@@ -188,8 +233,8 @@ impl ExchangeEngine {
                     let slots = this.slots.lock().unwrap();
                     let exchange = &slots[&(id, slot)];
                     (
-                        exchange.received.len() == co_ids.len(),
-                        exchange.start.unwrap() + Duration::from_millis(20),
+                        exchange.local.received.len() == co_ids.len(),
+                        exchange.local.deadline().unwrap(),
                     )
                 };
                 if all || Instant::now() >= deadline {
@@ -207,15 +252,15 @@ impl ExchangeEngine {
                 }
                 exchange.done = true;
                 if q == 1 {
-                    let first = exchange.received.values().map(|(at, _)| *at).min().unwrap();
-                    let last = exchange.received.values().map(|(at, _)| *at).max().unwrap();
+                    let first = exchange.local.received.values().map(|(at, _)| *at).min().unwrap();
+                    let last = exchange.local.received.values().map(|(at, _)| *at).max().unwrap();
                     let value=offset(last,first);
                     let mut spreads=this.spreads.lock().unwrap();
                     spreads.total+=u128::from(value);
                     spreads.values.push(value);
                 }
-                let pi = exchange
-                    .attestation_vector(q, co_ids.len())
+                let pi = exchange.local
+                    .vector(q, co_ids.len())
                     .expect("the local commitment has been sent");
                 let omitted = pi.iter().any(Option::is_none).then(|| json!({
                     "owner": id,
@@ -223,13 +268,13 @@ impl ExchangeEngine {
                     "proposer": q,
                     "anchor": "slot",
                     "ownSentUs": offset(sent, base),
-                    "startUs": offset(exchange.start.unwrap(), base),
-                    "deadlineUs": offset(exchange.start.unwrap() + Duration::from_millis(20), base),
+                    "startUs": offset(exchange.local.start.unwrap(), base),
+                    "deadlineUs": offset(exchange.local.deadline().unwrap(), base),
                     "decisionUs": offset(attested, base),
-                    "received": exchange.received.iter().map(|(proposer, (at, _))| json!({
+                    "received": exchange.local.received.iter().map(|(proposer, (at, _))| json!({
                         "proposer": proposer,
                         "arrivedUs": offset(*at, base),
-                        "relativeToStartUs": offset(*at, exchange.start.unwrap())
+                        "relativeToStartUs": offset(*at, exchange.local.start.unwrap())
                     })).collect::<Vec<_>>(),
                     "omittedProposers": pi.iter().enumerate().filter_map(|(index, entry)| entry.is_none().then_some(index + 1)).collect::<Vec<_>>()
                 }));
@@ -246,14 +291,14 @@ impl ExchangeEngine {
             };
             let body = Wire::Attest(attestation.clone());
             let encoded = bincode::serialize(&body).unwrap();
-            let signature = crypto::sign_bytes(&this.keys[id], &encoded);
+            let signature = crypto::sign_bytes(&this.keys[&id], &encoded);
             let packet = bincode::serialize(&Envelope {
                 from: id,
                 body,
                 signature: signature.clone(),
             })
             .unwrap();
-            for to in 0..this.keys.len() {
+            for to in this.targets.iter().copied() {
                 let transport = this.transport.clone();
                 let bytes = packet.clone();
                 tokio::spawn(async move {
@@ -324,7 +369,7 @@ impl ExchangeEngine {
                 lock_started.elapsed(),
             );
             let exchange = slots.entry((receiver, slot)).or_default();
-            if let Some(first) = exchange.received.get(&commitment.proposer).map(|(_, c)| c.clone()) {
+            if let Some(first) = exchange.local.received.get(&commitment.proposer).map(|(_, c)| c.clone()) {
                 if first.hash != commitment.hash && !exchange.equivocated {
                     exchange.equivocated = true;
                     let proof = Wire::Equivocation {
@@ -342,17 +387,10 @@ impl ExchangeEngine {
                 "exchange.receive_to_processing",
                 received_at.elapsed(),
             );
-            exchange.start = Some(
-                exchange
-                    .start
-                    .map_or(received_at, |first| first.min(received_at)),
-            );
-            exchange
-                .received
-                .insert(commitment.proposer, (received_at, commitment.clone()));
+            exchange.local.observe(commitment.clone(),received_at);
             (
                 exchange.notify.clone(),
-                exchange.start.unwrap(),
+                exchange.local.start.unwrap(),
                 exchange.role,
             )
         };
@@ -362,7 +400,7 @@ impl ExchangeEngine {
             role
         } else {
             let identity =
-                bs58::encode(self.keys[receiver].verifying_key().as_bytes()).into_string();
+                bs58::encode(self.keys[&receiver].verifying_key().as_bytes()).into_string();
             let g = self.gateway.read().await;
             g.slots
                 .get(&slot)
@@ -383,9 +421,9 @@ impl ExchangeEngine {
 
     /// Sends a message signed by `from` to every validator.
     fn broadcast(&self, from: usize, body: Wire) {
-        let signature = crypto::sign_bytes(&self.keys[from], &bincode::serialize(&body).unwrap());
+        let signature = crypto::sign_bytes(&self.keys[&from], &bincode::serialize(&body).unwrap());
         let packet = bincode::serialize(&Envelope { from, body, signature }).unwrap();
-        for to in 0..self.keys.len() {
+        for to in self.targets.iter().copied() {
             let transport = self.transport.clone();
             let packet = packet.clone();
             tokio::spawn(async move {
@@ -407,7 +445,7 @@ impl ExchangeEngine {
             crate::projection::apply(view, kind, &data);
         }
         gateway.emit(
-            Some(bs58::encode(self.keys[id].verifying_key().as_bytes()).into_string()),
+            Some(bs58::encode(self.keys[&id].verifying_key().as_bytes()).into_string()),
             Some(slot),
             "slot",
             at,
@@ -437,10 +475,10 @@ mod tests {
     fn attestation_uses_first_arrival_anchor_and_inclusive_twenty_ms_deadline() {
         let first = Instant::now();
         let own_sent = first + Duration::from_millis(7);
-        let mut exchange = Exchange {
+        let mut exchange = LocalExchange {
             start: Some(first.min(own_sent)),
             sent: true,
-            ..Exchange::default()
+            ..LocalExchange::default()
         };
         exchange.received.insert(1, (own_sent, commitment(1)));
         exchange
@@ -450,7 +488,7 @@ mod tests {
             .received
             .insert(3, (first + Duration::from_micros(20_001), commitment(3)));
         assert_eq!(
-            exchange.attestation_vector(1, 3),
+            exchange.vector(1, 3),
             Some(vec![Some([1; 32]), Some([2; 32]), None])
         );
         // Anchoring at our own send would wrongly accept proposer 3 for another seven ms.
@@ -460,20 +498,44 @@ mod tests {
     #[test]
     fn key_release_requires_own_commit_and_always_attests_own_block() {
         let first = Instant::now();
-        let mut exchange = Exchange {
+        let mut exchange = LocalExchange {
             start: Some(first),
-            ..Exchange::default()
+            ..LocalExchange::default()
         };
         exchange.received.insert(2, (first, commitment(2)));
-        assert_eq!(exchange.attestation_vector(1, 3), None);
+        assert_eq!(exchange.vector(1, 3), None);
         // Even an adversarially early peer hash cannot erase the local commitment.
         exchange.sent = true;
         exchange
             .received
             .insert(1, (first + Duration::from_millis(25), commitment(1)));
         assert_eq!(
-            exchange.attestation_vector(1, 3),
+            exchange.vector(1, 3),
             Some(vec![Some([1; 32]), Some([2; 32]), None])
         );
     }
+    #[test]
+    fn late_external_commitment_has_the_same_inclusive_deadline_as_genesis() {
+        let first = Instant::now();
+        let mut genesis = LocalExchange::default();
+        let mut external = LocalExchange::default();
+        for exchange in [&mut genesis,&mut external] {
+            exchange.observe(commitment(2),first);
+            assert!(exchange.sent(1,commitment(1),first + Duration::from_millis(7)));
+        }
+        genesis.observe(commitment(3),first + Duration::from_micros(20_001));
+        let mut outside = commitment(3); outside.hash = [77;32];
+        external.observe(outside.clone(),first + Duration::from_micros(20_001));
+        let expected = Some(vec![Some([1;32]),Some([2;32]),None]);
+        assert_eq!(genesis.vector(1,3),expected);
+        assert_eq!(external.vector(1,3),expected,"an outside commitment gets no extra network allowance");
+        assert_eq!(external.deadline(),Some(first + Duration::from_millis(20)));
+        // At exactly 2 delta-local the same outside commitment is included.
+        let mut on_time = LocalExchange::default();
+        on_time.observe(commitment(2),first);
+        on_time.sent(1,commitment(1),first + Duration::from_millis(7));
+        on_time.observe(outside,first + Duration::from_millis(20));
+        assert_eq!(on_time.vector(1,3),Some(vec![Some([1;32]),Some([2;32]),Some([77;32])]));
+    }
+
 }
