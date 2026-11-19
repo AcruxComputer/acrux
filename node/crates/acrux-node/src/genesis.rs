@@ -123,6 +123,9 @@ pub struct BridgeConfig {
     /// Virtual genesis weight, in native lamports; configured as an unsigned decimal string.
     #[serde(default, deserialize_with = "optional_lamports")]
     pub genesis_stake_lamports: Option<u64>,
+    /// Native burned base fees are committed to Solana from this bridge epoch boundary.
+    #[serde(default)]
+    pub fee_burn_from_slot: Option<u64>,
 }
 impl BridgeConfig {
     pub fn chain_tag(&self) -> [u8; 32] { crate::crypto::hash(self.chain_id.as_bytes()) }
@@ -152,6 +155,14 @@ impl BridgeConfig {
             _ => anyhow::bail!("bridge stakeFromSlot and genesisStakeLamports must be configured together"),
         }
     }
+    pub fn fee_burn_activation(&self) -> Result<Option<crate::execution::FeeBurnConfig>> {
+        let Some(slot) = self.fee_burn_from_slot else { return Ok(None) };
+        let native = self.native_cutover()?.context("bridge feeBurnFromSlot requires nativeFromSlot, nativeMint and nativeScale")?;
+        ensure!(self.epoch_slots > 0 && slot % self.epoch_slots == 0, "bridge feeBurnFromSlot must be a bridge epoch boundary");
+        ensure!(slot >= native.slot, "bridge feeBurnFromSlot must be at or after nativeFromSlot");
+        Ok(Some(crate::execution::FeeBurnConfig { from_slot:slot,epoch_slots:self.epoch_slots }))
+    }
+
 }
 fn optional_lamports<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<u64>, D::Error> {
     Option::<String>::deserialize(d)?.map(|amount| {
@@ -198,6 +209,7 @@ fn bridge(chain: &Path) -> Result<Option<BridgeConfig>> {
     ensure!(config.from_slot % 4 == 0, "bridge fromSlot must start at a four-slot cblock boundary");
     config.native_cutover()?;
     config.stake_activation()?;
+    config.fee_burn_activation()?;
     Ok(Some(config))
 }
 

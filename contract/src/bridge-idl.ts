@@ -172,6 +172,158 @@ export const ACRUX_BRIDGE_IDL = {
    "args": []
   },
   {
+   "name": "burn",
+   "docs": [
+    "On Solana: burns an epoch's native base-fee burn from its configured mint's vault.",
+    "The epoch's last cblock commits the amount in Solana mint base units, paid once per epoch."
+   ],
+   "discriminator": [
+    116,
+    110,
+    29,
+    56,
+    107,
+    219,
+    42,
+    93
+   ],
+   "accounts": [
+    {
+     "name": "payer",
+     "writable": true,
+     "signer": true
+    },
+    {
+     "name": "bridge",
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         98,
+         114,
+         105,
+         100,
+         103,
+         101
+        ]
+       }
+      ]
+     }
+    },
+    {
+     "name": "config",
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         102,
+         101,
+         101,
+         95,
+         98,
+         117,
+         114,
+         110,
+         95,
+         99,
+         111,
+         110,
+         102,
+         105,
+         103
+        ]
+       }
+      ]
+     }
+    },
+    {
+     "name": "cblock",
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         99,
+         98,
+         108,
+         111,
+         99,
+         107
+        ]
+       },
+       {
+        "kind": "account",
+        "path": "cblock.hash",
+        "account": "Cblock"
+       }
+      ]
+     }
+    },
+    {
+     "name": "mint",
+     "writable": true,
+     "relations": [
+      "config"
+     ]
+    },
+    {
+     "name": "vault",
+     "writable": true,
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         118,
+         97,
+         117,
+         108,
+         116
+        ]
+       },
+       {
+        "kind": "account",
+        "path": "mint"
+       }
+      ]
+     }
+    },
+    {
+     "name": "burned",
+     "writable": true
+    },
+    {
+     "name": "token_program"
+    },
+    {
+     "name": "system_program",
+     "address": "11111111111111111111111111111111"
+    }
+   ],
+   "args": [
+    {
+     "name": "epoch",
+     "type": "u64"
+    },
+    {
+     "name": "amount",
+     "type": "u64"
+    },
+    {
+     "name": "proof",
+     "type": {
+      "vec": {
+       "defined": {
+        "name": "ProofNode"
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
    "name": "close_cblock",
    "docs": [
     "Returns a posted cblock's rent to its payer. Only its payer can discard it, so another",
@@ -565,6 +717,90 @@ export const ACRUX_BRIDGE_IDL = {
      }
     }
    ]
+  },
+  {
+   "name": "init_fee_burn_config",
+   "docs": [
+    "Fixes the mint whose vault backs native ACRUX fee burns. Only the bridge authority can",
+    "initialize this account, once; later certificates cannot be applied to another mint."
+   ],
+   "discriminator": [
+    107,
+    123,
+    237,
+    170,
+    41,
+    123,
+    67,
+    240
+   ],
+   "accounts": [
+    {
+     "name": "authority",
+     "writable": true,
+     "signer": true,
+     "relations": [
+      "bridge"
+     ]
+    },
+    {
+     "name": "bridge",
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         98,
+         114,
+         105,
+         100,
+         103,
+         101
+        ]
+       }
+      ]
+     }
+    },
+    {
+     "name": "mint"
+    },
+    {
+     "name": "config",
+     "writable": true,
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         102,
+         101,
+         101,
+         95,
+         98,
+         117,
+         114,
+         110,
+         95,
+         99,
+         111,
+         110,
+         102,
+         105,
+         103
+        ]
+       }
+      ]
+     }
+    },
+    {
+     "name": "token_program"
+    },
+    {
+     "name": "system_program",
+     "address": "11111111111111111111111111111111"
+    }
+   ],
+   "args": []
   },
   {
    "name": "init_validator_set",
@@ -1255,6 +1491,19 @@ export const ACRUX_BRIDGE_IDL = {
    ]
   },
   {
+   "name": "Burned",
+   "discriminator": [
+    35,
+    116,
+    220,
+    106,
+    106,
+    147,
+    79,
+    120
+   ]
+  },
+  {
    "name": "Cblock",
    "discriminator": [
     111,
@@ -1278,6 +1527,19 @@ export const ACRUX_BRIDGE_IDL = {
     49,
     189,
     167
+   ]
+  },
+  {
+   "name": "FeeBurnConfig",
+   "discriminator": [
+    219,
+    229,
+    228,
+    240,
+    172,
+    194,
+    150,
+    166
    ]
   },
   {
@@ -1446,6 +1708,21 @@ export const ACRUX_BRIDGE_IDL = {
    "code": 6016,
    "name": "UnbackedNativeWithdrawal",
    "msg": "The native withdrawal exceeds the tokens credited from Solana."
+  },
+  {
+   "code": 6017,
+   "name": "AlreadyBurned",
+   "msg": "This fee-burn epoch has already been burned."
+  },
+  {
+   "code": 6018,
+   "name": "BadFeeBurnEpoch",
+   "msg": "A fee burn belongs to the last cblock of its epoch."
+  },
+  {
+   "code": 6019,
+   "name": "WrongFeeBurnMint",
+   "msg": "Fee burns use the immutable configured native mint."
   }
  ],
  "types": [
@@ -1514,6 +1791,33 @@ export const ACRUX_BRIDGE_IDL = {
        "array": [
         "u8",
         32
+       ]
+      }
+     }
+    ]
+   }
+  },
+  {
+   "name": "Burned",
+   "docs": [
+    "Permanent replay guards for 8,192 fee-burn epochs, at `[\"fee_burn\", epoch / 8192]`."
+   ],
+   "type": {
+    "kind": "struct",
+    "fields": [
+     {
+      "name": "bucket",
+      "type": "u64"
+     },
+     {
+      "name": "bits",
+      "docs": [
+       "Low bit first within each byte; a bit is set only after the burn succeeds."
+      ],
+      "type": {
+       "array": [
+        "u8",
+        1024
        ]
       }
      }
@@ -1653,6 +1957,21 @@ export const ACRUX_BRIDGE_IDL = {
      {
       "name": "slot",
       "type": "u64"
+     }
+    ]
+   }
+  },
+  {
+   "name": "FeeBurnConfig",
+   "docs": [
+    "The immutable Solana mint for native fee burns, at `[\"fee_burn_config\"]`."
+   ],
+   "type": {
+    "kind": "struct",
+    "fields": [
+     {
+      "name": "mint",
+      "type": "pubkey"
      }
     ]
    }

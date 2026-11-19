@@ -40,6 +40,8 @@ pub struct ProofArchive {
     pub epochs: BTreeMap<u64, u64>,
     /// All archived slots, including representatives with no withdrawals.
     pub withdrawals: BTreeMap<u64, Vec<u64>>,
+    /// Activated epoch-end proofs, including zero burns, never expire or get age-shed.
+    fee_burn_cblocks: BTreeSet<u64>,
     capacity: usize,
     grace_slots: u64,
     warned_above_level: bool,
@@ -64,7 +66,7 @@ impl ProofArchive {
         builder.set_cache_size(64 * 1024 * 1024);
         std::fs::create_dir_all(path.parent().context("bridge proof archive path")?)?;
         let db = builder.create(path)?;
-        let mut archive = Self { store: Arc::new(ProofArchiveStore(db)), epochs: BTreeMap::new(), withdrawals: BTreeMap::new(), capacity, grace_slots, warned_above_level: false, shed_since_log: 0 };
+        let mut archive = Self { store: Arc::new(ProofArchiveStore(db)), epochs: BTreeMap::new(), withdrawals: BTreeMap::new(), fee_burn_cblocks: BTreeSet::new(), capacity, grace_slots, warned_above_level: false, shed_since_log: 0 };
         {
             let w = archive.store.0.begin_write()?;
             {
@@ -77,6 +79,7 @@ impl ProofArchive {
                     if finalized_through.is_some_and(|cblock| slot.value() <= cblock) {
                         archive.epochs.entry(slot.value() * 4 / epoch_slots).or_insert(slot.value());
                         archive.withdrawals.insert(slot.value(), withdrawal_sequences(&proof)?);
+                        if fee_burn_epoch_end(&proof)? { archive.fee_burn_cblocks.insert(slot.value()); }
                     } else {
                         // A crash can leave a prepared proof ahead of the state checkpoint.
                         // It was never published and must not survive that checkpoint's rollback.
@@ -104,7 +107,8 @@ impl ProofArchive {
     /// Called only for finalized cblocks. New withdrawals and first proofs of epochs are always
     /// durable before their checkpoint, irrespective of the shedding level.
     pub fn keep(&mut self, slot: u64, epoch: u64, withdrawal: bool, proof: &Value) -> Result<bool> {
-        if !withdrawal && self.epochs.contains_key(&epoch) {
+        let fee_burn_end = fee_burn_epoch_end(proof)?;
+        if !withdrawal && !fee_burn_end && self.epochs.contains_key(&epoch) {
             return Ok(false);
         }
         let sequences = withdrawal_sequences(proof)?;
@@ -115,6 +119,7 @@ impl ProofArchive {
         }
         w.commit()?;
         self.withdrawals.insert(slot, sequences);
+        if fee_burn_end { self.fee_burn_cblocks.insert(slot); }
         self.epochs.entry(epoch).or_insert(slot);
         self.check_capacity();
         Ok(true)
@@ -130,7 +135,7 @@ impl ProofArchive {
         let representatives = self.epochs.values().copied().collect::<BTreeSet<_>>();
         let remove = self.withdrawals.iter()
             .take_while(|(slot, _)| finalized_through.saturating_sub(**slot).saturating_mul(4) > self.grace_slots)
-            .filter(|(slot, sequences)| !sequences.is_empty() && sequences.iter().all(|sequence| *sequence < saved_cursor) && !representatives.contains(*slot))
+            .filter(|(slot, sequences)| !sequences.is_empty() && sequences.iter().all(|sequence| *sequence < saved_cursor) && !representatives.contains(*slot) && !self.fee_burn_cblocks.contains(*slot))
             .take(excess.min(100)).map(|(slot, _)| *slot).collect::<Vec<_>>();
         self.remove(&remove)?;
         self.shed_since_log += remove.len();
@@ -146,7 +151,7 @@ impl ProofArchive {
     /// epoch's representative remains even after payment, because it can still hand that epoch on.
     pub fn prune_paid(&mut self, paid: &BTreeSet<u64>) -> Result<Vec<u64>> {
         let representatives = self.epochs.values().copied().collect::<BTreeSet<_>>();
-        let remove = paid.iter().copied().filter(|slot| self.withdrawals.contains_key(slot) && !representatives.contains(slot)).collect::<Vec<_>>();
+        let remove = paid.iter().copied().filter(|slot| self.withdrawals.contains_key(slot) && !representatives.contains(slot) && !self.fee_burn_cblocks.contains(slot)).collect::<Vec<_>>();
         if remove.is_empty() { return Ok(remove) }
         self.remove(&remove)?;
         tracing::info!(event = "bridge_proofs_pruned", count = remove.len(), held = self.withdrawals.len(), "paid bridge proofs pruned");
@@ -160,10 +165,20 @@ impl ProofArchive {
         w.commit()?;
         for slot in remove {
             self.withdrawals.remove(slot);
+            self.fee_burn_cblocks.remove(slot);
         }
         self.check_capacity();
         Ok(())
     }
+}
+
+fn fee_burn_epoch_end(proof: &Value) -> Result<bool> {
+    let Some(from_slot) = proof.get("feeBurnFromSlot").and_then(Value::as_u64) else { return Ok(false) };
+    let slot = proof["consensusSlot"].as_u64().context("bridge proof consensusSlot")?;
+    let epoch_slots = proof["epochSlots"].as_u64().context("bridge proof epochSlots")?;
+    anyhow::ensure!(epoch_slots > 0 && epoch_slots % 4 == 0, "invalid fee-burn proof epoch length");
+    let first_slot = slot.checked_mul(4).context("fee-burn proof slot overflow")?;
+    Ok(first_slot >= from_slot && first_slot.checked_add(4).context("fee-burn proof end overflow")? % epoch_slots == 0)
 }
 
 fn withdrawal_sequences(proof: &Value) -> Result<Vec<u64>> {
@@ -311,6 +326,7 @@ async fn read_new(urls: &[String; 2], program: &Pubkey, deposits: &Deposits, dec
 pub enum OutboxEntry {
     ValidatorSet { epoch: u64, validators: Vec<([u8; 32], u64)> },
     Withdrawal { sequence: u64, solana_mint: [u8; 32], recipient: [u8; 32], amount: u64 },
+    FeeBurn { epoch: u64, amount: u64 },
 }
 
 /// The outbox's Merkle root: leaves are the SHA-256 of each entry's bincode, each level pairs
@@ -345,6 +361,50 @@ pub fn outbox_proof(entries: &[OutboxEntry], mut index: usize) -> Vec<(bool, [u8
 mod tests {
     use super::*;
     use axum::{extract::State, routing::post, Json, Router};
+
+    #[test]
+    fn fee_burn_epoch_end_proofs_keep_live_encodings_and_survive_restart() {
+        let set = OutboxEntry::ValidatorSet { epoch:7,validators:vec![([3;32],42)] };
+        let mut expected = 0u32.to_le_bytes().to_vec();
+        expected.extend(7u64.to_le_bytes()); expected.extend(1u64.to_le_bytes());
+        expected.extend([3;32]); expected.extend(42u64.to_le_bytes());
+        assert_eq!(bincode::serialize(&set).unwrap(),expected,"existing hand-off leaves remain byte-compatible");
+        let withdrawal = OutboxEntry::Withdrawal { sequence:4,solana_mint:[2;32],recipient:[5;32],amount:9 };
+        let mut expected = 1u32.to_le_bytes().to_vec();
+        expected.extend(4u64.to_le_bytes()); expected.extend([2;32]); expected.extend([5;32]); expected.extend(9u64.to_le_bytes());
+        assert_eq!(bincode::serialize(&withdrawal).unwrap(),expected,"existing release leaves remain byte-compatible");
+        let fee = OutboxEntry::FeeBurn { epoch:1,amount:9 };
+        let mut expected = 2u32.to_le_bytes().to_vec();
+        expected.extend(1u64.to_le_bytes()); expected.extend(9u64.to_le_bytes());
+        assert_eq!(bincode::serialize(&fee).unwrap(),expected);
+        let entries = vec![set,withdrawal,fee];
+        let mut leaf = crate::crypto::hash(&expected);
+        for (left,sibling) in outbox_proof(&entries,2) {
+            leaf = crate::crypto::hash(&if left { [sibling,leaf].concat() } else { [leaf,sibling].concat() });
+        }
+        assert_eq!(leaf,outbox_root(&entries));
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target").join(format!("fee-burn-outbox-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&path).unwrap();
+        let store = path.join("proofs.redb");
+        {
+            let mut archive = ProofArchive::load(Some(&store),16,Some(11),1,1).unwrap();
+            for slot in [0,4,7,8,11] {
+                let mut proof = stored_proof(slot,16,(slot == 7).then_some(1));
+                proof["feeBurnFromSlot"] = json!(16);
+                if slot == 7 { proof["outbox"].as_array_mut().unwrap().push(json!(B64.encode(bincode::serialize(&OutboxEntry::FeeBurn { epoch:1,amount:9 }).unwrap()))); }
+                assert!(archive.keep(slot,slot * 4 / 16,slot == 7,&proof).unwrap());
+            }
+            assert!(archive.shed_stale(1000,Some(2)).unwrap().is_empty());
+            assert!(archive.prune_paid(&BTreeSet::from([7])).unwrap().is_empty());
+        }
+        {
+            let archive = ProofArchive::load(Some(&store),16,Some(11),1,1).unwrap();
+            assert_eq!(archive.fee_burn_cblocks,BTreeSet::from([7,11]));
+            assert!(archive.store.get(7).unwrap().is_some(),"the fee-burn proof remains after withdrawal payment");
+            assert!(archive.store.get(11).unwrap().is_some(),"a zero epoch still has durable end proof for the cursor");
+        }
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     fn stored_proof(slot: u64, epoch_slots: u64, sequence: Option<u64>) -> Value {
         let mut outbox = vec![OutboxEntry::ValidatorSet { epoch:slot * 4 / epoch_slots + 1, validators:vec![([1;32],1)] }];

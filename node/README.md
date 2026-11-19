@@ -190,6 +190,29 @@ checks the epoch-two draw and live vote weights, then deactivates and withdraws.
 It prints the schedule, stake, weights and zero rewards. Its own net uses TCP
 5041-5043 and QUIC 5062-5073, and it removes its child and temporary store.
 
+## Epoch fee burn
+
+The bridge rule may add `feeBurnFromSlot`, with no default: a bridge-epoch
+boundary at or after `nativeFromSlot`. From it, hashed state sums actual burned
+base fees. The epoch's last cblock appends a positive bincode variant-2
+`FeeBurn {epoch, amount}` in Solana mint base units; rounding dust carries. A
+skipped ending carries all unallocated fees to the next executed ending. Existing
+ValidatorSet/Withdrawal bytes and their SHA-256 Merkle leaves stay unchanged.
+
+`getNativeSupply` adds `feeBurnedLamports`, cumulative native lamports committed
+in whole-unit burn entries. Gross credits keep their public meaning. Internally
+the separate hashed counter reserves raw burns against the existing native gate,
+so no new Acrux bytecode or placement is required. Followers configure the same
+rule and re-execute those counter updates and state hashes.
+
+`getCblockProof {feeBurnEpoch}` reads the permanently retained epoch-ending proof,
+including zero epochs. It returns null only for an ending skipped behind durable
+finality; an incomplete epoch is NOT_FOUND. The keeper hands on, burns on Solana
+against that proof, waits for a finalized replay bit, and then cleans up. Keep
+the existing Acrux placements: the new `.so` is a Solana-side upgrade. Operator
+setup, the exact vault equation and the deferred validator check are in
+[../docs/bridge-relayer.md](../docs/bridge-relayer.md#epoch-base-fee-burns).
+
 ## Crates
 
 | Crate | Concern |

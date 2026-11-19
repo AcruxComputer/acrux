@@ -15,7 +15,7 @@
 //! out of the vault once that cblock is certified, once per withdrawal.
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{hash::hashv, sysvar::instructions as ix_sysvar};
-use anchor_spl::token_interface::{burn, transfer_checked, Burn, Mint, TokenAccount, TokenInterface, TransferChecked};
+use anchor_spl::token_interface::{burn as token_burn, transfer_checked, Burn, Mint, TokenAccount, TokenInterface, TransferChecked};
 
 declare_id!("EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5");
 
@@ -38,6 +38,13 @@ pub mod acrux_bridge {
     /// The authority explicitly admits a mint before its tokens can be deposited.
     pub fn allow_mint(ctx: Context<AllowMint>) -> Result<()> {
         ctx.accounts.allowed.set_inner(AllowedMint { mint: ctx.accounts.mint.key() });
+        Ok(())
+    }
+
+    /// Fixes the mint whose vault backs native ACRUX fee burns. Only the bridge authority can
+    /// initialize this account, once; later certificates cannot be applied to another mint.
+    pub fn init_fee_burn_config(ctx: Context<InitFeeBurnConfig>) -> Result<()> {
+        ctx.accounts.config.set_inner(FeeBurnConfig { mint: ctx.accounts.mint.key() });
         Ok(())
     }
 
@@ -144,7 +151,7 @@ pub mod acrux_bridge {
     pub fn withdraw(ctx: Context<Withdraw>, solana_mint: Pubkey, amount: u64, recipient: Pubkey) -> Result<()> {
         require!(amount > 0, BridgeError::ZeroAmount);
         require!(amount >= minimum_withdrawal(&ctx.accounts.minimum)?, BridgeError::BelowMinimumWithdrawal);
-        burn(
+        token_burn(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
                 Burn { mint: ctx.accounts.mint.to_account_info(), from: ctx.accounts.source.to_account_info(), authority: ctx.accounts.owner.to_account_info() },
@@ -241,6 +248,42 @@ pub mod acrux_bridge {
         Ok(())
     }
 
+    /// On Solana: burns an epoch's native base-fee burn from its configured mint's vault.
+    /// The epoch's last cblock commits the amount in Solana mint base units, paid once per epoch.
+    pub fn burn(ctx: Context<BurnFees>, epoch: u64, amount: u64, proof: Vec<ProofNode>) -> Result<()> {
+        require!(amount > 0, BridgeError::ZeroAmount);
+        let cblock = &ctx.accounts.cblock;
+        require!(cblock.certified, BridgeError::NotCertified);
+        let cblocks_per_epoch = ctx.accounts.bridge.epoch_slots / 4;
+        require!(cblock.epoch == epoch && cblock.slot % cblocks_per_epoch == cblocks_per_epoch - 1, BridgeError::BadFeeBurnEpoch);
+        let index = (epoch % BURNS_PER_BUCKET) as usize;
+        let mask = 1u8 << (index % 8);
+        require!(ctx.accounts.burned.bits[index / 8] & mask == 0, BridgeError::AlreadyBurned);
+        // bincode OutboxEntry::FeeBurn: variant (u32 2), epoch, amount.
+        let mut entry = Vec::with_capacity(20);
+        entry.extend_from_slice(&2u32.to_le_bytes());
+        entry.extend_from_slice(&epoch.to_le_bytes());
+        entry.extend_from_slice(&amount.to_le_bytes());
+        require!(merkle_root(&entry, &proof) == cblock.outbox_root, BridgeError::BadProof);
+        let mint = ctx.accounts.mint.key();
+        let bump = ctx.bumps.vault;
+        token_burn(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Burn {
+                    mint: ctx.accounts.mint.to_account_info(),
+                    from: ctx.accounts.vault.to_account_info(),
+                    authority: ctx.accounts.vault.to_account_info(),
+                },
+                &[&[b"vault", mint.as_ref(), &[bump]]],
+            ),
+            amount,
+        )?;
+        ctx.accounts.burned.bucket = epoch / BURNS_PER_BUCKET;
+        ctx.accounts.burned.bits[index / 8] |= mask;
+        Ok(())
+    }
+
     /// Hands the light client on to `epoch`: the validator set a certified cblock of the epoch
     /// before carries in its outbox, proven against the outbox root.
     pub fn hand_off(ctx: Context<HandOff>, epoch: u64, validators: Vec<Validator>, proof: Vec<ProofNode>) -> Result<()> {
@@ -278,6 +321,7 @@ pub mod acrux_bridge {
 
 pub const MAX_VALIDATORS: usize = 32;
 pub const RELEASES_PER_BUCKET: u64 = 8192;
+pub const BURNS_PER_BUCKET: u64 = 8192;
 const VOTE_NOTAR: u32 = 0;
 const VOTE_FINALIZE: u32 = 4;
 const ED25519_PROGRAM: Pubkey = pubkey!("Ed25519SigVerify111111111111111111111111111");
@@ -342,6 +386,22 @@ pub struct Bridge {
 #[derive(InitSpace)]
 pub struct AllowedMint {
     pub mint: Pubkey,
+}
+
+/// The immutable Solana mint for native fee burns, at `["fee_burn_config"]`.
+#[account]
+#[derive(InitSpace)]
+pub struct FeeBurnConfig {
+    pub mint: Pubkey,
+}
+
+/// Permanent replay guards for 8,192 fee-burn epochs, at `["fee_burn", epoch / 8192]`.
+#[account]
+#[derive(InitSpace)]
+pub struct Burned {
+    pub bucket: u64,
+    /// Low bit first within each byte; a bit is set only after the burn succeeds.
+    pub bits: [u8; 1024],
 }
 
 /// One deposit, at `["deposit", sequence]`.
@@ -489,6 +549,20 @@ pub struct AllowMint<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct InitFeeBurnConfig<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(seeds = [b"bridge"], bump = bridge.bump, has_one = authority)]
+    pub bridge: Account<'info, Bridge>,
+    #[account(mint::token_program = token_program)]
+    pub mint: InterfaceAccount<'info, Mint>,
+    #[account(init, payer = authority, space = 8 + FeeBurnConfig::INIT_SPACE, seeds = [b"fee_burn_config"], bump)]
+    pub config: Account<'info, FeeBurnConfig>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+
 #[event_cpi]
 #[derive(Accounts)]
 pub struct Deposit<'info> {
@@ -629,6 +703,27 @@ pub struct Release<'info> {
 
 #[derive(Accounts)]
 #[instruction(epoch: u64)]
+pub struct BurnFees<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(seeds = [b"bridge"], bump = bridge.bump)]
+    pub bridge: Account<'info, Bridge>,
+    #[account(seeds = [b"fee_burn_config"], bump, has_one = mint @ BridgeError::WrongFeeBurnMint)]
+    pub config: Account<'info, FeeBurnConfig>,
+    #[account(seeds = [b"cblock", cblock.hash.as_ref()], bump)]
+    pub cblock: Account<'info, Cblock>,
+    #[account(mut, mint::token_program = token_program)]
+    pub mint: InterfaceAccount<'info, Mint>,
+    #[account(mut, seeds = [b"vault", mint.key().as_ref()], bump, token::mint = mint, token::authority = vault, token::token_program = token_program)]
+    pub vault: InterfaceAccount<'info, TokenAccount>,
+    #[account(init_if_needed, payer = payer, space = 8 + Burned::INIT_SPACE, seeds = [b"fee_burn", (epoch / BURNS_PER_BUCKET).to_le_bytes().as_ref()], bump)]
+    pub burned: Box<Account<'info, Burned>>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(epoch: u64)]
 pub struct HandOff<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -693,4 +788,10 @@ pub enum BridgeError {
     NativeAmountOverflow,
     #[msg("The native withdrawal exceeds the tokens credited from Solana.")]
     UnbackedNativeWithdrawal,
+    #[msg("This fee-burn epoch has already been burned.")]
+    AlreadyBurned,
+    #[msg("A fee burn belongs to the last cblock of its epoch.")]
+    BadFeeBurnEpoch,
+    #[msg("Fee burns use the immutable configured native mint.")]
+    WrongFeeBurnMint,
 }

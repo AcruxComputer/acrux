@@ -203,6 +203,37 @@ pub struct NativeSupply {
     pub credited_lamports: u64,
     pub withdrawn_lamports: u64,
     pub circulating_lamports: u64,
+    /// Whole-token fee burns allocated to epoch outboxes, expressed in native lamports.
+    pub fee_burned_lamports: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct FeeBurnConfig {
+    pub from_slot: u64,
+    pub epoch_slots: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EpochFeeBurn {
+    pub epoch: u64,
+    pub solana_mint: Pubkey,
+    pub amount: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct FeeBurnState {
+    from_slot: u64,
+    epoch_slots: u64,
+    epoch: u64,
+    raw_burned_lamports: u64,
+    epoch_burned_lamports: u64,
+    carried_lamports: u64,
+    last_closed_epoch: u64,
+    last_closed_amount: u64,
+}
+
+fn bridge_fee_burn(bridge: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"fee_burn"],bridge).0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,6 +363,7 @@ pub struct SvmExecutor {
     bridge_minimums: Option<(u64, Vec<MinimumWithdrawal>)>,
     native_cutover: Option<NativeCutover>,
     stake_config: Option<StakeConfig>,
+    fee_burn_config: Option<FeeBurnConfig>,
 }
 
 impl SvmExecutor {
@@ -526,6 +558,7 @@ impl SvmExecutor {
             bridge_minimums: None,
             native_cutover: None,
             stake_config: None,
+            fee_burn_config: None,
         };
         for program in [
             "ComputeBudget111111111111111111111111111111",
@@ -905,6 +938,137 @@ impl SvmExecutor {
         self.native_cutover = Some(rule);
     }
 
+    pub fn set_fee_burn_config(&mut self, rule: FeeBurnConfig) {
+        self.fee_burn_config = Some(rule);
+    }
+
+    fn decode_fee_burn_state(&self, account: &Account) -> Result<FeeBurnState> {
+        let bridge = self.bridge.context("Fee burns require the bridge")?;
+        anyhow::ensure!(account.owner == bridge && !account.executable && account.data.len() == 72
+            && account.data[..8] == Sha256::digest(b"account:FeeBurnState")[..8], "Invalid fee burn state account");
+        let state:FeeBurnState = bincode::deserialize(&account.data[8..])?;
+        let rule = self.fee_burn_config.as_ref().context("Committed fee burn state requires its configured rule")?;
+        anyhow::ensure!(state.from_slot == rule.from_slot && state.epoch_slots == rule.epoch_slots, "Fee burn rule differs from committed state");
+        let pending = state.epoch_burned_lamports.checked_add(state.carried_lamports).context("Fee burn pending overflow")?;
+        anyhow::ensure!(pending <= state.raw_burned_lamports, "Invalid fee burn accounting");
+        Ok(state)
+    }
+
+    fn fee_burn_state(&self) -> Result<Option<FeeBurnState>> {
+        let Some(bridge) = self.bridge else { return Ok(None) };
+        let Some(account) = self.svm.get_account(&bridge_fee_burn(&bridge)) else { return Ok(None) };
+        if native_wallet(&account) { return Ok(None) }
+        self.decode_fee_burn_state(&account).map(Some)
+    }
+
+    fn write_fee_burn_state(&mut self, state: &FeeBurnState) -> Result<()> {
+        let bridge = self.bridge.context("Fee burns require the bridge")?;
+        let key = bridge_fee_burn(&bridge);
+        let mut account = self.svm.get_account(&key).context("Fee burn state account missing")?;
+        let mut data = Sha256::digest(b"account:FeeBurnState")[..8].to_vec();
+        data.extend(bincode::serialize(state)?);
+        anyhow::ensure!(data.len() == account.data.len(), "Fee burn state changed its fixed size");
+        account.data = data;
+        self.put(key,account)
+    }
+
+    fn prepare_fee_burn_epoch(&mut self, slot: u64) -> Result<()> {
+        let Some(rule) = self.fee_burn_config.clone().filter(|rule| slot >= rule.from_slot) else { return Ok(()) };
+        anyhow::ensure!(rule.epoch_slots > 0 && rule.epoch_slots % 4 == 0 && rule.from_slot % rule.epoch_slots == 0, "Invalid fee burn activation rule");
+        let epoch = slot / rule.epoch_slots;
+        let Some(mut state) = self.fee_burn_state()? else {
+            let bridge = self.bridge.context("Fee burns require the bridge")?;
+            let mut gate = self.native_gate()?.context("Fee burns require native ACRUX")?;
+            anyhow::ensure!(rule.from_slot >= u64::from_le_bytes(gate.data[72..80].try_into().unwrap()), "Fee burns cannot precede native ACRUX");
+            let state = FeeBurnState { from_slot:rule.from_slot,epoch_slots:rule.epoch_slots,epoch,raw_burned_lamports:0,
+                epoch_burned_lamports:0,carried_lamports:0,last_closed_epoch:u64::MAX,last_closed_amount:0 };
+            let mut data = Sha256::digest(b"account:FeeBurnState")[..8].to_vec(); data.extend(bincode::serialize(&state)?);
+            let key = bridge_fee_burn(&bridge);
+            let existing = self.svm.get_account(&key);
+            anyhow::ensure!(existing.as_ref().is_none_or(native_wallet), "Fee burn address has an incompatible account");
+            let before = existing.map_or(0,|account| account.lamports);
+            let lamports = before.max(self.rent_exempt_minimum(data.len()));
+            let reserve = u64::from_le_bytes(gate.data[64..72].try_into().unwrap()).checked_add(lamports - before).context("Fee burn reserve overflow")?;
+            gate.data[64..72].copy_from_slice(&reserve.to_le_bytes());
+            self.put(key,Account { lamports,data,owner:bridge,executable:false,rent_epoch:0 })?;
+            self.put(bridge_native(&bridge),gate)?;
+            return Ok(())
+        };
+        if epoch > state.epoch {
+            // When the arithmetic last cblock was skipped, no proof can carry that epoch's
+            // burn. Carry its entire unallocated amount to the next actual epoch-ending cblock.
+            state.carried_lamports = state.carried_lamports.checked_add(state.epoch_burned_lamports).context("Fee burn carry overflow")?;
+            state.epoch_burned_lamports = 0;
+            state.epoch = epoch;
+            self.write_fee_burn_state(&state)?;
+        }
+        Ok(())
+    }
+
+    fn base_fee_burn_backed(&self, burned: u64) -> Result<bool> {
+        if self.fee_burn_state()?.is_none() { return Ok(true) }
+        let gate = self.native_gate()?.context("Fee burns require native ACRUX")?;
+        let credited = u64::from_le_bytes(gate.data[48..56].try_into().unwrap());
+        let withdrawn = u64::from_le_bytes(gate.data[56..64].try_into().unwrap());
+        Ok(credited - withdrawn >= burned)
+    }
+
+    fn record_base_fee_burn(&mut self, burned: u64) -> Result<()> {
+        let Some(mut state) = self.fee_burn_state()?.filter(|_| burned > 0) else { return Ok(()) };
+        let bridge = self.bridge.unwrap();
+        let mut gate = self.native_gate()?.context("Fee burns require native ACRUX")?;
+        let credited = u64::from_le_bytes(gate.data[48..56].try_into().unwrap()).checked_sub(burned).context("Fee burn exceeds native backing")?;
+        anyhow::ensure!(credited >= u64::from_le_bytes(gate.data[56..64].try_into().unwrap()), "Fee burn exceeds unwithdrawn native backing");
+        state.raw_burned_lamports = state.raw_burned_lamports.checked_add(burned).context("Cumulative fee burn overflow")?;
+        state.epoch_burned_lamports = state.epoch_burned_lamports.checked_add(burned).context("Epoch fee burn overflow")?;
+        gate.data[48..56].copy_from_slice(&credited.to_le_bytes());
+        self.put(bridge_native(&bridge),gate)?;
+        self.write_fee_burn_state(&state)
+    }
+
+    fn close_fee_burn_epoch(&mut self, slot: u64) -> Result<()> {
+        let Some(mut state) = self.fee_burn_state()? else { return Ok(()) };
+        if slot % state.epoch_slots != state.epoch_slots - 1 || state.last_closed_epoch == state.epoch { return Ok(()) }
+        let gate = self.native_gate()?.context("Fee burns require native ACRUX")?;
+        let scale = u64::from_le_bytes(gate.data[40..48].try_into().unwrap());
+        let pending = state.carried_lamports.checked_add(state.epoch_burned_lamports).context("Fee burn pending overflow")?;
+        state.last_closed_epoch = state.epoch;
+        state.last_closed_amount = pending / scale;
+        state.carried_lamports = pending % scale;
+        state.epoch_burned_lamports = 0;
+        self.write_fee_burn_state(&state)
+    }
+
+    pub fn fee_burn_pending_lamports(&self) -> Result<u64> {
+        self.fee_burn_state()?.map_or(Ok(0),|state| state.carried_lamports.checked_add(state.epoch_burned_lamports).context("Fee burn pending overflow"))
+    }
+
+    pub fn fee_burn(&self, cblock: u64) -> Result<Option<EpochFeeBurn>> {
+        let Some(state) = self.fee_burn_state()? else { return Ok(None) };
+        let gate = self.native_gate()?.context("Fee burns require native ACRUX")?;
+        self.fee_burn_entry(cblock,&state,&gate)
+    }
+
+    /// A cblock's outbox must read the same checkpoint as its state hash, even when execution
+    /// has caught up through more than one epoch before the validator votes on those cblocks.
+    pub fn fee_burn_at(&self, checkpoint: &ExecutorCheckpoint, cblock: u64) -> Result<Option<EpochFeeBurn>> {
+        let Some(bridge) = self.bridge else { return Ok(None) };
+        let Some(account) = checkpoint.accounts.get(&bridge_fee_burn(&bridge)) else { return Ok(None) };
+        if native_wallet(account) { return Ok(None) }
+        let state = self.decode_fee_burn_state(account)?;
+        let gate = checkpoint.accounts.get(&bridge_native(&bridge)).context("Fee burn checkpoint is missing native ACRUX")?;
+        self.fee_burn_entry(cblock,&state,gate)
+    }
+
+    fn fee_burn_entry(&self, cblock: u64, state: &FeeBurnState, gate: &Account) -> Result<Option<EpochFeeBurn>> {
+        let first = cblock.checked_mul(4).context("Fee burn cblock overflow")?;
+        let end = first.checked_add(3).context("Fee burn cblock overflow")?;
+        if end % state.epoch_slots != state.epoch_slots - 1 || state.last_closed_epoch != first / state.epoch_slots || state.last_closed_amount == 0 { return Ok(None) }
+        anyhow::ensure!(Some(gate.owner) == self.bridge && !gate.executable && gate.data.len() == 80
+            && gate.data[..8] == Sha256::digest(b"account:NativeGate")[..8], "Invalid native gate in fee burn checkpoint");
+        Ok(Some(EpochFeeBurn { epoch:state.last_closed_epoch,solana_mint:Pubkey::new_from_array(gate.data[8..40].try_into().unwrap()),amount:state.last_closed_amount }))
+    }
+
     pub fn set_stake_config(&mut self, rule: StakeConfig) {
         self.stake_config = Some(rule);
     }
@@ -975,6 +1139,24 @@ impl SvmExecutor {
         Ok(self.stake_schedule_snapshots(checkpoint)?.into_iter().find(|(epoch,_)| *epoch == target_epoch).map(|(_,weights)| weights))
     }
 
+    /// Keeps each genesis vote account reading as a live validator for stock tools (`solana
+    /// delegate-stake` refuses a vote account without a root slot, or with one 128 slots behind):
+    /// at each window's first slot, a root 32 slots back and a last vote one slot back.
+    fn refresh_genesis_votes(&mut self, identities: &[Pubkey], slot: u64) -> Result<()> {
+        use solana_sdk::vote::state::{LandedVote,Lockout,VoteState,VoteStateVersions};
+        for identity in identities {
+            let key = genesis_vote_address(identity);
+            let mut account = self.svm.get_account(&key).context("Genesis vote account missing")?;
+            let mut state = VoteState::deserialize(&account.data)?;
+            state.root_slot = Some(slot.saturating_sub(32));
+            state.votes.clear();
+            state.votes.push_back(LandedVote::from(Lockout::new(slot.saturating_sub(1))));
+            VoteState::serialize(&VoteStateVersions::new_current(state),&mut account.data)?;
+            self.put(key,account)?;
+        }
+        Ok(())
+    }
+
     /// After restoring the canonical parent, before inclusion fees: activate once and freeze the
     /// next future schedule at an epoch boundary. A rollback restores this marker and its snapshots.
     pub fn prepare_stake_epoch(&mut self, slot: u64) -> Result<()> {
@@ -1023,6 +1205,7 @@ impl SvmExecutor {
                 marker
             }
         };
+        if slot % 16 == 0 { self.refresh_genesis_votes(&rule.identities, slot)?; }
         if epoch <= marker.prepared_through_epoch { return Ok(()) }
         for entered in marker.prepared_through_epoch + 1..=epoch {
             let target = entered.checked_add(1).context("Stake epoch overflow")?;
@@ -1074,14 +1257,20 @@ impl SvmExecutor {
         let Some(account) = self.native_gate()? else { return Ok(None) };
         let value = |offset| u64::from_le_bytes(account.data[offset..offset + 8].try_into().unwrap());
         let reserve_lamports = value(64);
+        let fee_burn = self.fee_burn_state()?;
+        let raw_burned = fee_burn.as_ref().map_or(0,|state| state.raw_burned_lamports);
+        let pending = self.fee_burn_pending_lamports()?;
         Ok(Some(NativeSupply {
             cutover_slot: value(72),
             solana_mint: Pubkey::new_from_array(account.data[8..40].try_into().unwrap()),
             lamports_per_base_unit: value(40),
             reserve_lamports,
-            credited_lamports: value(48),
+            // The unchanged Acrux program sees net credit, reserving every raw fee burn before
+            // a native withdrawal. Public accounting continues to report the gross deposits.
+            credited_lamports: value(48).checked_add(raw_burned).context("Gross native credits overflow")?,
             withdrawn_lamports: value(56),
             circulating_lamports: self.total_lamports()?.checked_sub(reserve_lamports).context("Native supply fell below the fixed cutover reserve")?,
+            fee_burned_lamports: raw_burned.checked_sub(pending).context("Allocated fee burns exceed raw burns")?,
         }))
     }
 
@@ -1281,7 +1470,7 @@ impl SvmExecutor {
         Ok([(mint, mint_account), (ata, holder)])
     }
 
-    fn prepare_native_credit(&self, bridge: &Pubkey, mut gate: Account, credit: &BridgeCredit) -> std::result::Result<[(Pubkey, Account); 2], BridgeCreditSkipReason> {
+    fn prepare_native_credit(&self, bridge: &Pubkey, mut gate: Account, credit: &BridgeCredit, raw_fee_burned: u64) -> std::result::Result<[(Pubkey, Account); 2], BridgeCreditSkipReason> {
         use BridgeCreditSkipReason::*;
         let recipient = Pubkey::from_str(&credit.recipient).map_err(|_| InvalidRecipient)?;
         let mut wallet = self.svm.get_account(&recipient).unwrap_or_default();
@@ -1290,6 +1479,7 @@ impl SvmExecutor {
         let scale = u64::from_le_bytes(gate.data[40..48].try_into().unwrap());
         let lamports = credit.amount.checked_mul(scale).ok_or(BalanceOverflow)?;
         let credited = u64::from_le_bytes(gate.data[48..56].try_into().unwrap()).checked_add(lamports).ok_or(SupplyOverflow)?;
+        credited.checked_add(raw_fee_burned).ok_or(SupplyOverflow)?;
         wallet.lamports = wallet.lamports.checked_add(lamports).ok_or(BalanceOverflow)?;
         gate.data[48..56].copy_from_slice(&credited.to_le_bytes());
         Ok([(recipient,wallet),(bridge_native(bridge),gate)])
@@ -1310,7 +1500,8 @@ impl SvmExecutor {
             let prepared = if next == u64::MAX {
                 Err(BridgeCreditSkipReason::SequenceOverflow)
             } else if let Some(gate) = native.filter(|gate| Pubkey::from_str(&credit.solana_mint).ok().is_some_and(|mint| gate.data[8..40] == mint.to_bytes())) {
-                self.prepare_native_credit(&bridge,gate,&credit)
+                let raw_fee_burned = self.fee_burn_state()?.map_or(0,|state| state.raw_burned_lamports);
+                self.prepare_native_credit(&bridge,gate,&credit,raw_fee_burned)
             } else {
                 self.prepare_bridge_credit(&bridge, &credit)
             };
@@ -1345,6 +1536,7 @@ impl SvmExecutor {
         self.apply_bridge_minimums(slot)?;
         self.apply_native_cutover(slot)?;
         self.apply_credits()?;
+        self.prepare_fee_burn_epoch(slot)?;
         let mut merged = BTreeMap::<String, ExecutionItem>::new();
         for item in items {
             // Recheck signed bytes at the execution boundary; a public header cannot
@@ -1451,7 +1643,11 @@ impl SvmExecutor {
             let mut before = self.account_view(&keys);
             // The priority fee left the payer when the slot's selection ran.
             before.lamports[0] += priority_fee;
-            if let Err(error) = self.debit(payer, base_fee, true) {
+            let burned = u64::try_from(u128::from(base_fee) * u128::from(self.fees.base_burn_bps) / 10_000)?;
+            let backed = self.base_fee_burn_backed(burned)?;
+            let charge = if backed { self.debit(payer, base_fee, true) }
+                else { Err(anyhow!("Base fee would burn unbacked native ACRUX")) };
+            if let Err(error) = charge {
                 self.remember_executed(candidate.id.clone(), &item.transaction.bytes);
                 results.push(ExecutionResult {
                     id: candidate.id.clone(),
@@ -1466,8 +1662,7 @@ impl SvmExecutor {
                 });
                 continue;
             }
-            let burned =
-                u64::try_from(u128::from(base_fee) * u128::from(self.fees.base_burn_bps) / 10_000)?;
+            self.record_base_fee_burn(burned)?;
             self.distribute(base_fee - burned, &item.source_proposers)?;
             let real_account = self
                 .svm
@@ -1547,6 +1742,7 @@ impl SvmExecutor {
             results.push(outcome);
         }
         self.clear_native_burn()?;
+        self.close_fee_burn_epoch(slot)?;
         self.advance_blockhash(slot);
         Ok(SlotExecution {
             merged_order: ordered
@@ -1881,6 +2077,140 @@ mod tests {
         let record = executor.svm.get_account(&bridge_skipped_credit(&bridge, 1)).unwrap();
         assert_eq!(bincode::deserialize::<SkippedBridgeCredit>(&record.data).unwrap(), SkippedBridgeCredit { credit: overflow, reason: BridgeCreditSkipReason::BalanceOverflow });
         executor.execute_slot(2, vec![]).unwrap();
+    }
+
+    #[test]
+    fn fee_burn_epochs_carry_restore_and_reserve_backing_with_the_unchanged_native_program() {
+        use base64::Engine;
+        use solana_sdk::instruction::{AccountMeta,Instruction};
+        let owner = Keypair::new();
+        let proposer = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        // This is the existing Acrux placement, not the new Solana burn program or a rebuilt SBF.
+        let file:serde_json::Value = serde_json::from_slice(&std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../chain/placements/acrux-bridge-native.json")).unwrap()).unwrap();
+        let accounts = file["accounts"].as_array().unwrap().iter().map(|a| (Pubkey::from_str(a["address"].as_str().unwrap()).unwrap(),Account {
+            lamports:a["lamports"].as_u64().unwrap(),data:base64::engine::general_purpose::STANDARD.decode(a["data"].as_str().unwrap()).unwrap(),
+            owner:Pubkey::from_str(a["owner"].as_str().unwrap()).unwrap(),executable:a["executable"].as_bool().unwrap(),rent_epoch:0,
+        })).collect::<Vec<_>>();
+        let bridge = accounts.last().unwrap().0;
+        let placement = Placement { name:"existing Acrux native bridge".into(),slot:4,accounts };
+        let native = NativeCutover { slot:4,solana_mint:mint,lamports_per_base_unit:4000 };
+        let rule = FeeBurnConfig { from_slot:8,epoch_slots:8 };
+        let mut executor = SvmExecutor::new([(owner.pubkey().to_string(),100_000_000)],&[]).unwrap();
+        executor.set_bridge(bridge); executor.set_native_cutover(native.clone()); executor.set_fee_burn_config(rule.clone());
+        executor.set_placements(vec![placement.clone()]); executor.set_proposers(&[(1,proposer.to_string())]).unwrap();
+        executor.set_credits(vec![
+            BridgeCredit { sequence:0,solana_mint:mint.to_string(),decimals:6,recipient:owner.pubkey().to_string(),amount:10_000 },
+            BridgeCredit { sequence:1,solana_mint:mint.to_string(),decimals:6,recipient:proposer.to_string(),amount:1_000 },
+        ]);
+        executor.execute_slot(3,vec![]).unwrap(); executor.execute_slot(4,vec![]).unwrap();
+        let snapshot = |executor:&SvmExecutor| {
+            let checkpoint = executor.checkpoint(); let mut state = executor.snapshot_meta(&checkpoint);
+            state.accounts = checkpoint.account_changes(None).0.into_iter().map(|(key,account)| (key.to_string(),account.as_ref().clone())).collect();
+            state.executed = checkpoint.executed_changes(None).0; state
+        };
+        let mut legacy = SvmExecutor::from_state(&[],snapshot(&executor)).unwrap();
+        legacy.set_bridge(bridge); legacy.set_native_cutover(native.clone()); legacy.set_placements(vec![placement.clone()]);
+        legacy.set_proposers(&[(1,proposer.to_string())]).unwrap();
+        let item = |executor:&SvmExecutor,instruction:Instruction,slot:u64| {
+            let tx = Transaction::new_signed_with_payer(&[instruction],Some(&owner.pubkey()),&[&owner],Hash::from_str(&executor.latest_blockhash()).unwrap());
+            let transaction = executor.validate_transaction(&bincode::serialize(&tx).unwrap(),slot).unwrap();
+            ExecutionItem { transaction,source_proposers:vec![1] }
+        };
+        let transfer = |executor:&SvmExecutor,slot:u64,amount:u64| item(executor,system_instruction::transfer(&owner.pubkey(),&proposer,amount),slot);
+        let before = transfer(&executor,5,6);
+        executor.execute_slot(5,vec![before.clone()]).unwrap(); legacy.execute_slot(5,vec![before]).unwrap();
+        assert_eq!(executor.state_hash(),legacy.state_hash(),"a future fee-burn rule leaves every pre-activation account unchanged");
+        assert!(executor.fee_burn(1).unwrap().is_none());
+        assert_eq!(executor.native_supply().unwrap().unwrap().fee_burned_lamports,0);
+        let before_activation = executor.native_supply().unwrap().unwrap();
+        executor.execute_slot(8,vec![]).unwrap();
+        assert_eq!(executor.native_supply().unwrap().unwrap().circulating_lamports,before_activation.circulating_lamports,"counter rent joins unbacked reserve");
+        let paid = transfer(&executor,9,10); assert!(executor.execute_slot(9,vec![paid]).unwrap().results[0].success);
+        let failed = transfer(&executor,10,u64::MAX); let failure = executor.execute_slot(10,vec![failed]).unwrap().results.remove(0);
+        assert!(!failure.success); assert_eq!(failure.base_fee,5000,"a failed instruction still pays its charged base fee");
+        assert_eq!(executor.fee_burn_state().unwrap().unwrap().raw_burned_lamports,5000);
+        assert!(executor.fee_burn(2).unwrap().is_none(),"only the arithmetic last cblock may carry the epoch's burn");
+        let checkpoint = executor.checkpoint();
+        let mut loaded = SvmExecutor::from_state(&[],snapshot(&executor)).unwrap();
+        loaded.set_bridge(bridge); loaded.set_native_cutover(native); loaded.set_fee_burn_config(rule);
+        loaded.set_placements(vec![placement]); loaded.set_proposers(&[(1,proposer.to_string())]).unwrap();
+        let last = transfer(&executor,15,16);
+        executor.execute_slot(15,vec![last.clone()]).unwrap(); loaded.execute_slot(15,vec![last.clone()]).unwrap();
+        let first_epoch_hash = executor.state_hash();
+        assert_eq!(loaded.state_hash(),first_epoch_hash,"loading keeps raw totals and the carry in hashed state");
+        executor.restore(checkpoint).unwrap(); executor.execute_slot(15,vec![last]).unwrap();
+        assert_eq!(executor.state_hash(),first_epoch_hash,"rollback replays the same burn and outbox amount");
+        assert_eq!(executor.fee_burn(3).unwrap(),Some(EpochFeeBurn { epoch:1,solana_mint:mint,amount:1 }));
+        let first_epoch_end = executor.checkpoint();
+        assert_eq!(executor.fee_burn_pending_lamports().unwrap(),3500);
+        assert_eq!(executor.native_supply().unwrap().unwrap().fee_burned_lamports,4000);
+        let gate = executor.svm.get_account(&bridge_native(&bridge)).unwrap();
+        assert_eq!(u64::from_le_bytes(gate.data[48..56].try_into().unwrap()),44_000_000 - 7500,"the old native program sees credit net of every raw burned lamport");
+        executor.set_credits(vec![BridgeCredit { sequence:2,solana_mint:mint.to_string(),decimals:6,recipient:owner.pubkey().to_string(),amount:1 }]);
+        executor.execute_slot(16,vec![]).unwrap();
+        assert_eq!(executor.native_supply().unwrap().unwrap().credited_lamports,44_004_000,"public credits remain gross successful deposits");
+        let paid = transfer(&executor,23,24); executor.execute_slot(23,vec![paid]).unwrap();
+        assert_eq!(executor.fee_burn(5).unwrap().unwrap().amount,1);
+        assert!(executor.fee_burn(3).unwrap().is_none(),"the live counter has advanced to a later closure");
+        assert_eq!(executor.fee_burn_at(&first_epoch_end,3).unwrap(),Some(EpochFeeBurn { epoch:1,solana_mint:mint,amount:1 }),
+            "an earlier cblock still gets its own checkpoint's exact fee burn and mint");
+        assert_eq!(executor.fee_burn_pending_lamports().unwrap(),2000);
+        let paid = transfer(&executor,25,26); executor.execute_slot(25,vec![paid]).unwrap();
+        // No slots in cblock 7 (the end of epoch 3) execute. All its pending value must survive.
+        executor.execute_slot(32,vec![]).unwrap();
+        assert!(executor.fee_burn(7).unwrap().is_none(),"a skipped last cblock cannot acquire a manufactured proof entry");
+        assert_eq!(executor.fee_burn_pending_lamports().unwrap(),4500);
+        executor.execute_slot(39,vec![]).unwrap();
+        assert_eq!(executor.fee_burn(9).unwrap().unwrap().amount,1);
+        assert_eq!(executor.fee_burn_pending_lamports().unwrap(),500);
+        executor.execute_slot(47,vec![]).unwrap();
+        assert!(executor.fee_burn(11).unwrap().is_none(),"a zero whole-token burn has no outbox entry");
+        let supply = executor.native_supply().unwrap().unwrap();
+        assert_eq!((supply.credited_lamports,supply.fee_burned_lamports),(44_004_000,12_000));
+
+        // Extra balance from legacy rent cannot enlarge the vault cap. Exercise the unchanged
+        // native SBF, including the base fee charged before its cap check.
+        executor.fund(&owner.pubkey().to_string(),500_000_000).unwrap();
+        let outbound = Pubkey::find_program_address(&[b"outbound"],&bridge).0;
+        let record = |sequence:u64| Pubkey::find_program_address(&[b"withdrawal",&sequence.to_le_bytes()],&bridge).0;
+        let withdraw = |executor:&SvmExecutor,amount:u64,sequence:u64,slot:u64| {
+            let mut data = Sha256::digest(b"global:withdraw_native")[..8].to_vec(); data.extend(amount.to_le_bytes()); data.extend(mint.as_ref());
+            item(executor,Instruction { program_id:bridge,data,accounts:vec![
+                AccountMeta::new(owner.pubkey(),true),AccountMeta::new(bridge_native(&bridge),false),
+                AccountMeta::new_readonly(bridge_minimum(&bridge,&mint),false),AccountMeta::new(bridge_native_burn(&bridge),false),
+                AccountMeta::new(outbound,false),AccountMeta::new(record(sequence),false),AccountMeta::new_readonly(system_program::id(),false),
+            ] },slot)
+        };
+        let too_much = withdraw(&executor,44_004_000 / 4000,0,48);
+        let rejected = executor.execute_slot(48,vec![too_much]).unwrap().results.remove(0);
+        assert!(!rejected.success && rejected.logs.iter().any(|line| line.contains("UnbackedNativeWithdrawal")),"{rejected:?}");
+        assert!(executor.svm.get_account(&record(0)).is_none());
+        let net = u64::from_le_bytes(executor.svm.get_account(&bridge_native(&bridge)).unwrap().data[48..56].try_into().unwrap());
+        let amount = (net - 2500) / 4000;
+        let paid = withdraw(&executor,amount,0,49); let released = executor.execute_slot(49,vec![paid]).unwrap().results.remove(0);
+        assert!(released.success,"{released:?}");
+        let paid = transfer(&executor,50,51); assert_eq!(executor.execute_slot(50,vec![paid]).unwrap().results[0].base_fee,5000);
+        let raw_before = executor.fee_burn_state().unwrap().unwrap().raw_burned_lamports;
+        let paid = transfer(&executor,51,52); let rejected = executor.execute_slot(51,vec![paid]).unwrap().results.remove(0);
+        assert_eq!(rejected.base_fee,0); assert!(!rejected.success);
+        assert_eq!(executor.fee_burn_state().unwrap().unwrap().raw_burned_lamports,raw_before,"an unbacked fee is rejected before charging it");
+        executor.execute_slot(55,vec![]).unwrap();
+        let supply = executor.native_supply().unwrap().unwrap();
+        assert_eq!(supply.withdrawn_lamports + supply.fee_burned_lamports,supply.credited_lamports);
+        assert_eq!(executor.fee_burn_pending_lamports().unwrap(),0);
+        let gate_key = bridge_native(&bridge);
+        let mut gate = executor.svm.get_account(&gate_key).unwrap();
+        gate.data[48..56].copy_from_slice(&(u64::MAX - raw_before - 1000).to_le_bytes());
+        executor.put(gate_key,gate.clone()).unwrap();
+        let wallet_before = executor.balance(&owner.pubkey().to_string()).unwrap();
+        executor.set_credits(vec![BridgeCredit { sequence:3,solana_mint:mint.to_string(),decimals:6,recipient:owner.pubkey().to_string(),amount:1 }]);
+        executor.execute_slot(56,vec![]).unwrap();
+        assert_eq!(executor.next_credit(),4);
+        assert_eq!(executor.balance(&owner.pubkey().to_string()).unwrap(),wallet_before);
+        assert_eq!(executor.svm.get_account(&gate_key).unwrap(),gate,"gross credit overflow cannot partially update the net gate");
+        let skipped:SkippedBridgeCredit = bincode::deserialize(&executor.svm.get_account(&bridge_skipped_credit(&bridge,3)).unwrap().data).unwrap();
+        assert_eq!(skipped.reason,BridgeCreditSkipReason::SupplyOverflow,"gross credit overflow still consumes the deposit through M1");
     }
 
     #[test]

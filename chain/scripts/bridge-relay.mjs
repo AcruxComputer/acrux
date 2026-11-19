@@ -17,6 +17,7 @@ import { chainDir, devKeypair } from './dev-keys.mjs'
 
 export const DEFAULT_EPOCH_SLOTS = 432_000 // Acrux's validator/stake epoch; proposer windows have a separate cadence.
 export const RELEASED_BITS = 8192
+export const BURNED_BITS = 8192
 export const chainTag = name => sha256(Buffer.from(name))
 export const programData = programId => PublicKey.findProgramAddressSync([programId.toBuffer()], new PublicKey('BPFLoaderUpgradeab1e11111111111111111111111'))[0]
 const ED25519 = new PublicKey('Ed25519SigVerify111111111111111111111111111')
@@ -37,6 +38,8 @@ export const pdas = (programId) => {
     cblock: (hash) => pda(Buffer.from('cblock'), hash),
     released: (sequence) => pda(Buffer.from('released'), u64(BigInt(sequence.toString()) / BigInt(RELEASED_BITS))),
     allowed: mint => pda(Buffer.from('allowed'), mint.toBuffer()),
+    feeBurnConfig: pda(Buffer.from('fee_burn_config')),
+    burned: epoch => pda(Buffer.from('fee_burn'), u64(BigInt(epoch.toString()) / BigInt(BURNED_BITS))),
   }
 }
 
@@ -80,6 +83,7 @@ export function outboxProof(leaves, index) {
 
 /// A bincode `OutboxEntry`: a validator set (its epoch and (key, stake) list) or a withdrawal.
 export function decodeEntry(bytes) {
+  if (bytes.readUInt32LE(0) === 2) return { feeBurn: true, epoch: new anchor.BN(bytes.readBigUInt64LE(4).toString()), amount: new anchor.BN(bytes.readBigUInt64LE(12).toString()) }
   if (bytes.readUInt32LE(0) === 1) {
     return {
       withdrawal: true,
@@ -148,9 +152,26 @@ export async function relay(program, proof) {
   const leaves = proof.outbox.map((e) => Buffer.from(e, 'base64'))
   report.handedOn = []
   report.released = []
+  report.burned = []
   for (const [index, leaf] of leaves.entries()) {
     const entry = decodeEntry(leaf)
     if (!state.certified || !entry) continue
+    if (entry.feeBurn) {
+      if (entry.amount.isZero()) continue
+      const { feeBurnConfig, burned } = pdas(program.programId)
+      const guard = await program.account.burned.fetchNullable(burned(entry.epoch))
+      const bit = Number(BigInt(entry.epoch.toString()) % BigInt(BURNED_BITS))
+      if (guard && (guard.bits[Math.floor(bit / 8)] & (1 << (bit % 8)))) continue
+      const config = await program.account.feeBurnConfig.fetch(feeBurnConfig)
+      const tokenProgram = (await connection.getAccountInfo(config.mint)).owner
+      const vault = PublicKey.findProgramAddressSync([Buffer.from('vault'), config.mint.toBuffer()], program.programId)[0]
+      report.transactions.push(await program.methods.burn(entry.epoch, entry.amount, outboxProof(leaves, index)).accountsStrict({
+        payer, bridge: pdas(program.programId).bridge, config: feeBurnConfig, cblock, mint: config.mint, vault,
+        burned: burned(entry.epoch), tokenProgram, systemProgram: anchor.web3.SystemProgram.programId,
+      }).rpc())
+      report.burned.push({ epoch: entry.epoch.toNumber(), amount: entry.amount.toString() })
+      continue
+    }
     if (entry.withdrawal) {
       const guard = await program.account.released.fetchNullable(released(entry.sequence))
       const bit = Number(BigInt(entry.sequence.toString()) % BigInt(RELEASED_BITS))

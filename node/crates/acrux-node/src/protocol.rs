@@ -669,6 +669,8 @@ impl Network {
             state.archived_withdrawals = archive.withdrawals.clone();
             state.epoch_cblock_proofs = archive.epochs.clone();
             state.bridge_program = genesis.as_ref().and_then(|g| g.bridge.as_ref()).map(|rule| rule.program.to_string());
+            state.bridge_epoch_slots = genesis.as_ref().and_then(|g| g.bridge.as_ref()).map(|rule| rule.epoch_slots);
+            state.fee_burn_from_slot = genesis.as_ref().and_then(|g| g.bridge.as_ref()).and_then(|rule| rule.fee_burn_from_slot);
         }
         let resumed = match &saved {
             Some(saved) => Some(BlockRef {
@@ -734,6 +736,7 @@ impl Network {
                         executor.set_bridge(bridge.program);
                         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
                         if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); }
+                        if let Some(fee_burn) = bridge.fee_burn_activation()? { executor.set_fee_burn_config(fee_burn); }
                         if let Some((from_slot, genesis_stake_lamports)) = bridge.stake_activation()? {
                             executor.set_stake_config(crate::execution::StakeConfig { from_slot, epoch_slots: bridge.epoch_slots, genesis_stake_lamports, identities: identities.iter().map(|identity| identity.parse()).collect::<std::result::Result<Vec<_>, _>>()? });
                         }
@@ -749,6 +752,7 @@ impl Network {
                         executor.set_bridge(bridge.program);
                         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
                         if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); }
+                        if let Some(fee_burn) = bridge.fee_burn_activation()? { executor.set_fee_burn_config(fee_burn); }
                         if let Some((from_slot, genesis_stake_lamports)) = bridge.stake_activation()? {
                             executor.set_stake_config(crate::execution::StakeConfig { from_slot, epoch_slots: bridge.epoch_slots, genesis_stake_lamports, identities: identities.iter().map(|identity| identity.parse()).collect::<std::result::Result<Vec<_>, _>>()? });
                         }
@@ -967,6 +971,8 @@ impl Network {
             .collect::<Vec<_>>();
         let proof = json!({
             "consensusSlot": c, "epochSlots": epoch_slots, "chainId": self.genesis.as_ref().and_then(|g| g.bridge.as_ref()).expect("bridge proof requires bridge rule").chain_id, "hash": hex::encode(block.hash), "preimage": B64.encode(&preimage),
+            "feeBurnFromSlot": self.genesis.as_ref().and_then(|g| g.bridge.as_ref()).and_then(|rule| rule.fee_burn_from_slot),
+            "nativeMint": self.genesis.as_ref().and_then(|g| g.bridge.as_ref()).and_then(|rule| rule.native_mint).map(|mint| mint.to_string()),
             "outboxRoot": hex::encode(crate::bridge::outbox_root(&outbox)),
             "outbox": outbox.iter().map(|e| B64.encode(bincode::serialize(e).expect("outbox entry encodes"))).collect::<Vec<_>>(),
             "validators": self.identities, "stakes": self.stakes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
@@ -3287,6 +3293,11 @@ impl Network {
                     outbox.extend(self.nodes[id].executor.as_ref().unwrap().withdrawals(i).into_iter().map(|(sequence, solana_mint, recipient, amount)| {
                         crate::bridge::OutboxEntry::Withdrawal { sequence, solana_mint, recipient, amount }
                     }));
+                    // Voting can trail execution: read the epoch close from this cblock's own
+                    // hashed checkpoint, not the marker of a later executed epoch.
+                    if let Some(burn) = self.nodes[id].executor.as_ref().unwrap().fee_burn_at(self.nodes[id].checkpoints.get(&i).context("Bridge cblock checkpoint is missing")?, i)? {
+                        outbox.push(crate::bridge::OutboxEntry::FeeBurn { epoch:burn.epoch,amount:burn.amount });
+                    }
                     let hash = crypto::hash(&[preimage.as_slice(), &crate::bridge::outbox_root(&outbox)].concat());
                     if id == 0 {
                         self.cblock_preimages.insert(i, (preimage, outbox));
@@ -3661,6 +3672,7 @@ impl Network {
                         "cutoverSlot": supply.cutover_slot, "mint": supply.solana_mint.to_string(), "scale": supply.lamports_per_base_unit.to_string(),
                         "reserveLamports": supply.reserve_lamports.to_string(), "creditedLamports": supply.credited_lamports.to_string(),
                         "withdrawnLamports": supply.withdrawn_lamports.to_string(), "circulatingLamports": supply.circulating_lamports.to_string(),
+                        "feeBurnedLamports": supply.fee_burned_lamports.to_string(),
                     })))
                 })();
                 let _ = reply.send(result.map_err(|e| e.to_string()));

@@ -87,13 +87,24 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
     const lamports = balance.toString()
     await db.bridgeRelayerState.upsert({ where: { program: programName }, create: { program: programName, wallet, lamports, ...patch }, update: { wallet, lamports, ...patch } })
   }
-  async function proof(params: { consensusSlot: number } | { epoch: number } | { latest: true }) {
+  type ProofSelector = { consensusSlot: number } | { epoch: number } | { latest: true }
+  function proof(params: { feeBurnEpoch: number }): Promise<Proof | null>
+  function proof(params: ProofSelector): Promise<Proof>
+  async function proof(params: ProofSelector | { feeBurnEpoch: number }): Promise<Proof | null> {
     const response = await fetch(config.gatewayUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getCblockProof', params }), signal: AbortSignal.timeout(RPC_MS) })
     if (!response.ok) throw new Error('Gateway proof request failed.')
     const body = await response.json() as { result?: unknown; error?: unknown }
-    if (body.error || !body.result) throw new Error('Gateway does not hold the requested finalized proof.')
+    if (body.error || body.result === undefined) throw new Error('Gateway does not hold the requested finalized proof.')
+    if (body.result === null) {
+      if ('feeBurnEpoch' in params) return null
+      throw new Error('Gateway does not hold the requested finalized proof.')
+    }
     const parsed = readProof(body.result, epochSlots, chainId)
     if ('consensusSlot' in params && parsed.consensusSlot !== params.consensusSlot || 'epoch' in params && Math.floor(parsed.consensusSlot * 4 / epochSlots) !== params.epoch) throw new Error('Gateway returned another cblock or epoch.')
+    if ('feeBurnEpoch' in params) {
+      const expected = (params.feeBurnEpoch + 1) * (epochSlots / 4) - 1
+      if (!Number.isSafeInteger(expected) || parsed.consensusSlot !== expected) throw new Error('Gateway returned another fee burn epoch ending.')
+    }
     return parsed
   }
   async function acknowledgeSavedCursor(nextWithdrawalSequence: number) {
@@ -112,6 +123,7 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
   function savedProof(proof: Proof): Prisma.InputJsonObject {
     return {
       consensusSlot: proof.consensusSlot, chainId: proof.chainId, epochSlots: proof.epochSlots,
+      feeBurnFromSlot: proof.feeBurnFromSlot ?? null, nativeMint: proof.nativeMint ?? null,
       hash: proof.hash, outboxRoot: proof.outboxRoot, preimage: proof.preimage.toString('base64'),
       outbox: proof.outbox.map(entry => entry.toString('base64')), validators: proof.validators.map(key => key.toBase58()),
       stakes: proof.stakes, votes: proof.votes,
@@ -190,8 +202,8 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
           resumed = true
         } else {
           // A finalized post/attest/close can need a new generation after its cblock was closed
-          // and reposted. A paid release's permanent bit can never legitimately disappear.
-          if (status.confirmationStatus !== 'finalized' || event === 'bridge_released') throw new Error('Bridge transaction effect is not visible; reconcile its original bytes next tick.')
+          // and reposted. A completed money action's permanent bit cannot disappear.
+          if (status.confirmationStatus !== 'finalized' || (event === 'bridge_released' || event === 'bridge_fee_burned')) throw new Error('Bridge transaction effect is not visible; reconcile its original bytes next tick.')
           await store.update(journalKey, { state: 'expired' })
         }
       }
@@ -200,9 +212,9 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
         completed = await store.get(journalKey)
         if (!completed) throw new Error('Bridge transaction journal is missing.')
         await receipt(completed, commitment)
-        // Successful confirmed program execution establishes intermediate writes. Release alone
-        // also checks its permanent bitmap at finality before reporting payment.
-        if (event === 'bridge_released' && !await applied(commitment)) throw new Error('Finalized release bit is missing.')
+        // Confirmed execution establishes intermediate writes; both money actions also check
+        // their permanent bitmap at finality before being reported complete.
+        if ((event === 'bridge_released' || event === 'bridge_fee_burned') && !await applied(commitment)) throw new Error('Finalized bridge replay bit is missing.')
       }
       log({ event, ...fields, signature: completed.signature, commitment, ...(resumed ? { resumed: true } : {}) })
     } catch (error) {
@@ -296,6 +308,38 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
     if (await account<ValidatorSet>(solana, setPda(epoch), 'ValidatorSet')) return
     await action('bridge_handed_on', `handoff:${epoch}`, { epoch, cblock: proof.consensusSlot }, async () => [await program.methods.handOff(new BN(epoch), entry.validators, outboxProof(proof.outbox, index)).accountsStrict({ payer: signer.publicKey, cblock, next: setPda(epoch), systemProgram: SystemProgram.programId }).instruction()], async commitment => !!await account<ValidatorSet>(solana, setPda(epoch), 'ValidatorSet', commitment))
   }
+  async function isFeeBurned(epoch: number) {
+    const bucket = Math.floor(epoch / 8192)
+    const info = await solana.getAccountInfo(pda(Buffer.from('fee_burn'), u64(bucket)), { commitment: 'finalized', minContextSlot: solanaFinalizedSlot })
+    // Anchor can initialize a PDA that someone has already funded as an empty system account.
+    if (!info || !info.executable && info.owner.equals(SystemProgram.programId) && info.data.length === 0) return false
+    const state = decode<ReleasedBucket>('Burned', info)
+    if (exact(state.bucket, 'fee burn bucket') !== bucket) throw new Error('Fee burn bucket differs.')
+    const bit = epoch % 8192
+    return !!(state.bits[Math.floor(bit / 8)] & (1 << (bit % 8)))
+  }
+  async function retireFeeBurn(epoch: number) {
+    own()
+    const key = `bridge:${programName}:fee-burn:${epoch}`
+    if ((await store.get(key))?.state === 'signed') await store.update(key, { state: 'confirmed' })
+  }
+  async function burnFee(proof: Proof, nativeMint: PublicKey) {
+    const index = proof.entries.findIndex(entry => entry.kind === 'feeBurn')
+    const entry = proof.entries[index]
+    const epoch = Math.floor(proof.consensusSlot * 4 / epochSlots)
+    // A zero-fee epoch has no FeeBurn leaf. Its ending cblock still hands the set on.
+    if (!await account<ValidatorSet>(solana, setPda(epoch + 1), 'ValidatorSet')) await handOff(proof, epoch + 1)
+    if (!entry || entry.kind !== 'feeBurn' || entry.amount.isZero()) return
+    const config = pda(Buffer.from('fee_burn_config'))
+    const bound = await account<{ mint: PublicKey }>(solana, config, 'FeeBurnConfig')
+    if (!bound || !bound.mint.equals(nativeMint)) throw new Error('Initialize the fee burn configuration with the native Solana mint before relaying burns.')
+    const tokenProgram = await mintTokenProgram(nativeMint)
+    const cblock = await certify(proof)
+    await action('bridge_fee_burned', `fee-burn:${entry.epoch}`, { epoch: entry.epoch, amount: entry.amount.toString() }, async () => [
+      await program.methods.burn(new BN(entry.epoch), entry.amount, outboxProof(proof.outbox, index)).accountsStrict({ payer: signer.publicKey, bridge, config, cblock, mint: nativeMint, vault: pda(Buffer.from('vault'), nativeMint.toBuffer()), burned: pda(Buffer.from('fee_burn'), u64(Math.floor(entry.epoch / 8192))), tokenProgram, systemProgram: SystemProgram.programId }).instruction(),
+    ], async () => isFeeBurned(entry.epoch), 'finalized')
+    await retireFeeBurn(entry.epoch)
+  }
   type PayoutGroup = { proof: Proof; entries: { entry: Extract<Entry, { kind: 'withdrawal' }>; index: number }[] }
   async function paySelected(groups: Map<string, PayoutGroup>) {
     const results = await Promise.allSettled([...groups.values()].map(async group => {
@@ -338,14 +382,55 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
     let sets = await programAccounts<ValidatorSet>('ValidatorSet')
     for (const set of sets) if (!set.address.equals(setPda(exact(set.value.epoch, 'validator epoch')))) throw new Error('Validator set PDA differs.')
     if (!sets.length) throw new Error('Seed the bridge validator set before starting the relayer.')
+    const row = await db.bridgeRelayerState.findUniqueOrThrow({ where: { program: programName } })
+    const firstFeeBurnEpoch = latest.feeBurnFromSlot == null ? null : latest.feeBurnFromSlot / epochSlots
+    const nativeMint = firstFeeBurnEpoch === null ? null : new PublicKey(latest.nativeMint!)
+    let nextFeeBurnEpoch: number | null = null
+    if (firstFeeBurnEpoch !== null) {
+      nextFeeBurnEpoch = row.nextFeeBurnEpoch == null ? firstFeeBurnEpoch : exact(row.nextFeeBurnEpoch, 'fee burn cursor')
+      if (nextFeeBurnEpoch < firstFeeBurnEpoch) throw new Error('The fee burn rule moved beyond its persisted cursor.')
+      if (row.nextFeeBurnEpoch == null) {
+        own()
+        await db.bridgeRelayerState.update({ where: { program: programName }, data: { nextFeeBurnEpoch: BigInt(nextFeeBurnEpoch) } })
+      }
+    } else if (row.nextFeeBurnEpoch != null) throw new Error('The gateway removed the configured fee burn rule.')
+    const ends = new Map<number, Proof | null>()
+    const epochEnd = async (epoch: number) => {
+      if (!ends.has(epoch)) ends.set(epoch, await proof({ feeBurnEpoch: epoch }))
+      return ends.get(epoch)!
+    }
     let newestEpoch = Math.max(...sets.map(set => exact(set.value.epoch, 'validator epoch')))
     while (newestEpoch < currentEpoch) {
-      await handOff(await proof({ epoch: newestEpoch }), newestEpoch + 1)
+      const relay = firstFeeBurnEpoch !== null && newestEpoch >= firstFeeBurnEpoch ? await epochEnd(newestEpoch) ?? await proof({ epoch: newestEpoch }) : await proof({ epoch: newestEpoch })
+      await handOff(relay, newestEpoch + 1)
       newestEpoch++
+    }
+    let burnFailure: { error: unknown } | null = null
+    if (nextFeeBurnEpoch !== null) {
+      let cursor: number = nextFeeBurnEpoch
+      const completedThrough = Math.floor((finalizedSlot + 1) / epochSlots) - 1
+      try {
+        while (cursor <= completedThrough) {
+          if (await isFeeBurned(cursor)) await retireFeeBurn(cursor)
+          else {
+            const end = await epochEnd(cursor)
+            if (end) await burnFee(end, nativeMint!)
+          }
+          // An explicit null end carries unallocated fees forward. An end without FeeBurn has
+          // no burn transaction; a positive leaf reaches here only after its permanent bit is final.
+          const advanced = cursor + 1
+          own()
+          await db.bridgeRelayerState.update({ where: { program: programName }, data: { nextFeeBurnEpoch: BigInt(advanced) } })
+          cursor = advanced
+        }
+      } catch (error) {
+        burnFailure = { error }
+        log({ event: 'bridge_fee_burn_deferred', epoch: cursor, error: reason(error) })
+      }
+      nextFeeBurnEpoch = cursor
     }
     const outbound = await account<{ withdrawals: BN }>(acrux, pda(Buffer.from('outbound')), 'Outbound', 'finalized')
     const count = outbound ? exact(outbound.withdrawals, 'withdrawal count') : 0
-    const row = await db.bridgeRelayerState.findUniqueOrThrow({ where: { program: programName } })
     let next = exact(row.nextWithdrawalSequence, 'withdrawal cursor')
     let saved = exact(row.savedWithdrawalSequence, 'saved withdrawal cursor')
     if (saved > count || next > count) throw new Error('Acrux withdrawal count is behind the persisted bridge cursors.')
@@ -506,7 +591,7 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
     // Retire only a bounded number of intermediate receipts, after all payout phases. Actions
     // required by a handoff recover their own original bytes before this housekeeping runs.
     const pending = await db.keeperTransaction.findMany({
-      where: { state: 'signed', key: { startsWith: `bridge:${programName}:` }, NOT: { key: { startsWith: `bridge:${programName}:release:` } } },
+      where: { state: 'signed', key: { startsWith: `bridge:${programName}:`, not: { startsWith: `bridge:${programName}:fee-burn:` } }, NOT: { key: { startsWith: `bridge:${programName}:release:` } } },
       orderBy: [{ createdAt: 'asc' }, { key: 'asc' }], take: config.maxRetryWithdrawalsPerCycle,
     })
     const resumed = await Promise.allSettled(pending.map(async row => {
@@ -530,17 +615,19 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
     for (const cblock of cblocks) {
       if (!cblock.address.equals(pda(Buffer.from('cblock'), Buffer.from(cblock.value.hash)))) throw new Error('Cblock PDA differs.')
       const slot = exact(cblock.value.slot, 'cblock slot')
-      if (keptCblocks.has(slot) || unscannedCblock !== null && slot >= unscannedCblock) continue
+      const pendingFeeBurn = nextFeeBurnEpoch !== null && Math.floor(slot * 4 / epochSlots) >= nextFeeBurnEpoch && (slot + 1) * 4 % epochSlots === 0
+      if (pendingFeeBurn || keptCblocks.has(slot) || unscannedCblock !== null && slot >= unscannedCblock) continue
       if (cblock.value.payer.equals(signer.publicKey)) await closeCblock(cblock.address, slot)
     }
     sets = await programAccounts<ValidatorSet>('ValidatorSet', 'finalized')
     const newestFinalizedEpoch = sets.length ? Math.max(...sets.map(set => exact(set.value.epoch, 'validator epoch'))) : null
     for (const set of sets) {
       const epoch = exact(set.value.epoch, 'validator epoch')
-      if (newestFinalizedEpoch === null || epoch + 1 >= newestFinalizedEpoch || epoch >= currentEpoch || keptEpochs.has(epoch) || unscannedEpoch !== null && epoch >= unscannedEpoch || !set.value.payer.equals(signer.publicKey)) continue
+      if (newestFinalizedEpoch === null || epoch + 1 >= newestFinalizedEpoch || epoch >= currentEpoch || nextFeeBurnEpoch !== null && epoch >= nextFeeBurnEpoch || keptEpochs.has(epoch) || unscannedEpoch !== null && epoch >= unscannedEpoch || !set.value.payer.equals(signer.publicKey)) continue
       await action('bridge_account_closed', `close-set:${epoch}`, { account: set.address.toBase58(), kind: 'validator_set', epoch }, async () => [await program.methods.closeValidatorSet().accountsStrict({ payer: signer.publicKey, set: set.address, newest: setPda(newestFinalizedEpoch) }).instruction()], async commitment => !await account<ValidatorSet>(solana, set.address, 'ValidatorSet', commitment))
     }
     await report(newestFinalizedEpoch === null ? {} : { lastHandedEpoch: BigInt(newestFinalizedEpoch) })
+    if (burnFailure) throw burnFailure.error
   }
   return { runCycle }
 }

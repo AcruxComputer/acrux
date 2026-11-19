@@ -231,6 +231,7 @@ model BridgeRelayerState {
   lastRelayedAt          DateTime? @map("last_relayed_at") @db.Timestamptz(3)
   nextWithdrawalSequence BigInt   @default(0) @map("next_withdrawal_sequence")
   savedWithdrawalSequence BigInt  @default(0) @map("saved_withdrawal_sequence")
+  nextFeeBurnEpoch        BigInt?  @map("next_fee_burn_epoch")
   updatedAt              DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   @@map("bridge_relayer_states")

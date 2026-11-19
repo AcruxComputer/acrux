@@ -116,6 +116,8 @@ pub struct GatewayState {
     pub archived_withdrawals: BTreeMap<u64, Vec<u64>>,
     pub epoch_cblock_proofs: BTreeMap<u64, u64>,
     pub bridge_program: Option<String>,
+    pub bridge_epoch_slots: Option<u64>,
+    pub fee_burn_from_slot: Option<u64>,
     /// Volatile acknowledgement of the relayer's durable Postgres save cursor.
     pub bridge_saved_cursor: Option<u64>,
     pub parameters: Value,
@@ -153,6 +155,8 @@ impl GatewayState {
             archived_withdrawals: BTreeMap::new(),
             epoch_cblock_proofs: BTreeMap::new(),
             bridge_program: None,
+            bridge_epoch_slots: None,
+            fee_burn_from_slot: None,
             bridge_saved_cursor: None,
             counters: json!({"slots":0,"finalizedCblocks":0,"skips":0,"averageCommitSpreadUs":0}),
             counter_base: (0, 0),
@@ -391,35 +395,46 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
         },
         "getCblockProof" => {
             let state = state.read().await;
-            let selectors = [params.get("consensusSlot"), params.get("epoch"), params.get("latest")].iter().filter(|s| s.is_some()).count();
-            let slot = params.get("consensusSlot").and_then(Value::as_u64);
-            let epoch = params.get("epoch").and_then(Value::as_u64);
-            if selectors != 1 || (slot.is_none() && epoch.is_none() && params.get("latest") != Some(&Value::Bool(true))) {
-                Err(("INVALID_INPUT", "Give exactly one of consensusSlot, epoch, or latest: true."))
+            let selectors = [params.get("consensusSlot"), params.get("epoch"), params.get("latest"), params.get("feeBurnEpoch")].iter().filter(|selector| selector.is_some()).count();
+            let slot = params.get("consensusSlot").and_then(safe_integer);
+            let epoch = params.get("epoch").and_then(safe_integer);
+            let fee_burn_epoch = params.get("feeBurnEpoch").and_then(safe_integer);
+            if selectors != 1 || (slot.is_none() && epoch.is_none() && fee_burn_epoch.is_none() && params.get("latest") != Some(&Value::Bool(true))) {
+                Err(("INVALID_INPUT", "Give exactly one of consensusSlot, epoch, feeBurnEpoch, or latest: true."))
             } else {
-                let slot = if let Some(slot) = slot {
-                    Some(slot)
+                let selected = if let Some(slot) = slot {
+                    Ok(Some(slot))
                 } else if let Some(epoch) = epoch {
-                    state.epoch_cblock_proofs.get(&epoch).copied().or_else(|| {
+                    Ok(state.epoch_cblock_proofs.get(&epoch).copied().or_else(|| {
                         state.cblock_proofs.iter().find_map(|(slot, proof)| {
-                            let epoch_slots = proof["epochSlots"].as_u64().filter(|length| *length > 0)?;
-                            (slot * 4 / epoch_slots == epoch).then_some(*slot)
+                            let length = proof["epochSlots"].as_u64().filter(|length| *length > 0)?;
+                            (slot * 4 / length == epoch).then_some(*slot)
                         })
-                    })
+                    }))
+                } else if let Some(epoch) = fee_burn_epoch {
+                    match (state.fee_burn_from_slot, state.bridge_epoch_slots) {
+                        (Some(from), Some(length)) if epoch >= from / length => epoch.checked_add(1).and_then(|next| next.checked_mul(length / 4)).and_then(|next| next.checked_sub(1))
+                            .map(Some).ok_or(("INVALID_INPUT", "feeBurnEpoch is too large.")),
+                        _ => Err(("INVALID_INPUT", "The fee-burn rule is not active for this epoch.")),
+                    }
                 } else {
-                    state.cblock_proofs.keys().next_back().into_iter().chain(state.archived_withdrawals.keys().next_back()).max().copied()
+                    Ok(state.cblock_proofs.keys().next_back().into_iter().chain(state.archived_withdrawals.keys().next_back()).max().copied())
                 };
-                match slot {
-                    Some(slot) => match state.cblock_proofs.get(&slot) {
+                match selected {
+                    Err(error) => Err(error),
+                    Ok(Some(slot)) => match state.cblock_proofs.get(&slot) {
                         Some(proof) => Ok(proof.clone()),
                         None if state.archived_withdrawals.contains_key(&slot) => match state.bridge_archive.as_ref().map(|archive| archive.get(slot)).transpose() {
                             Ok(Some(Some(proof))) => Ok(proof),
                             Ok(_) => Err(("NOT_FOUND", "No finalized bridge proof is held for this selector.")),
                             Err(_) => Err(("INTERNAL_ERROR", "The archived bridge proof could not be read.")),
                         },
+                        // Epoch-end proofs are permanent. Only a durable descendant past an absent
+                        // end proves it was skipped; an incomplete epoch remains NOT_FOUND.
+                        None if fee_burn_epoch.is_some() && state.finalized_cblock.is_some_and(|head| head > slot) => Ok(Value::Null),
                         None => Err(("NOT_FOUND", "No finalized bridge proof is held for this selector.")),
                     },
-                    None => Err(("NOT_FOUND", "No finalized bridge proof is held for this selector.")),
+                    Ok(None) => Err(("NOT_FOUND", "No finalized bridge proof is held for this selector.")),
                 }
             }
         },

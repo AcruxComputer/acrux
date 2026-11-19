@@ -125,6 +125,8 @@ export const BridgeRelayer = z.strictObject({
 export const BridgeNative = z.strictObject({
   cutoverSlot: Count, mint: Address, scale: U64,
   reserveLamports: U64, creditedLamports: U64, withdrawnLamports: U64, circulatingLamports: U64,
+  /** Cumulative native lamports committed in rounded FeeBurn entries, including burns waiting on Solana. */
+  feeBurnedLamports: U64,
 })
 export type BridgeNative = z.infer<typeof BridgeNative>
 export const Bridge = z.strictObject({

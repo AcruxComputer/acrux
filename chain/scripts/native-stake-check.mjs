@@ -34,6 +34,8 @@ const nativeFromSlot = asNumber(required('native-from-slot'), 'native-from-slot'
 const stakeFromSlot = asNumber(required('stake-from-slot'), 'stake-from-slot')
 const epochSlots = asNumber(required('epoch-slots'), 'epoch-slots')
 const scale = required('native-scale'), genesisStakeLamports = required('genesis-stake-lamports')
+// --solana-cli <folder holding solana and solana-keygen> also runs the docs' CLI flow.
+const solanaCli = arg('solana-cli')
 asNumber(scale, 'native-scale')
 assert.ok(epochSlots % 16 === 0, 'The local bridge epoch must contain whole sixteen-slot proposer windows.')
 assert.ok(nativeFromSlot % epochSlots === 0 && stakeFromSlot % epochSlots === 0 && stakeFromSlot > nativeFromSlot, 'Use separate native and stake activation boundaries in the local bridge epochs.')
@@ -223,6 +225,30 @@ try {
   const minimumDelegation = await acrux.getStakeMinimumDelegation({ commitment: 'finalized' })
   assert.ok(stakeLamports >= BigInt(minimumDelegation.value), `Twice --genesis-stake-lamports must meet the actual Stake program minimum of ${minimumDelegation.value} native lamports.`)
   event('native_stake_baseline', { proposerEpoch: baselineEpoch, voteAccounts: baselineVotes, minimumDelegationLamports: minimumDelegation.value })
+  // The docs' CLI flow (web/content/docs/sdk/stake.mdx), command for command, through the stock solana
+  // CLI. One config file in this run's folder keeps the operator's own CLI config untouched.
+  if (solanaCli) {
+    const config = join(runDir, 'cli.yml'), holderFile = join(runDir, 'holder.json'), stakeFile = join(runDir, 'stake-account.json')
+    writeFileSync(holderFile, JSON.stringify([...holder.secretKey]))
+    const cli = (tool, args) => {
+      const run = spawnSync(join(solanaCli, process.platform === 'win32' ? `${tool}.exe` : tool), [...args, '--config', config], { cwd: runDir, encoding: 'utf8', windowsHide: true, timeout: 120_000 })
+      const printed = `${run.stdout}${run.stderr}`.trim()
+      event('stock_cli', { command: [tool, ...args].join(' '), status: run.status, printed })
+      assert.equal(run.status, 0, `${tool} ${args.join(' ')} refused: ${printed}`)
+      return printed
+    }
+    cli('solana', ['config', 'set', '--url', gateway, '--keypair', holderFile])
+    cli('solana-keygen', ['new', '--no-bip39-passphrase', '-o', stakeFile])
+    cli('solana', ['create-stake-account', stakeFile, '10'])
+    cli('solana', ['delegate-stake', stakeFile, vote.toBase58()])
+    const delegatedIn = (await acrux.getEpochInfo('finalized')).epoch
+    cli('solana', ['deactivate-stake', stakeFile])
+    await waitSlot((delegatedIn + 1) * epochSlots + 4)
+    cli('solana', ['withdraw-stake', stakeFile, holder.publicKey.toBase58(), 'ALL'])
+    const stakeAddress = new PublicKey(cli('solana-keygen', ['pubkey', stakeFile]).split(/\s+/).at(-1))
+    assert.equal(await acrux.getAccountInfo(stakeAddress, 'finalized'), null, 'withdraw-stake ALL must close the stake account.')
+    event('stock_cli_passed', { vote: vote.toBase58(), delegatedInEpoch: delegatedIn, withdrawnInEpoch: (await acrux.getEpochInfo('finalized')).epoch })
+  }
   const rent = await acrux.getMinimumBalanceForRentExemption(StakeProgram.space)
   const accountLamports = asNumber(stakeLamports + BigInt(rent), 'stake account funding')
   assert.ok(BigInt(await acrux.getBalance(holder.publicKey, 'finalized')) > BigInt(accountLamports), 'The converted deposit must cover the delegation, its rent and fees.')

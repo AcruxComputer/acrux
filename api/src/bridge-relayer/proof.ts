@@ -10,13 +10,16 @@ const wireProof = z.object({
   consensusSlot: integer.max(Math.floor((Number.MAX_SAFE_INTEGER - 3) / 4)),
   chainId: z.string().min(1),
   epochSlots: integer.positive().refine(value => value % 4 === 0),
+  feeBurnFromSlot: integer.nullable().optional(),
+  nativeMint: z.string().nullable().optional(),
   hash: z.string().regex(/^[0-9a-f]{64}$/), outboxRoot: z.string().regex(/^[0-9a-f]{64}$/),
   preimage: base64, outbox: z.array(base64).min(1),
   validators: z.array(z.string()).min(1).max(32), stakes: z.array(decimal).min(1).max(32),
   votes: z.array(z.object({ validator: integer.max(31), kind: z.enum(['notar', 'finalize']), signature: base64 })),
 })
 export type Entry = { kind: 'set'; epoch: number; validators: { key: PublicKey; stake: BN }[] } |
-  { kind: 'withdrawal'; sequence: number; mint: PublicKey; recipient: PublicKey; amount: BN }
+  { kind: 'withdrawal'; sequence: number; mint: PublicKey; recipient: PublicKey; amount: BN } |
+  { kind: 'feeBurn'; epoch: number; amount: BN }
 export type Proof = Omit<z.infer<typeof wireProof>, 'preimage' | 'outbox' | 'validators'> & { preimage: Buffer; outbox: Buffer[]; validators: PublicKey[]; entries: Entry[] }
 const sha256 = (...parts: Buffer[]) => createHash('sha256').update(Buffer.concat(parts)).digest()
 export const u64 = (value: number) => { const bytes = Buffer.alloc(8); bytes.writeBigUInt64LE(BigInt(value)); return bytes }
@@ -27,6 +30,9 @@ export const exact = (value: BN | bigint | number, label: string): number => {
 }
 
 function decodeEntry(bytes: Buffer): Entry {
+  if (bytes.length === 20 && bytes.readUInt32LE(0) === 2) return {
+    kind: 'feeBurn', epoch: exact(bytes.readBigUInt64LE(4), 'fee burn epoch'), amount: new BN(bytes.readBigUInt64LE(12).toString()),
+  }
   if (bytes.length === 84 && bytes.readUInt32LE(0) === 1) return {
     kind: 'withdrawal', sequence: exact(bytes.readBigUInt64LE(4), 'withdrawal sequence'),
     mint: new PublicKey(bytes.subarray(12, 44)), recipient: new PublicKey(bytes.subarray(44, 76)), amount: new BN(bytes.readBigUInt64LE(76).toString()),
@@ -51,6 +57,11 @@ export function readProof(raw: unknown, epochSlots: number, chainId: Buffer): Pr
   if (level[0].toString('hex') !== wire.outboxRoot) throw new Error('Gateway outbox root is invalid.')
   const next = entries.filter(entry => entry.kind === 'set')
   if (next.length !== 1 || next[0].epoch !== Math.floor(wire.consensusSlot * 4 / epochSlots) + 1) throw new Error('Gateway outbox epoch is invalid.')
+  const burns = entries.filter(entry => entry.kind === 'feeBurn')
+  if (burns.length > 1 || burns.some(entry => entry.epoch !== Math.floor(wire.consensusSlot * 4 / epochSlots) || (wire.consensusSlot + 1) * 4 % epochSlots !== 0)) throw new Error('Gateway fee burn is not the epoch-ending cblock.')
+  if (wire.feeBurnFromSlot != null && (wire.feeBurnFromSlot % epochSlots !== 0 || !wire.nativeMint)) throw new Error('Gateway fee burn rule is invalid.')
+  if (wire.nativeMint != null) new PublicKey(wire.nativeMint)
+  if (burns.length && wire.feeBurnFromSlot != null && wire.consensusSlot * 4 < wire.feeBurnFromSlot) throw new Error('Gateway fee burn precedes its activation.')
   if (wire.votes.some(vote => vote.validator >= validators.length || Buffer.from(vote.signature, 'base64').length !== 64)) throw new Error('Gateway vote is invalid.')
   return { ...wire, preimage, outbox, validators, entries }
 }

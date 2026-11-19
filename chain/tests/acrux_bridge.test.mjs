@@ -9,7 +9,7 @@ import { before, test } from 'node:test'
 import anchor from '@coral-xyz/anchor'
 import {
   ExtensionType, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, createInitializeMintInstruction, createInitializeTransferFeeConfigInstruction,
-  createMint, getAccount, getMintLen, getOrCreateAssociatedTokenAccount, mintTo,
+  createMint, getAccount, getMint, getMintLen, getOrCreateAssociatedTokenAccount, mintTo,
 } from '@solana/spl-token'
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SYSVAR_INSTRUCTIONS_PUBKEY, SystemProgram, Transaction, sendAndConfirmTransaction } from '@solana/web3.js'
 import { chainDir, devKeypair } from '../scripts/dev-keys.mjs'
@@ -239,6 +239,79 @@ test('release bitmap: a sequence pays once and a neighboring sequence in the sam
   assert.equal((await getAccount(connection, destination)).amount, 500_000_000n)
 })
 
+
+// FeeBurn is a distinct bincode variant, bound to one authority-configured native mint.
+const feeBurnEntry = (epoch, amount) => Buffer.concat([Buffer.from([2, 0, 0, 0]), u64(epoch), u64(amount)])
+const feeBurnConfig = pdas(program.programId).feeBurnConfig
+const postBurnCblock = async (leaves, at) => {
+  const epochSlots = (await program.account.bridge.fetch(bridge)).epochSlots.toNumber()
+  const epoch = Math.floor(at * 4 / epochSlots)
+  const root = sha256(sha256(leaves[0]), sha256(leaves[1]))
+  const preimage = Buffer.concat([u64(at), Buffer.from('a fee-burn regression cblock')])
+  const hash = sha256(preimage, root)
+  const cblock = cblockOf(hash)
+  await program.methods.postCblock([...hash], [...root], preimage).accountsStrict({ payer: depositor.publicKey, bridge, cblock, systemProgram: SystemProgram.programId }).rpc()
+  const certify = async () => {
+    const signed = [0, 1].map(v => {
+      const message = voteMessage(chainId, v, at, hash, 'finalize')
+      return { key: validators[v].key, signature: sign(null, message, validators[v].privateKey), message }
+    })
+    const ix = await program.methods.attestCblock().accountsStrict({ bridge, cblock, set: setOf(epoch), instructions: SYSVAR_INSTRUCTIONS_PUBKEY }).instruction()
+    await program.provider.sendAndConfirm(new Transaction().add(ed25519Instruction(signed), ix), [])
+  }
+  return { hash, cblock, leaves, certify }
+}
+const burnFees = (proof, epoch, amount) => program.methods.burn(new anchor.BN(epoch), new anchor.BN(amount), outboxProof(proof.leaves, 1)).accountsStrict({
+  payer: depositor.publicKey, bridge, config: feeBurnConfig, cblock: proof.cblock, mint, vault: vaultOf(mint),
+  burned: pdas(program.programId).burned(epoch), tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId,
+}).rpc()
+let feeBurnProof
+
+test('fee burn: a valid FeeBurn proof burns the vault and lowers mint supply', async () => {
+  const initialize = (authorityKey) => program.methods.initFeeBurnConfig().accountsStrict({ authority: authorityKey.publicKey, bridge, mint, config: feeBurnConfig, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId }).signers(authorityKey === authority ? [authority] : []).rpc()
+  await assert.rejects(initialize(depositor))
+  await initialize(authority)
+  assert.ok((await program.account.feeBurnConfig.fetch(feeBurnConfig)).mint.equals(mint))
+  await assert.rejects(initialize(authority))
+  const epochSlots = (await program.account.bridge.fetch(bridge)).epochSlots.toNumber()
+  const leaves = [setEntry(1, validators), feeBurnEntry(0, 100_000_000)]
+  feeBurnProof = await postBurnCblock(leaves, epochSlots / 4 - 1)
+  await assert.rejects(burnFees(feeBurnProof, 0, 100_000_000), err => err.error?.errorCode?.code === 'NotCertified')
+  await feeBurnProof.certify()
+  await assert.rejects(burnFees(feeBurnProof, 1, 100_000_000), err => err.error?.errorCode?.code === 'BadFeeBurnEpoch')
+  await assert.rejects(burnFees(feeBurnProof, 0, 100_000_001), err => err.error?.errorCode?.code === 'BadProof')
+  const nonFinal = await postBurnCblock(leaves, epochSlots / 4 - 2)
+  await nonFinal.certify()
+  await assert.rejects(burnFees(nonFinal, 0, 100_000_000), err => err.error?.errorCode?.code === 'BadFeeBurnEpoch')
+  const vaultBefore = (await getAccount(connection, vaultOf(mint))).amount
+  const supplyBefore = (await getMint(connection, mint)).supply
+  await burnFees(feeBurnProof, 0, 100_000_000)
+  assert.equal(vaultBefore - (await getAccount(connection, vaultOf(mint))).amount, 100_000_000n)
+  assert.equal(supplyBefore - (await getMint(connection, mint)).supply, 100_000_000n)
+  const burned = await program.account.burned.fetch(pdas(program.programId).burned(0))
+  assert.equal(burned.bucket.toNumber(), 0)
+  assert.equal(burned.bits[0], 1)
+})
+
+test('fee burn: a second burn of the same epoch fails', async () => {
+  const vaultBefore = (await getAccount(connection, vaultOf(mint))).amount
+  await assert.rejects(burnFees(feeBurnProof, 0, 100_000_000), err => err.error?.errorCode?.code === 'AlreadyBurned')
+  assert.equal((await getAccount(connection, vaultOf(mint))).amount, vaultBefore)
+})
+
+test('fee burn: a FeeBurn leaf given to release fails', async () => {
+  await assert.rejects(release(feeBurnProof.hash, feeBurnProof.leaves, { sequence: 42, amount: 100_000_000, index: 1 }), err => err.error?.errorCode?.code === 'BadProof')
+})
+
+test('fee burn: a Withdrawal leaf given to burn fails', async () => {
+  const epochSlots = (await program.account.bridge.fetch(bridge)).epochSlots.toNumber()
+  const proof = await postBurnCblock([setEntry(2, validators), withdrawalEntry(43, 10_000_000)], epochSlots / 2 - 1)
+  await proof.certify()
+  const vaultBefore = (await getAccount(connection, vaultOf(mint))).amount
+  await assert.rejects(burnFees(proof, 1, 10_000_000), err => err.error?.errorCode?.code === 'BadProof')
+  assert.equal((await getAccount(connection, vaultOf(mint))).amount, vaultBefore)
+  assert.equal((await program.account.burned.fetch(pdas(program.programId).burned(1))).bits[0], 1)
+})
 
 // Close receipts prove that rent goes back to the account's recorded payer, after the fee.
 const checkRentReturned = async (signature, address, payer = depositor.publicKey) => {
