@@ -579,6 +579,7 @@ impl Network {
                     if let Some(bridge) = genesis.as_ref().and_then(|g| g.bridge.as_ref()) {
                         executor.set_bridge(bridge.program);
                         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
+                        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); }
                     }
                     anyhow::ensure!(executor.state_hash() == saved.state.state_hash, "the saved state at cblock {} hashes to {}, not to its saved hash {}", block.slot, executor.state_hash(), saved.state.state_hash);
                     executor
@@ -590,6 +591,7 @@ impl Network {
                     if let Some(bridge) = genesis.as_ref().and_then(|g| g.bridge.as_ref()) {
                         executor.set_bridge(bridge.program);
                         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
+                        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); }
                     }
                     executor.set_fees(crate::execution::Fees {
                         reserve_lamports: config.reserve,
@@ -1800,6 +1802,7 @@ impl Network {
             .as_ref()
             .filter(|f| f.scenario == "censorship" && f.window == s / 16 && f.attacker != q)
             .and_then(|_| self.lab_marked.lock().unwrap().clone());
+        self.retire_builtin(id, s);
         let node = &mut self.nodes[id];
         let (txs, fragments) = pack(node, s, q, censored.as_ref());
         let credits = self.credits_due(id, s);
@@ -1939,6 +1942,7 @@ impl Network {
         }
         let slot = window * 16;
         let key = crypto::fresh_key();
+        self.retire_builtin(id, slot);
         let node = &mut self.nodes[id];
         let (transactions, fragments) = pack(node, slot, q, None);
         let credits = self.credits_due(id, slot);
@@ -2104,6 +2108,8 @@ impl Network {
         let mut step = Step::new();
         match e.body {
             Wire::Submit(tx) => {
+                // Judged by the slot it targets: every actor, not only node zero's, admits submissions.
+                if self.native_cutover_slot().is_some_and(|cut| tx.header.target_slot >= cut) && self.built_in.contains(&tx.header.fee_payer) { return Ok(()) }
                 let valid = self.nodes[id]
                     .executor
                     .as_ref()
@@ -2690,6 +2696,9 @@ impl Network {
                 };
             }
             self.nodes[id].slots.get_mut(&s).unwrap().payload = payloads.iter().cloned().collect();
+            // Restore the selected parent first, then retire legacy money before this slot's
+            // inclusion fees. A rollback restores the marker along with every other account.
+            self.nodes[id].executor.as_mut().unwrap().activate_native_cutover(s)?;
             let mut validation = payloads
                 .iter()
                 .flat_map(|(q, txs)| {
@@ -3374,8 +3383,18 @@ impl Network {
             .map(|w| elapsed(w.start).saturating_sub(i % 4 * 200000))
             .unwrap_or(0)
     }
+    fn native_cutover_slot(&self) -> Option<u64> {
+        self.genesis.as_ref().and_then(|g| g.bridge.as_ref()).and_then(|bridge| bridge.native_from_slot)
+    }
+    fn retire_builtin(&mut self, id: usize, slot: u64) {
+        if !self.native_cutover_slot().is_some_and(|cut| slot >= cut) { return }
+        // This public payer set is present on every actor, unlike node zero's private keys.
+        let retired = &self.built_in;
+        self.nodes[id].mempool.retain(|_, tx| !retired.contains(&tx.header.fee_payer));
+    }
     async fn traffic(&mut self) -> Result<()> {
         let s = self.latest_started() + 3;
+        if self.native_cutover_slot().is_some_and(|cut| s >= cut) { return Ok(()) }
         let ids = self.proposer_ids(s / 16);
         let n = self.traffic_seq as usize;
         self.traffic_seq += 1;
@@ -3472,6 +3491,17 @@ impl Network {
             GatewayCommand::Faucet { reply } => {
                 let _ = reply.send(self.faucet_available().map_err(|e| e.to_string()));
             }
+            GatewayCommand::NativeSupply { reply } => {
+                let result = (|| {
+                    let supply = self.nodes[0].executor.as_ref().unwrap().native_supply()?;
+                    Ok::<_, anyhow::Error>(supply.map_or(Value::Null, |supply| json!({
+                        "cutoverSlot": supply.cutover_slot, "mint": supply.solana_mint.to_string(), "scale": supply.lamports_per_base_unit.to_string(),
+                        "reserveLamports": supply.reserve_lamports.to_string(), "creditedLamports": supply.credited_lamports.to_string(),
+                        "withdrawnLamports": supply.withdrawn_lamports.to_string(), "circulatingLamports": supply.circulating_lamports.to_string(),
+                    })))
+                })();
+                let _ = reply.send(result.map_err(|e| e.to_string()));
+            }
             GatewayCommand::Credit {
                 address,
                 lamports,
@@ -3540,7 +3570,12 @@ impl Network {
     }
     /// What the faucet can still grant: the genesis faucet's balance and what every other funder holds
     /// above what it keeps.
+    fn require_faucet(&self, slot: u64) -> Result<()> {
+        if let Some(cut) = self.native_cutover_slot().filter(|cut| slot >= *cut) { anyhow::bail!("FAUCET_RETIRED: {cut}") }
+        Ok(())
+    }
     fn faucet_available(&self) -> Result<Value> {
+        self.require_faucet(self.latest_started())?;
         let executor = self.nodes[0].executor.as_ref().unwrap();
         let funds = |k: &Keypair| executor.balance(&k.pubkey().to_string()).unwrap_or(0);
         let faucet = self.genesis.as_ref().map_or(0, |g| funds(&g.faucet));
@@ -3553,6 +3588,7 @@ impl Network {
     }
     async fn faucet_transfer(&mut self, address: &str, lamports: u64) -> Result<Value> {
         let target = self.latest_started() + SEND_LEAD_SLOTS;
+        self.require_faucet(target)?;
         let recipient: solana_sdk::pubkey::Pubkey = address.parse()?;
         let genesis = self.genesis.clone();
         // The grant's ACRUX comes from the genesis faucet while it can pay, then from whichever
@@ -4111,7 +4147,9 @@ impl Network {
             "getBalance" => json!({"context": context, "value": executor.balance(arg(0).as_str().context("address")?)?}),
             "getSupply" => {
                 let total = executor.total_lamports()?;
-                json!({"context": context, "value": {"total": total, "circulating": total, "nonCirculating": 0, "nonCirculatingAccounts": []}})
+                let reserve = executor.native_supply()?.map_or(0, |supply| supply.reserve_lamports);
+                let circulating = total.checked_sub(reserve).context("Native supply is below its fixed reserve")?;
+                json!({"context": context, "value": {"total": total, "circulating": circulating, "nonCirculating": reserve, "nonCirculatingAccounts": []}})
             }
             "getAccountInfo" => {
                 let encoding = encoding(&arg(1));

@@ -2,7 +2,7 @@
 // program on Solana (SOLANA_RPC_URL) and on Acrux (the gateway), read every BRIDGE_POLL_SECONDS.
 // Deposit and withdrawal records are read once, by sequence; what changes after (credited,
 // certified, released) is read for the transfers still on their way.
-import { ACRUX_BRIDGE_IDL, paginate, type Bridge, type BridgeTransfer, type PageQuery } from '@acrux/contract'
+import { ACRUX_BRIDGE_IDL, BridgeNative, paginate, type Bridge, type BridgeTransfer, type PageQuery } from '@acrux/contract'
 import { BorshAccountsCoder, type Idl } from '@coral-xyz/anchor'
 import { PublicKey } from '@solana/web3.js'
 import type { PrismaClient } from '@prisma/client'
@@ -32,7 +32,7 @@ export class BridgeReader {
   private withdrawals = new Map<number, Withdrawal>()
   private credited = 0
   private decimals = new Map<string, number>()
-  private view: Omit<Bridge, 'status' | 'program' | 'fromSlot' | 'relayer'> = { lightClient: { epoch: null, validators: 0, latestCertified: null }, vaults: [], totals: { deposits: 0, credited: 0, withdrawals: 0, released: 0 }, readAt: null }
+  private view: Omit<Bridge, 'status' | 'program' | 'fromSlot' | 'relayer'> = { native: null, lightClient: { epoch: null, validators: 0, latestCertified: null }, vaults: [], totals: { deposits: 0, credited: 0, withdrawals: 0, released: 0 }, readAt: null }
 
   constructor(program: string | undefined, private readonly fromSlot: number | null, private readonly solanaUrl: string, private readonly acruxUrl: string, private readonly pollMs: number) {
     this.program = program ? new PublicKey(program) : null
@@ -49,7 +49,7 @@ export class BridgeReader {
 
   private pda(...seeds: Buffer[]) { return PublicKey.findProgramAddressSync(seeds, this.program!)[0] }
 
-  private async rpc(url: string, method: string, params: unknown[]) {
+  private async rpc(url: string, method: string, params: unknown[] | Record<string, unknown>) {
     const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal: AbortSignal.timeout(10_000) })
     const body = await response.json() as { result?: any; error?: { message: string } }
     if (body.error) throw new Error(`${method}: ${body.error.message}`)
@@ -73,10 +73,11 @@ export class BridgeReader {
 
   private async read() {
     const now = Date.now()
-    const [bridgeAccount, outbound, creditedAccount] = await Promise.all([
+    const [bridgeAccount, outbound, creditedAccount, native] = await Promise.all([
       this.accounts(this.solanaUrl, [this.pda(Buffer.from('bridge'))]).then(a => a[0]),
       this.accounts(this.acruxUrl, [this.pda(Buffer.from('outbound'))]).then(a => a[0]),
       this.accounts(this.acruxUrl, [this.pda(Buffer.from('credited'))]).then(a => a[0]),
+      this.rpc(this.acruxUrl, 'getNativeSupply', {}).then(value => BridgeNative.nullable().parse(value)),
     ])
     // New deposits on Solana and withdrawals on Acrux, by sequence.
     const made = bridgeAccount ? Number(coder.decode('Bridge', bridgeAccount.data).deposits) : 0
@@ -103,7 +104,7 @@ export class BridgeReader {
     // Withdrawals on their way: their cblock's hash from the gateway, then certified and released.
     const pending = [...this.withdrawals.values()].filter(w => !w.released)
     for (const w of pending.filter(w => !w.hash)) {
-      const proof = await this.rpc(this.acruxUrl, 'getCblockProof', { consensusSlot: Math.floor(w.slot / 4) } as never).catch(() => null)
+      const proof = await this.rpc(this.acruxUrl, 'getCblockProof', { consensusSlot: Math.floor(w.slot / 4) }).catch(() => null)
       if (proof?.hash) w.hash = proof.hash
     }
     for (const w of pending) w.certified = !!w.hash && certified.has(w.hash)
@@ -126,6 +127,7 @@ export class BridgeReader {
     const bridgedMints = mints.map(m => this.pda(Buffer.from('mint'), new PublicKey(m).toBuffer()))
     const supplies = await this.accounts(this.acruxUrl, bridgedMints)
     this.view = {
+      native,
       lightClient: {
         epoch: sets.length ? Math.max(...sets.map(s => Number(s.value.epoch))) : null,
         validators: sets.length ? sets.sort((a, b) => Number(b.value.epoch) - Number(a.value.epoch))[0].value.validators.length : 0,

@@ -1,3 +1,4 @@
+import { FAUCET_RETIRED_MESSAGE } from './bridge.js'
 import type { z } from 'zod'
 import { toBase58, toBase64 } from './encoding.js'
 import { PROTOCOL_PARAMETERS, errors } from './schemas.js'
@@ -435,7 +436,7 @@ export const specMap: z.infer<typeof SpecMap> = {
     { topic: 'Registry and faucet', decision: 'Deposit, registration fee, cooldown, inactivity, code rules and faucet limits must be configured.', status: 'configuration_required' },
   ],
 }
-const specialMessages: Record<string, string> = { NOT_FOUND: 'The requested resource was not found.', RATE_LIMITED: 'Too many requests. Try again shortly.', FAUCET_LIMIT: 'The faucet limit for this key or IP has been reached.', FAUCET_EMPTY: 'The faucet cannot pay this grant.', GRANT_FAILED: 'The grant transaction failed on Acrux Net.', INVALID_INPUT: 'The request contains invalid input.', VALIDATION_ERROR: 'The request contains invalid input.', NET_STALLED: 'No new slot has arrived for one second.', NET_UNAVAILABLE: 'Acrux Net is unavailable.', PROGRAM_UNAVAILABLE: 'Waiting for the registry program.', CONFIGURATION_REQUIRED: 'Required configuration has not been set.', ORIGIN_NOT_ALLOWED: 'This origin is not allowed.', TRANSACTION_EXPIRED: 'The transaction fragments expired before reaching the threshold.' }
+const specialMessages: Record<string, string> = { FAUCET_RETIRED: FAUCET_RETIRED_MESSAGE, NOT_FOUND: 'The requested resource was not found.', RATE_LIMITED: 'Too many requests. Try again shortly.', FAUCET_LIMIT: 'The faucet limit for this key or IP has been reached.', FAUCET_EMPTY: 'The faucet cannot pay this grant.', GRANT_FAILED: 'The grant transaction failed on Acrux Net.', INVALID_INPUT: 'The request contains invalid input.', VALIDATION_ERROR: 'The request contains invalid input.', NET_STALLED: 'No new slot has arrived for one second.', NET_UNAVAILABLE: 'Acrux Net is unavailable.', PROGRAM_UNAVAILABLE: 'Waiting for the registry program.', CONFIGURATION_REQUIRED: 'Required configuration has not been set.', ORIGIN_NOT_ALLOWED: 'This origin is not allowed.', TRANSACTION_EXPIRED: 'The transaction fragments expired before reaching the threshold.' }
 export const failureFixtures: Record<keyof typeof errors.status, ApiErrorBody> = Object.fromEntries(Object.keys(errors.status).map(code => [code, {
   error: { code, message: specialMessages[code] ?? `Fixture failure: ${code.toLowerCase().replaceAll('_', ' ')}.`, retryable: ['RATE_LIMITED', 'FAUCET_LIMIT', 'NET_STALLED', 'NET_UNAVAILABLE', 'PROGRAM_UNAVAILABLE', 'UPSTREAM_UNAVAILABLE'].includes(code), stage: code === 'INVALID_INPUT' || code === 'VALIDATION_ERROR' ? 'validation' : 'read',
     ...(['RATE_LIMITED', 'FAUCET_LIMIT'].includes(code) ? { retryAfterSeconds: 60 } : {}),
@@ -490,14 +491,14 @@ const bridgeProgram = 'EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5'
 const bridgeSolanaMint = '3A5GLMkvQndVrzcTTC7gXDUnBnaTDhQFWvumfhQ7uYyT'
 const bridgeAcruxMint = 'Bu5CMp2GSnpzLGNpVvpA3mMPPftbiJRYBTpqYGSAJxsN'
 export const bridgeFixture: z.infer<typeof Bridge> = {
-  status: 'live', program: bridgeProgram, fromSlot: 0, relayer: null,
+  status: 'live', program: bridgeProgram, fromSlot: 0, relayer: null, native: null,
   lightClient: { epoch: 1, validators: 12, latestCertified: { consensusSlot: 174, epoch: 0, hash: 'a7'.repeat(32), outboxRoot: '5c'.repeat(32), account: '7Wt8f36u8o2DdMmZaQQpdpSg8QFS6hEdTheKZqtZEgvb' } },
   vaults: [{ solanaMint: bridgeSolanaMint, acruxMint: bridgeAcruxMint, decimals: 6, lockedBaseUnits: '1500000000', bridgedBaseUnits: '1250000000' }],
   totals: { deposits: 1, credited: 1, withdrawals: 2, released: 1 },
   readAt: '2026-11-18T14:30:00.000Z',
 }
 export const bridgeWaitingFixture: z.infer<typeof Bridge> = {
-  status: 'waiting', program: null, fromSlot: null, relayer: null, lightClient: { epoch: null, validators: 0, latestCertified: null }, vaults: [],
+  status: 'waiting', program: null, fromSlot: null, relayer: null, native: null, lightClient: { epoch: null, validators: 0, latestCertified: null }, vaults: [],
   totals: { deposits: 0, credited: 0, withdrawals: 0, released: 0 }, readAt: null,
 }
 export const bridgeTransfersFixture: z.infer<typeof BridgeTransfer>[] = [

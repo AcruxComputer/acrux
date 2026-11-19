@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { z } from 'zod'
 import { streamSSE } from 'hono/streaming'
 import {
-  Address, ApiClientError, Balance, BridgeTransfersQuery, CONTRACT_VERSION, FaucetRequest, HubCode, LabRunRequest, PageQuery, Signature, SpecMap,
+  Address, ApiClientError, Balance, BridgeTransfersQuery, CONTRACT_VERSION, Count, FAUCET_RETIRED_MESSAGE, FaucetRequest, HubCode, LabRunRequest, PageQuery, Signature, SpecMap,
   TxId, createGatewayClient, paginate, type ProtocolEvent, type RpcMethod,
 } from '@acrux/contract'
 import { scenarios } from '@acrux/contract/fixtures'
@@ -157,13 +157,27 @@ export function createNodeApi() {
     return at ? new Date(at) : null
   }
   const policy = () => ({ amountLamports: env.FAUCET_GRANT_LAMPORTS!, perKey: env.FAUCET_PER_KEY_LIMIT!, perIp: env.FAUCET_PER_IP_LIMIT!, periodSeconds: env.FAUCET_WINDOW_SECONDS!, missingConfiguration: [] })
-  // What the faucet can still grant, from the node's private port; null while it cannot be read.
-  const available = async () => {
-    try {
-      const response = await fetch(new URL('/internal/faucet', env.GATEWAY_INTERNAL_URL), { signal: AbortSignal.timeout(2000) })
-      return response.ok ? z.object({ availableLamports: z.string().regex(/^\d+$/) }).parse(await response.json()).availableLamports : null
-    } catch { return null }
+  const rejectRetiredFaucet = (body: unknown, stage: 'read' | 'send') => {
+    const retired = z.object({ error: z.object({ code: z.literal('FAUCET_RETIRED'), cutoverSlot: Count }) }).safeParse(body)
+    if (retired.success) fail('FAUCET_RETIRED', FAUCET_RETIRED_MESSAGE, { retryable: false, stage, cutoverSlot: retired.data.error.cutoverSlot })
   }
+  // What the faucet can still grant; retirement is a permanent response, never an unavailable balance.
+  const available = async () => {
+    let response: Response
+    try { response = await fetch(new URL('/internal/faucet', env.GATEWAY_INTERNAL_URL), { signal: AbortSignal.timeout(2000) }) }
+    catch { return null }
+    if (!response.ok) {
+      rejectRetiredFaucet(await response.json().catch(() => null), 'read')
+      return null
+    }
+    try { return z.object({ availableLamports: z.string().regex(/^\d+$/) }).parse(await response.json()).availableLamports }
+    catch { return null }
+  }
+  // Keep the pre-cutover root GET unavailable, while reporting retirement at this path too.
+  app.get('/v1/faucet', async () => {
+    await available()
+    fail('NOT_FOUND', 'A wallet address is required for faucet status.')
+  })
   app.get('/v1/faucet/:address', async c => {
     const address = readParam(c, 'address', Address), ip = clientIp(c), left = await remaining(address, ip)
     const [frees, availableLamports] = await Promise.all([freesAt(address, ip, left), available()])
@@ -185,6 +199,7 @@ export function createNodeApi() {
     const { address } = await readJson(c, FaucetRequest), ip = clientIp(c)
     const limited = faucetWindows(ip, 'faucet', 20)
     if (limited !== null) fail('RATE_LIMITED', 'Too many faucet requests from this address; try again in a minute.', { retryable: true, retryAfterSeconds: limited, stage: 'validation' })
+    await available() // Reject retirement before reserving a grant; the node also checks at submission.
     // The grant's row is written before the grant is paid, under a lock on its IP and key, so
     // parallel requests count each other. IP before key everywhere, so the locks never deadlock.
     const reserved = await db.$transaction(async tx => {
@@ -212,6 +227,7 @@ export function createNodeApi() {
       if (!response.ok) {
         await release()
         const refused = await response.json().catch(() => null) as { error?: { code?: string } } | null
+        rejectRetiredFaucet(refused, 'send')
         if (refused?.error?.code === 'FAUCET_EMPTY') fail('FAUCET_EMPTY', 'The faucet cannot pay this grant.', { retryable: false, stage: 'send' })
         fail('NET_UNAVAILABLE', 'Acrux Net could not submit this grant.', { retryable: true, stage: 'send' })
       }

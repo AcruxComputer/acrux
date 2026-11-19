@@ -186,6 +186,37 @@ pub fn bridge_minimum(bridge: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"minimum", mint.as_ref()], bridge).0
 }
 
+/// A named-slot rule converting the bridge's ACRUX token into the chain's native lamports.
+#[derive(Clone, Debug)]
+pub struct NativeCutover {
+    pub slot: u64,
+    pub solana_mint: Pubkey,
+    pub lamports_per_base_unit: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeSupply {
+    pub cutover_slot: u64,
+    pub solana_mint: Pubkey,
+    pub lamports_per_base_unit: u64,
+    pub reserve_lamports: u64,
+    pub credited_lamports: u64,
+    pub withdrawn_lamports: u64,
+    pub circulating_lamports: u64,
+}
+
+pub fn bridge_native(bridge: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"native"], bridge).0
+}
+
+pub fn bridge_native_burn(bridge: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"native_burn"], bridge).0
+}
+
+fn native_wallet(account: &Account) -> bool {
+    account.owner == system_program::id() && account.data.is_empty() && !account.executable
+}
+
 pub trait Executor {
     fn validate_transaction(&self, bytes: &[u8], target_slot: u64) -> Result<ValidatedTx>;
     fn execute_slot(&mut self, slot: u64, items: Vec<ExecutionItem>) -> Result<SlotExecution>;
@@ -265,14 +296,15 @@ pub struct SvmExecutor {
     allowed_programs: BTreeSet<Pubkey>,
     fees: Fees,
     track_capacity_cu: u64,
-    /// The placements, each with the digest its program account has once placed.
-    placements: Vec<(Placement, [u8; 32])>,
+    /// Each placement's code-account indexes. Mutable pool/config accounts do not trigger re-placement.
+    placements: Vec<(Placement, Vec<usize>)>,
     /// The Solana bridge program's address, when the chain credits its deposits.
     bridge: Option<Pubkey>,
     /// The credits the next executed slot applies, before its transactions.
     credits: Vec<BridgeCredit>,
     /// Rule-owned minimum accounts enter committed state at the bridge activation slot.
     bridge_minimums: Option<(u64, Vec<MinimumWithdrawal>)>,
+    native_cutover: Option<NativeCutover>,
 }
 
 impl SvmExecutor {
@@ -465,6 +497,7 @@ impl SvmExecutor {
             bridge: None,
             credits: vec![],
             bridge_minimums: None,
+            native_cutover: None,
         };
         for program in [
             "ComputeBudget111111111111111111111111111111",
@@ -789,23 +822,43 @@ impl SvmExecutor {
         self.placements = placements
             .into_iter()
             .map(|p| {
-                let (key, program) = p.accounts.last().expect("a placement holds its program account");
-                let digest = account_digest(key, program);
-                (p, digest)
+                let program_index = p.accounts.len().checked_sub(1).expect("a placement holds its program account");
+                let program = &p.accounts[program_index].1;
+                let mut code = vec![program_index];
+                if program.owner == solana_sdk::bpf_loader_upgradeable::id() {
+                    let state:solana_sdk::bpf_loader_upgradeable::UpgradeableLoaderState = bincode::deserialize(&program.data).expect("an upgradeable placement has a Program account");
+                    let solana_sdk::bpf_loader_upgradeable::UpgradeableLoaderState::Program { programdata_address } = state else {
+                        panic!("an executable upgradeable placement must reference ProgramData");
+                    };
+                    code.push(p.accounts.iter().position(|(key,_)| *key == programdata_address).expect("a placement includes its referenced ProgramData"));
+                }
+                (p, code)
             })
             .collect();
     }
 
-    /// Writes every placement due by `slot` whose program account is not yet in the state as placed.
+    /// Writes every due placement whose program or program-data account differs from the rule.
     /// The same on every validator and follower, and again after a rollback past it.
     fn apply_placements(&mut self, slot: u64) -> Result<()> {
         for i in 0..self.placements.len() {
-            let (placement, digest) = &self.placements[i];
-            let program = placement.accounts.last().unwrap().0;
-            if placement.slot > slot || self.account_hashes.get(&program) == Some(digest) {
+            let (placement, code) = &self.placements[i];
+            let program = placement.accounts.last().expect("a placement holds its program account").0;
+            // An append-only manifest may place a later version at the same address. Once it is
+            // due, do not reload the older bytecode before restoring the newer one on every slot.
+            let newest = self.placements.iter().enumerate().filter(|(_, (p,_))| p.slot <= slot && p.accounts.last().is_some_and(|(key,_)| *key == program))
+                .max_by_key(|(index,(p,_))| (p.slot,*index)).map(|(index,_)| index);
+            if newest != Some(i) { continue }
+            let placed = code.iter().all(|index| {
+                let (key,expected) = &placement.accounts[*index];
+                self.accounts.get(key).is_some_and(|current| current.owner == expected.owner && current.executable == expected.executable && current.data == expected.data)
+            });
+            if placed {
                 continue;
             }
-            for (key, account) in placement.accounts.clone() {
+            for (key, mut account) in placement.accounts.clone() {
+                if self.native_cutover.as_ref().is_some_and(|rule| slot >= rule.slot) {
+                    account.lamports = account.lamports.max(self.svm.get_account(&key).map_or(0,|current| current.lamports));
+                }
                 self.put(key, account)?;
             }
         }
@@ -818,6 +871,125 @@ impl SvmExecutor {
 
     pub fn set_bridge_minimums(&mut self, from_slot: u64, minimums: Vec<MinimumWithdrawal>) {
         self.bridge_minimums = Some((from_slot, minimums));
+    }
+
+    pub fn set_native_cutover(&mut self, rule: NativeCutover) {
+        self.native_cutover = Some(rule);
+    }
+
+    /// Canonical execution and followers call this after restoring the parent, before inclusion
+    /// fees. Only the first native activation moves these steps earlier; historical ordering and
+    /// placements arriving after the cutover keep their normal execute_slot ordering.
+    pub fn activate_native_cutover(&mut self, slot: u64) -> Result<()> {
+        if self.native_cutover.as_ref().is_none_or(|rule| slot < rule.slot) { return Ok(()) }
+        if self.native_gate()?.is_some() { return Ok(()) }
+        self.apply_placements(slot)?;
+        self.apply_bridge_minimums(slot)?;
+        self.apply_native_cutover(slot)
+    }
+
+    /// The native marker is ordinary hashed bridge-owned state, so restore/load alone determines
+    /// whether conversion has already happened. The program can change only its withdrawn field.
+    fn native_gate(&self) -> Result<Option<Account>> {
+        let Some(bridge) = self.bridge else { return Ok(None) };
+        let Some(account) = self.svm.get_account(&bridge_native(&bridge)) else { return Ok(None) };
+        if native_wallet(&account) { return Ok(None) }
+        anyhow::ensure!(account.owner == bridge && !account.executable && account.data.len() == 80
+            && account.data[..8] == Sha256::digest(b"account:NativeGate")[..8], "Invalid native bridge gate");
+        let scale = u64::from_le_bytes(account.data[40..48].try_into().unwrap());
+        let credited = u64::from_le_bytes(account.data[48..56].try_into().unwrap());
+        let withdrawn = u64::from_le_bytes(account.data[56..64].try_into().unwrap());
+        anyhow::ensure!(scale > 0 && withdrawn <= credited, "Invalid native bridge accounting");
+        if let Some(rule) = &self.native_cutover {
+            anyhow::ensure!(account.data[8..40] == rule.solana_mint.to_bytes()
+                && scale == rule.lamports_per_base_unit && account.data[72..80] == rule.slot.to_le_bytes(), "Native bridge rule differs from committed cutover");
+        }
+        Ok(Some(account))
+    }
+
+    pub fn native_supply(&self) -> Result<Option<NativeSupply>> {
+        let Some(account) = self.native_gate()? else { return Ok(None) };
+        let value = |offset| u64::from_le_bytes(account.data[offset..offset + 8].try_into().unwrap());
+        let reserve_lamports = value(64);
+        Ok(Some(NativeSupply {
+            cutover_slot: value(72),
+            solana_mint: Pubkey::new_from_array(account.data[8..40].try_into().unwrap()),
+            lamports_per_base_unit: value(40),
+            reserve_lamports,
+            credited_lamports: value(48),
+            withdrawn_lamports: value(56),
+            circulating_lamports: self.total_lamports()?.checked_sub(reserve_lamports).context("Native supply fell below the fixed cutover reserve")?,
+        }))
+    }
+
+    fn apply_native_cutover(&mut self, slot: u64) -> Result<()> {
+        let Some(rule) = self.native_cutover.clone().filter(|rule| slot >= rule.slot) else { return Ok(()) };
+        let bridge = self.bridge.context("Native cutover requires the bridge program")?;
+        anyhow::ensure!(rule.lamports_per_base_unit > 0, "Native cutover scale must be positive");
+        if self.native_gate()?.is_some() { return Ok(()) }
+        let gate_key = bridge_native(&bridge);
+        let burn_key = bridge_native_burn(&bridge);
+        for key in [gate_key,burn_key] {
+            anyhow::ensure!(self.svm.get_account(&key).as_ref().is_none_or(native_wallet), "Native cutover PDA has an incompatible account");
+        }
+        let mint_key = bridge_mint(&bridge, &rule.solana_mint);
+        let mut changes = BTreeMap::new();
+        let mut gains = BTreeMap::<Pubkey,u64>::new();
+        let mut credited = 0u64;
+        let mut reserve = 0u64;
+        for (key, current) in &self.accounts {
+            let mut account = current.as_ref().clone();
+            if native_wallet(&account) {
+                account.lamports = 0;
+            } else {
+                reserve = reserve.checked_add(account.lamports).context("Native cutover reserve overflow")?;
+            }
+            if account.owner == spl_token_id() && account.data.len() == 165 && account.data[..32] == mint_key.to_bytes() {
+                anyhow::ensure!(matches!(account.data[108],1|2), "Native cutover token account is not initialized");
+                let owner = Pubkey::new_from_array(account.data[32..64].try_into().unwrap());
+                let amount = u64::from_le_bytes(account.data[64..72].try_into().unwrap());
+                let lamports = amount.checked_mul(rule.lamports_per_base_unit).context("Native cutover token scaling overflow")?;
+                credited = credited.checked_add(lamports).context("Native cutover credited overflow")?;
+                let gain = gains.entry(owner).or_default();
+                *gain = gain.checked_add(lamports).context("Native cutover holder overflow")?;
+                account.data[64..72].fill(0);
+            }
+            if *key == mint_key {
+                anyhow::ensure!(account.owner == spl_token_id() && !account.executable && account.data.len() == 82 && account.data[45] == 1, "Native cutover mint is invalid");
+                account.data[36..44].fill(0);
+            }
+            changes.insert(*key,account);
+        }
+        // These two rule-owned accounts exist before reserve capture; their rent is not backed
+        // native value and must not appear in the circulating amount.
+        let gate_rent = self.rent_exempt_minimum(80);
+        let burn_rent = self.rent_exempt_minimum(0);
+        reserve = reserve.checked_add(gate_rent).and_then(|n| n.checked_add(burn_rent)).context("Native cutover reserve overflow")?;
+        let mut data = Sha256::digest(b"account:NativeGate")[..8].to_vec();
+        data.extend_from_slice(rule.solana_mint.as_ref());
+        for value in [rule.lamports_per_base_unit,credited,0,reserve,rule.slot] { data.extend_from_slice(&value.to_le_bytes()); }
+        changes.insert(gate_key,Account { lamports:gate_rent,data,owner:bridge,executable:false,rent_epoch:0 });
+        changes.insert(burn_key,Account { lamports:burn_rent,data:vec![],owner:bridge,executable:false,rent_epoch:0 });
+        for (owner,lamports) in gains {
+            let account = changes.entry(owner).or_default();
+            account.lamports = account.lamports.checked_add(lamports).context("Native cutover wallet overflow")?;
+        }
+        for (key,account) in changes { self.put(key,account)?; }
+        Ok(())
+    }
+
+    fn clear_native_burn(&mut self) -> Result<()> {
+        if self.native_gate()?.is_none() { return Ok(()) }
+        let bridge = self.bridge.unwrap();
+        let key = bridge_native_burn(&bridge);
+        let mut account = self.svm.get_account(&key).context("Native burn account missing")?;
+        let rent = self.rent_exempt_minimum(0);
+        anyhow::ensure!(account.owner == bridge && !account.executable && account.data.is_empty() && account.lamports >= rent, "Invalid native burn account");
+        if account.lamports != rent {
+            account.lamports = rent;
+            self.put(key,account)?;
+        }
+        Ok(())
     }
 
     /// Installs each configured floor before transactions, including after a rollback or a
@@ -946,6 +1118,20 @@ impl SvmExecutor {
         Ok([(mint, mint_account), (ata, holder)])
     }
 
+    fn prepare_native_credit(&self, bridge: &Pubkey, mut gate: Account, credit: &BridgeCredit) -> std::result::Result<[(Pubkey, Account); 2], BridgeCreditSkipReason> {
+        use BridgeCreditSkipReason::*;
+        let recipient = Pubkey::from_str(&credit.recipient).map_err(|_| InvalidRecipient)?;
+        let mut wallet = self.svm.get_account(&recipient).unwrap_or_default();
+        if wallet.owner != system_program::id() { return Err(RecipientOwner) }
+        if wallet.executable || !wallet.data.is_empty() { return Err(RecipientLayout) }
+        let scale = u64::from_le_bytes(gate.data[40..48].try_into().unwrap());
+        let lamports = credit.amount.checked_mul(scale).ok_or(BalanceOverflow)?;
+        let credited = u64::from_le_bytes(gate.data[48..56].try_into().unwrap()).checked_add(lamports).ok_or(SupplyOverflow)?;
+        wallet.lamports = wallet.lamports.checked_add(lamports).ok_or(BalanceOverflow)?;
+        gate.data[48..56].copy_from_slice(&credited.to_le_bytes());
+        Ok([(recipient,wallet),(bridge_native(bridge),gate)])
+    }
+
     /// Applies each deposit once, in sequence. Invalid destination state or arithmetic records a
     /// skipped deposit and advances the counter, so the same finalized deposit cannot halt slots.
     fn apply_credits(&mut self) -> Result<()> {
@@ -957,8 +1143,11 @@ impl SvmExecutor {
             if credit.sequence != next {
                 continue;
             }
+            let native = self.native_gate()?;
             let prepared = if next == u64::MAX {
                 Err(BridgeCreditSkipReason::SequenceOverflow)
+            } else if let Some(gate) = native.filter(|gate| Pubkey::from_str(&credit.solana_mint).ok().is_some_and(|mint| gate.data[8..40] == mint.to_bytes())) {
+                self.prepare_native_credit(&bridge,gate,&credit)
             } else {
                 self.prepare_bridge_credit(&bridge, &credit)
             };
@@ -990,6 +1179,7 @@ impl SvmExecutor {
         self.set_slot_clock(slot)?;
         self.apply_placements(slot)?;
         self.apply_bridge_minimums(slot)?;
+        self.apply_native_cutover(slot)?;
         self.apply_credits()?;
         let mut merged = BTreeMap::<String, ExecutionItem>::new();
         for item in items {
@@ -1192,6 +1382,7 @@ impl SvmExecutor {
             self.remember_executed(candidate.id.clone(), &item.transaction.bytes);
             results.push(outcome);
         }
+        self.clear_native_burn()?;
         self.advance_blockhash(slot);
         Ok(SlotExecution {
             merged_order: ordered
@@ -1525,6 +1716,264 @@ mod tests {
         let record = executor.svm.get_account(&bridge_skipped_credit(&bridge, 1)).unwrap();
         assert_eq!(bincode::deserialize::<SkippedBridgeCredit>(&record.data).unwrap(), SkippedBridgeCredit { credit: overflow, reason: BridgeCreditSkipReason::BalanceOverflow });
         executor.execute_slot(2, vec![]).unwrap();
+    }
+
+    #[test]
+    fn native_cutover_converts_all_holders_retires_wallets_and_replays_from_state() {
+        use base64::Engine;
+        let bridge = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let other_mint = Pubkey::new_unique();
+        let alice = Pubkey::new_unique();
+        let bob = Pubkey::new_unique();
+        let faucet = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+        let record_owner = Pubkey::new_unique();
+        let nonce = Pubkey::new_unique();
+        let rule = NativeCutover { slot:8,solana_mint:mint,lamports_per_base_unit:1000 };
+        let mut executor = SvmExecutor::new([(alice.to_string(),9_000_000),(bob.to_string(),8_000_000),(faucet.to_string(),1_000_000_000),(validator.to_string(),7_000_000)],&[]).unwrap();
+        executor.set_bridge(bridge);
+        executor.set_native_cutover(rule.clone());
+        executor.put(record_owner,Account { lamports:12_345,data:vec![77],owner:bridge,executable:false,rent_epoch:0 }).unwrap();
+        executor.put(nonce,Account { lamports:123_456,data:vec![9],owner:system_program::id(),executable:false,rent_epoch:0 }).unwrap();
+        // Both placements have the same program account. Only ProgramData changes at the cutover.
+        let file:serde_json::Value = serde_json::from_slice(&std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../chain/placements/memo-4c2p.json")).unwrap()).unwrap();
+        let mut accounts = file["accounts"].as_array().unwrap().iter().map(|a| (Pubkey::from_str(a["address"].as_str().unwrap()).unwrap(),Account {
+            lamports:a["lamports"].as_u64().unwrap(),data:base64::engine::general_purpose::STANDARD.decode(a["data"].as_str().unwrap()).unwrap(),
+            owner:Pubkey::from_str(a["owner"].as_str().unwrap()).unwrap(),executable:a["executable"].as_bool().unwrap(),rent_epoch:0,
+        })).collect::<Vec<_>>();
+        let configuration = Pubkey::new_unique();
+        accounts.insert(accounts.len() - 1,(configuration,Account { lamports:4_000,data:vec![1,2],owner:accounts.last().unwrap().0,executable:false,rent_epoch:0 }));
+        let mut upgraded = accounts.clone();
+        upgraded[0].1.data[4..12].copy_from_slice(&8u64.to_le_bytes());
+        executor.set_placements(vec![Placement { name:"memo before cutover".into(),slot:2,accounts:accounts.clone() },Placement { name:"memo at cutover".into(),slot:8,accounts:upgraded.clone() }]);
+        executor.set_credits(vec![
+            BridgeCredit { sequence:0,solana_mint:mint.to_string(),decimals:6,recipient:alice.to_string(),amount:30 },
+            BridgeCredit { sequence:1,solana_mint:other_mint.to_string(),decimals:6,recipient:bob.to_string(),amount:9 },
+        ]);
+        executor.execute_slot(3,vec![]).unwrap();
+        assert!(executor.native_supply().unwrap().is_none());
+        let native_mint = bridge_mint(&bridge,&mint);
+        let alice_ata = Pubkey::find_program_address(&[alice.as_ref(),spl_token_id().as_ref(),native_mint.as_ref()],&Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap()).0;
+        let mut holder = executor.svm.get_account(&alice_ata).unwrap();
+        holder.data[64..72].copy_from_slice(&10u64.to_le_bytes());
+        executor.put(alice_ata,holder.clone()).unwrap();
+        let frozen = Pubkey::new_unique();
+        let delegated = Pubkey::new_unique();
+        let program_held = Pubkey::new_unique();
+        for (key,owner,amount,state) in [(frozen,alice,11,2),(delegated,bob,6,1),(program_held,record_owner,3,1)] {
+            let mut account = holder.clone();
+            account.data[32..64].copy_from_slice(owner.as_ref());
+            account.data[64..72].copy_from_slice(&(amount as u64).to_le_bytes());
+            account.data[108] = state;
+            if key == delegated {
+                account.data[72..76].copy_from_slice(&1u32.to_le_bytes());
+                account.data[76..108].copy_from_slice(validator.as_ref());
+                account.data[121..129].copy_from_slice(&6u64.to_le_bytes());
+            }
+            executor.put(key,account).unwrap();
+        }
+        executor.execute_slot(7,vec![]).unwrap();
+        executor.fund(&upgraded[0].0.to_string(),5_000).unwrap();
+        executor.fund(&accounts.last().unwrap().0.to_string(),6_000).unwrap();
+        executor.set_proposers(&[(1,validator.to_string())]).unwrap();
+        let before = executor.checkpoint();
+        let other_before = executor.svm.get_account(&bridge_mint(&bridge,&other_mint)).unwrap();
+        let reserve = before.accounts.values().filter(|a| !native_wallet(a)).map(|a| a.lamports).sum::<u64>() + executor.rent_exempt_minimum(80) + executor.rent_exempt_minimum(0);
+        executor.activate_native_cutover(7).unwrap();
+        assert!(executor.native_supply().unwrap().is_none(),"pre-inclusion activation leaves pre-cut slots unchanged");
+        executor.activate_native_cutover(8).unwrap();
+        let activated = executor.checkpoint();
+        assert_eq!(executor.admit_inclusions(&[(alice.to_string(),1,1),(faucet.to_string(),1,1)],0).unwrap(),vec![true,false],"inclusion sees converted ACRUX and the retired faucet");
+        executor.charge_inclusion(&alice.to_string(),1,0,1).unwrap();
+        executor.execute_slot(8,vec![]).unwrap();
+        assert_eq!(executor.balance(&alice.to_string()).unwrap(),20_000);
+        assert_eq!(executor.balance(&validator.to_string()).unwrap(),1_000,"execute_slot must not retire inclusion fees charged after activation");
+        executor.activate_native_cutover(8).unwrap();
+        assert_eq!(executor.balance(&validator.to_string()).unwrap(),1_000);
+        executor.restore(activated).unwrap();
+        executor.execute_slot(8,vec![]).unwrap();
+        let cutover_hash = executor.state_hash();
+        let supply = executor.native_supply().unwrap().unwrap();
+        assert_eq!((supply.credited_lamports,supply.withdrawn_lamports,supply.reserve_lamports,supply.circulating_lamports),(30_000,0,reserve,30_000));
+        assert_eq!(executor.balance(&alice.to_string()).unwrap(),21_000);
+        assert_eq!(executor.balance(&bob.to_string()).unwrap(),6_000);
+        assert_eq!(executor.balance(&faucet.to_string()).unwrap(),0);
+        assert_eq!(executor.balance(&validator.to_string()).unwrap(),0);
+        let record = executor.svm.get_account(&record_owner).unwrap();
+        assert_eq!((record.lamports,record.owner,record.data),(15_345,bridge,vec![77]));
+        assert_eq!(executor.svm.get_account(&nonce).unwrap().lamports,123_456);
+        for key in [alice_ata,frozen,delegated,program_held] {
+            assert_eq!(executor.svm.get_account(&key).unwrap().data[64..72],[0;8]);
+        }
+        assert_eq!(executor.svm.get_account(&native_mint).unwrap().data[36..44],[0;8]);
+        assert_eq!(executor.svm.get_account(&bridge_mint(&bridge,&other_mint)).unwrap(),other_before);
+        let mut expected_data = upgraded[0].1.clone(); expected_data.lamports += 5_000;
+        let mut expected_program = accounts.last().unwrap().1.clone(); expected_program.lamports += 6_000;
+        assert_eq!(executor.svm.get_account(&upgraded[0].0).unwrap(),expected_data,"a data upgrade preserves existing rent and donations");
+        assert_eq!(executor.svm.get_account(&accounts.last().unwrap().0).unwrap(),expected_program);
+        executor.restore(before).unwrap();
+        executor.execute_slot(8,vec![]).unwrap();
+        assert_eq!(executor.state_hash(),cutover_hash,"rollback re-applies the conversion and data upgrade exactly once");
+        let mut live_configuration = executor.svm.get_account(&configuration).unwrap();
+        live_configuration.data[0] = 99;
+        executor.put(configuration,live_configuration.clone()).unwrap();
+        executor.fund(&upgraded[0].0.to_string(),7_777).unwrap();
+        executor.fund(&accounts.last().unwrap().0.to_string(),8_888).unwrap();
+        let donated_program_data = executor.svm.get_account(&upgraded[0].0).unwrap();
+        let checkpoint = executor.checkpoint();
+        let mut saved = executor.snapshot_meta(&checkpoint);
+        saved.accounts = checkpoint.account_changes(None).0.into_iter().map(|(key,account)| (key.to_string(),account.as_ref().clone())).collect();
+        saved.executed = checkpoint.executed_changes(None).0;
+        let mut loaded = SvmExecutor::from_state(&[],saved).unwrap();
+        loaded.set_bridge(bridge);
+        loaded.set_native_cutover(rule);
+        assert_eq!(loaded.native_supply().unwrap().unwrap().credited_lamports,30_000);
+        for current in [&mut executor,&mut loaded] { current.execute_slot(9,vec![]).unwrap(); }
+        assert_eq!(executor.state_hash(),loaded.state_hash(),"a loaded marker never converts holders again");
+        assert_eq!(executor.svm.get_account(&configuration).unwrap(),live_configuration,"mutable placement state is not reset by a later slot");
+        assert_eq!(executor.svm.get_account(&upgraded[0].0).unwrap(),donated_program_data,"donations do not trigger code re-placement");
+        assert_eq!(loaded.balance(&alice.to_string()).unwrap(),21_000);
+    }
+
+    #[test]
+    fn native_cutover_credits_once_skips_overflow_and_clears_burn_each_slot() {
+        let bridge = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let foreign = Pubkey::new_unique();
+        let rule = NativeCutover { slot:4,solana_mint:mint,lamports_per_base_unit:1000 };
+        let credit = |sequence,recipient:Pubkey,amount| BridgeCredit { sequence,solana_mint:mint.to_string(),decimals:6,recipient:recipient.to_string(),amount };
+        let mut executor = SvmExecutor::new([],&[]).unwrap();
+        executor.set_bridge(bridge);
+        executor.set_native_cutover(rule.clone());
+        executor.put(foreign,Account { lamports:1000,data:vec![7],owner:bridge,executable:false,rent_epoch:0 }).unwrap();
+        executor.set_credits(vec![credit(0,owner,100)]);
+        executor.execute_slot(3,vec![]).unwrap();
+        executor.execute_slot(4,vec![]).unwrap();
+        let mint_account = executor.svm.get_account(&bridge_mint(&bridge,&mint)).unwrap();
+        executor.set_credits(vec![credit(1,owner,50),credit(1,owner,50)]);
+        executor.execute_slot(5,vec![]).unwrap();
+        assert_eq!(executor.next_credit(),2);
+        assert_eq!(executor.balance(&owner.to_string()).unwrap(),150_000);
+        assert_eq!(executor.native_supply().unwrap().unwrap().credited_lamports,150_000);
+        assert_eq!(executor.svm.get_account(&bridge_mint(&bridge,&mint)).unwrap(),mint_account,"native deposits do not refill the bridged mint");
+        executor.set_credits(vec![credit(2,owner,u64::MAX),credit(3,foreign,1),credit(4,owner,5)]);
+        executor.execute_slot(6,vec![]).unwrap();
+        assert_eq!(executor.next_credit(),5);
+        assert_eq!(executor.balance(&owner.to_string()).unwrap(),155_000);
+        for (sequence,reason) in [(2,BridgeCreditSkipReason::BalanceOverflow),(3,BridgeCreditSkipReason::RecipientOwner)] {
+            let skipped:SkippedBridgeCredit = bincode::deserialize(&executor.svm.get_account(&bridge_skipped_credit(&bridge,sequence)).unwrap().data).unwrap();
+            assert_eq!(skipped.reason,reason);
+        }
+        let checkpoint = executor.checkpoint();
+        let gate_key = bridge_native(&bridge);
+        let mut gate = executor.svm.get_account(&gate_key).unwrap();
+        gate.data[48..56].copy_from_slice(&(u64::MAX - 10).to_le_bytes());
+        executor.put(gate_key,gate.clone()).unwrap();
+        executor.set_credits(vec![credit(5,owner,1)]);
+        executor.execute_slot(7,vec![]).unwrap();
+        assert_eq!(executor.svm.get_account(&gate_key).unwrap(),gate,"credited overflow never writes a partial wallet or gate update");
+        let skipped:SkippedBridgeCredit = bincode::deserialize(&executor.svm.get_account(&bridge_skipped_credit(&bridge,5)).unwrap().data).unwrap();
+        assert_eq!(skipped.reason,BridgeCreditSkipReason::SupplyOverflow);
+        executor.restore(checkpoint.clone()).unwrap();
+        let gate = executor.svm.get_account(&gate_key).unwrap();
+        let mut full_wallet = executor.svm.get_account(&owner).unwrap();
+        full_wallet.lamports = u64::MAX - 10;
+        executor.put(owner,full_wallet.clone()).unwrap();
+        executor.set_credits(vec![credit(5,owner,1)]);
+        executor.execute_slot(7,vec![]).unwrap();
+        assert_eq!(executor.svm.get_account(&owner).unwrap(),full_wallet);
+        assert_eq!(executor.svm.get_account(&gate_key).unwrap(),gate,"wallet overflow cannot advance backed credits");
+        let skipped:SkippedBridgeCredit = bincode::deserialize(&executor.svm.get_account(&bridge_skipped_credit(&bridge,5)).unwrap().data).unwrap();
+        assert_eq!(skipped.reason,BridgeCreditSkipReason::BalanceOverflow);
+        executor.restore(checkpoint).unwrap();
+        let before = executor.total_lamports().unwrap();
+        let burn_key = bridge_native_burn(&bridge);
+        let mut burn = executor.svm.get_account(&burn_key).unwrap();
+        let rent = burn.lamports;
+        burn.lamports += 12_000;
+        executor.put(burn_key,burn).unwrap();
+        executor.execute_slot(7,vec![]).unwrap();
+        assert_eq!(executor.svm.get_account(&burn_key).unwrap().lamports,rent);
+        assert_eq!(executor.total_lamports().unwrap(),before,"end-of-slot burn removal updates the cached total");
+        assert_eq!(executor.native_supply().unwrap().unwrap().credited_lamports,155_000);
+        let mut no_rule = SvmExecutor::new([],&[]).unwrap();
+        no_rule.set_bridge(bridge);
+        no_rule.set_credits(vec![credit(0,owner,1)]);
+        no_rule.execute_slot(100,vec![]).unwrap();
+        assert!(no_rule.native_supply().unwrap().is_none());
+        assert_eq!(no_rule.balance(&owner.to_string()).unwrap(),0,"without the rule a deposit remains an SPL credit");
+        assert_eq!(u64::from_le_bytes(no_rule.svm.get_account(&bridge_mint(&bridge,&mint)).unwrap().data[36..44].try_into().unwrap()),1);
+        let mut overflowing = SvmExecutor::new([(owner.to_string(),9_000_000)],&[]).unwrap();
+        overflowing.set_bridge(bridge);
+        overflowing.set_native_cutover(rule);
+        overflowing.set_credits(vec![credit(0,owner,u64::MAX)]);
+        overflowing.execute_slot(3,vec![]).unwrap();
+        let held_mint = overflowing.svm.get_account(&bridge_mint(&bridge,&mint)).unwrap();
+        assert!(overflowing.execute_slot(4,vec![]).is_err(),"cutover conversion refuses multiplication overflow");
+        assert_eq!(overflowing.balance(&owner.to_string()).unwrap(),9_000_000,"a failed cutover never retires wallets partially");
+        assert_eq!(overflowing.svm.get_account(&bridge_mint(&bridge,&mint)).unwrap(),held_mint);
+        assert!(overflowing.native_supply().unwrap().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires chain/target/deploy/acrux_bridge.so built with withdraw_native"]
+    fn native_withdrawal_sbf_burns_and_enforces_backed_cap() {
+        use solana_sdk::instruction::{AccountMeta,Instruction};
+        let bridge = Pubkey::from_str("EDm6HxGArNEgGfWRZwvj42f4euc9oPQWVUwUbkK3PEe5").unwrap();
+        let programs = [GenesisProgram { address:bridge.to_string(),path:PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../chain/target/deploy/acrux_bridge.so") }];
+        let owner = Keypair::new();
+        let proposer = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let mut executor = SvmExecutor::new([(owner.pubkey().to_string(),100_000_000)],&programs).unwrap();
+        executor.set_bridge(bridge);
+        executor.set_bridge_minimums(4,vec![MinimumWithdrawal { mint,amount:10 }]);
+        executor.set_native_cutover(NativeCutover { slot:4,solana_mint:mint,lamports_per_base_unit:1000 });
+        executor.set_proposers(&[(1,proposer.to_string())]).unwrap();
+        executor.set_credits(vec![BridgeCredit { sequence:0,solana_mint:mint.to_string(),decimals:6,recipient:owner.pubkey().to_string(),amount:200_000 }]);
+        executor.execute_slot(3,vec![]).unwrap();
+        executor.execute_slot(4,vec![]).unwrap();
+        let native = bridge_native(&bridge);
+        let burn = bridge_native_burn(&bridge);
+        let outbound = Pubkey::find_program_address(&[b"outbound"],&bridge).0;
+        let record = |sequence:u64| Pubkey::find_program_address(&[b"withdrawal",&sequence.to_le_bytes()],&bridge).0;
+        let withdraw = |executor:&mut SvmExecutor,amount:u64,sequence:u64,slot:u64| {
+            let mut data = Sha256::digest(b"global:withdraw_native")[..8].to_vec();
+            data.extend_from_slice(&amount.to_le_bytes());
+            data.extend_from_slice(recipient.as_ref());
+            let instruction = Instruction { program_id:bridge,accounts:vec![
+                AccountMeta::new(owner.pubkey(),true),AccountMeta::new(native,false),
+                AccountMeta::new_readonly(bridge_minimum(&bridge,&mint),false),AccountMeta::new(burn,false),
+                AccountMeta::new(outbound,false),AccountMeta::new(record(sequence),false),
+                AccountMeta::new_readonly(system_program::id(),false),
+            ],data };
+            let tx = Transaction::new_signed_with_payer(&[instruction],Some(&owner.pubkey()),&[&owner],Hash::from_str(&executor.latest_blockhash()).unwrap());
+            let transaction = executor.validate_transaction(&bincode::serialize(&tx).unwrap(),slot).unwrap();
+            executor.execute_slot(slot,vec![ExecutionItem { transaction,source_proposers:vec![1] }]).unwrap().results.remove(0)
+        };
+        let before = executor.total_lamports().unwrap();
+        let released = withdraw(&mut executor,20_000,0,5);
+        assert!(released.success,"{released:?}");
+        let supply = executor.native_supply().unwrap().unwrap();
+        assert_eq!((supply.credited_lamports,supply.withdrawn_lamports),(200_000_000,20_000_000));
+        assert_eq!(executor.svm.get_account(&burn).unwrap().lamports,executor.rent_exempt_minimum(0));
+        assert_eq!(before - executor.total_lamports().unwrap(),20_000_000 + released.base_fee / 2);
+        let withdrawal = executor.svm.get_account(&record(0)).unwrap();
+        assert_eq!(withdrawal.data[80..112],mint.to_bytes());
+        assert_eq!(withdrawal.data[112..120],20_000u64.to_le_bytes());
+        assert_eq!(executor.withdrawals(1),vec![(0,mint.to_bytes(),recipient.to_bytes(),20_000)]);
+        // Extra native balance can come from preserved legacy account rent. It does not enlarge
+        // the hashed backing counter, even when the wallet can afford the attempted withdrawal.
+        executor.fund(&owner.pubkey().to_string(),500_000_000).unwrap();
+        let gate = executor.svm.get_account(&native).unwrap();
+        let refused = withdraw(&mut executor,200_000,1,6);
+        assert!(!refused.success,"the cap must reject native value beyond backed credits");
+        assert_eq!(executor.svm.get_account(&native).unwrap(),gate);
+        assert_eq!(executor.svm.get_account(&outbound).unwrap().data[8..16],1u64.to_le_bytes());
+        assert!(executor.svm.get_account(&record(1)).is_none());
+        assert_eq!(executor.svm.get_account(&burn).unwrap().lamports,executor.rent_exempt_minimum(0));
     }
 
     #[test]

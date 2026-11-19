@@ -3,7 +3,7 @@
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "info": {
     "title": "Acrux API",
-    "version": "0.1.20",
+    "version": "0.1.21",
     "description": "Round 1 fixture contract. Amounts are decimal integer strings. Times are relative microseconds with UTC slot wallTime."
   },
   "servers": [
@@ -71,6 +71,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -131,6 +132,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -315,6 +326,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -375,6 +387,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -516,6 +538,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -576,6 +599,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -737,6 +770,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -797,6 +831,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -946,6 +990,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -1006,6 +1051,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -1147,6 +1202,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -1207,6 +1263,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -1369,6 +1435,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -1429,6 +1496,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -1578,6 +1655,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -1638,6 +1716,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -1779,6 +1867,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -1839,6 +1928,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -1988,6 +2087,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -2048,6 +2148,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -2199,6 +2309,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -2259,6 +2370,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -2400,6 +2521,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -2460,6 +2582,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -2601,6 +2733,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -2661,6 +2794,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -2810,6 +2953,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -2870,6 +3014,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -3019,6 +3173,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -3079,6 +3234,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -3220,6 +3385,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -3290,6 +3456,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -3431,6 +3607,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -3491,6 +3668,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -3653,6 +3840,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -3713,6 +3901,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -3852,6 +4050,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -3922,6 +4121,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -4071,6 +4280,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -4131,6 +4341,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -4280,6 +4500,7 @@
                 "UPSTREAM_UNAVAILABLE",
                 "FAUCET_LIMIT",
                 "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
                 "GRANT_FAILED",
                 "NET_STALLED",
                 "NET_UNAVAILABLE",
@@ -4340,6 +4561,16 @@
             }
           },
           "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
             "description": "The error envelope: branch on error.code.",
             "content": {
               "application/json": {
@@ -4498,6 +4729,7 @@
                   "UPSTREAM_UNAVAILABLE",
                   "FAUCET_LIMIT",
                   "FAUCET_EMPTY",
+                  "FAUCET_RETIRED",
                   "GRANT_FAILED",
                   "NET_STALLED",
                   "NET_UNAVAILABLE",
@@ -4563,6 +4795,11 @@
               "retryAfterSeconds": {
                 "type": "integer",
                 "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "cutoverSlot": {
+                "type": "integer",
+                "minimum": 0,
                 "maximum": 9007199254740991
               },
               "requestId": {
@@ -4889,6 +5126,68 @@
               }
             ]
           },
+          "native": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "cutoverSlot": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "mint": {
+                    "type": "string",
+                    "minLength": 32,
+                    "maxLength": 44
+                  },
+                  "scale": {
+                    "type": "string",
+                    "maxLength": 20,
+                    "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0-0][0-9]{1}|1844674407370955161[0-4][0-9]{0}|18446744073709551615)$",
+                    "minLength": 1
+                  },
+                  "reserveLamports": {
+                    "type": "string",
+                    "maxLength": 20,
+                    "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0-0][0-9]{1}|1844674407370955161[0-4][0-9]{0}|18446744073709551615)$",
+                    "minLength": 1
+                  },
+                  "creditedLamports": {
+                    "type": "string",
+                    "maxLength": 20,
+                    "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0-0][0-9]{1}|1844674407370955161[0-4][0-9]{0}|18446744073709551615)$",
+                    "minLength": 1
+                  },
+                  "withdrawnLamports": {
+                    "type": "string",
+                    "maxLength": 20,
+                    "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0-0][0-9]{1}|1844674407370955161[0-4][0-9]{0}|18446744073709551615)$",
+                    "minLength": 1
+                  },
+                  "circulatingLamports": {
+                    "type": "string",
+                    "maxLength": 20,
+                    "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0-0][0-9]{1}|1844674407370955161[0-4][0-9]{0}|18446744073709551615)$",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "cutoverSlot",
+                  "mint",
+                  "scale",
+                  "reserveLamports",
+                  "creditedLamports",
+                  "withdrawnLamports",
+                  "circulatingLamports"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "vaults": {
             "type": "array",
             "items": {
@@ -4983,6 +5282,7 @@
           "fromSlot",
           "lightClient",
           "relayer",
+          "native",
           "vaults",
           "totals",
           "readAt"
@@ -5022,6 +5322,61 @@
           "hash",
           "outboxRoot",
           "account"
+        ],
+        "additionalProperties": false
+      },
+      "BridgeNative": {
+        "type": "object",
+        "properties": {
+          "cutoverSlot": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "mint": {
+            "type": "string",
+            "minLength": 32,
+            "maxLength": 44
+          },
+          "scale": {
+            "type": "string",
+            "maxLength": 20,
+            "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0-0][0-9]{1}|1844674407370955161[0-4][0-9]{0}|18446744073709551615)$",
+            "minLength": 1
+          },
+          "reserveLamports": {
+            "type": "string",
+            "maxLength": 20,
+            "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0-0][0-9]{1}|1844674407370955161[0-4][0-9]{0}|18446744073709551615)$",
+            "minLength": 1
+          },
+          "creditedLamports": {
+            "type": "string",
+            "maxLength": 20,
+            "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0-0][0-9]{1}|1844674407370955161[0-4][0-9]{0}|18446744073709551615)$",
+            "minLength": 1
+          },
+          "withdrawnLamports": {
+            "type": "string",
+            "maxLength": 20,
+            "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0-0][0-9]{1}|1844674407370955161[0-4][0-9]{0}|18446744073709551615)$",
+            "minLength": 1
+          },
+          "circulatingLamports": {
+            "type": "string",
+            "maxLength": 20,
+            "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0-0][0-9]{1}|1844674407370955161[0-4][0-9]{0}|18446744073709551615)$",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "cutoverSlot",
+          "mint",
+          "scale",
+          "reserveLamports",
+          "creditedLamports",
+          "withdrawnLamports",
+          "circulatingLamports"
         ],
         "additionalProperties": false
       },
@@ -6278,6 +6633,7 @@
           "UPSTREAM_UNAVAILABLE",
           "FAUCET_LIMIT",
           "FAUCET_EMPTY",
+          "FAUCET_RETIRED",
           "GRANT_FAILED",
           "NET_STALLED",
           "NET_UNAVAILABLE",
@@ -17355,6 +17711,7 @@
                           "UPSTREAM_UNAVAILABLE",
                           "FAUCET_LIMIT",
                           "FAUCET_EMPTY",
+                          "FAUCET_RETIRED",
                           "GRANT_FAILED",
                           "NET_STALLED",
                           "NET_UNAVAILABLE",
@@ -17420,6 +17777,11 @@
                       "retryAfterSeconds": {
                         "type": "integer",
                         "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "cutoverSlot": {
+                        "type": "integer",
+                        "minimum": 0,
                         "maximum": 9007199254740991
                       },
                       "requestId": {
@@ -26697,6 +27059,7 @@
                                 "UPSTREAM_UNAVAILABLE",
                                 "FAUCET_LIMIT",
                                 "FAUCET_EMPTY",
+                                "FAUCET_RETIRED",
                                 "GRANT_FAILED",
                                 "NET_STALLED",
                                 "NET_UNAVAILABLE",
@@ -26762,6 +27125,11 @@
                             "retryAfterSeconds": {
                               "type": "integer",
                               "minimum": -9007199254740991,
+                              "maximum": 9007199254740991
+                            },
+                            "cutoverSlot": {
+                              "type": "integer",
+                              "minimum": 0,
                               "maximum": 9007199254740991
                             },
                             "requestId": {
@@ -32717,6 +33085,7 @@
                           "UPSTREAM_UNAVAILABLE",
                           "FAUCET_LIMIT",
                           "FAUCET_EMPTY",
+                          "FAUCET_RETIRED",
                           "GRANT_FAILED",
                           "NET_STALLED",
                           "NET_UNAVAILABLE",
@@ -32782,6 +33151,11 @@
                       "retryAfterSeconds": {
                         "type": "integer",
                         "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "cutoverSlot": {
+                        "type": "integer",
+                        "minimum": 0,
                         "maximum": 9007199254740991
                       },
                       "requestId": {
@@ -41526,6 +41900,7 @@
                                   "UPSTREAM_UNAVAILABLE",
                                   "FAUCET_LIMIT",
                                   "FAUCET_EMPTY",
+                                  "FAUCET_RETIRED",
                                   "GRANT_FAILED",
                                   "NET_STALLED",
                                   "NET_UNAVAILABLE",
@@ -41591,6 +41966,11 @@
                               "retryAfterSeconds": {
                                 "type": "integer",
                                 "minimum": -9007199254740991,
+                                "maximum": 9007199254740991
+                              },
+                              "cutoverSlot": {
+                                "type": "integer",
+                                "minimum": 0,
                                 "maximum": 9007199254740991
                               },
                               "requestId": {

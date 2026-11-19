@@ -143,17 +143,7 @@ pub mod acrux_bridge {
     /// the withdrawal to `recipient` on Solana at `["withdrawal", sequence]`, for the cblock's outbox.
     pub fn withdraw(ctx: Context<Withdraw>, solana_mint: Pubkey, amount: u64, recipient: Pubkey) -> Result<()> {
         require!(amount > 0, BridgeError::ZeroAmount);
-        let configured = &ctx.accounts.minimum;
-        require!(!configured.executable, BridgeError::InvalidMinimum);
-        let minimum = if configured.owner == &anchor_lang::system_program::ID && configured.data_is_empty() {
-            0
-        } else {
-            require_keys_eq!(*configured.owner, crate::ID, BridgeError::InvalidMinimum);
-            let data = configured.try_borrow_data()?;
-            require!(data.len() == 16 && data[..8] == MinimumWithdrawal::DISCRIMINATOR[..], BridgeError::InvalidMinimum);
-            u64::from_le_bytes(data[8..16].try_into().unwrap())
-        };
-        require!(amount >= minimum, BridgeError::BelowMinimumWithdrawal);
+        require!(amount >= minimum_withdrawal(&ctx.accounts.minimum)?, BridgeError::BelowMinimumWithdrawal);
         burn(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -170,6 +160,44 @@ pub mod acrux_bridge {
             owner: ctx.accounts.owner.key(),
             recipient,
             solana_mint,
+            amount,
+            slot: Clock::get()?.slot,
+            bump: ctx.bumps.record,
+        });
+        Ok(())
+    }
+
+    /// On Acrux after the native cut-over: debits `amount` in Solana base units, converted to
+    /// native lamports by the executor-installed gate, and writes the same withdrawal outbox record.
+    /// The executor removes the burn account's excess lamports at the end of this slot.
+    pub fn withdraw_native(ctx: Context<WithdrawNative>, amount: u64, recipient: Pubkey) -> Result<()> {
+        require!(amount > 0, BridgeError::ZeroAmount);
+        require!(amount >= minimum_withdrawal(&ctx.accounts.minimum)?, BridgeError::BelowMinimumWithdrawal);
+        let native = &mut ctx.accounts.native;
+        require!(native.lamports_per_base_unit > 0, BridgeError::InvalidNativeGate);
+        let lamports = amount.checked_mul(native.lamports_per_base_unit).ok_or(BridgeError::NativeAmountOverflow)?;
+        let withdrawn = native.withdrawn.checked_add(lamports).ok_or(BridgeError::NativeAmountOverflow)?;
+        require!(withdrawn <= native.credited, BridgeError::UnbackedNativeWithdrawal);
+        native.withdrawn = withdrawn;
+        anchor_lang::system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::Transfer {
+                    from: ctx.accounts.owner.to_account_info(),
+                    to: ctx.accounts.burn.to_account_info(),
+                },
+            ),
+            lamports,
+        )?;
+        let outbound = &mut ctx.accounts.outbound;
+        outbound.bump = ctx.bumps.outbound;
+        let sequence = outbound.withdrawals;
+        outbound.withdrawals = sequence.checked_add(1).ok_or(BridgeError::NativeAmountOverflow)?;
+        ctx.accounts.record.set_inner(Withdrawal {
+            sequence,
+            owner: ctx.accounts.owner.key(),
+            recipient,
+            solana_mint: native.solana_mint,
             amount,
             slot: Clock::get()?.slot,
             bump: ctx.bumps.record,
@@ -254,6 +282,18 @@ const VOTE_NOTAR: u32 = 0;
 const VOTE_FINALIZE: u32 = 4;
 const ED25519_PROGRAM: Pubkey = pubkey!("Ed25519SigVerify111111111111111111111111111");
 
+/// The required per-mint minimum PDA may be absent only when the chain rule has no floor.
+fn minimum_withdrawal(configured: &AccountInfo) -> Result<u64> {
+    require!(!configured.executable, BridgeError::InvalidMinimum);
+    if configured.owner == &anchor_lang::system_program::ID && configured.data_is_empty() {
+        return Ok(0);
+    }
+    require_keys_eq!(*configured.owner, crate::ID, BridgeError::InvalidMinimum);
+    let data = configured.try_borrow_data()?;
+    require!(data.len() == 16 && data[..8] == MinimumWithdrawal::DISCRIMINATOR[..], BridgeError::InvalidMinimum);
+    Ok(u64::from_le_bytes(data[8..16].try_into().unwrap()))
+}
+
 /// The outbox root an entry and its proof lead to: the entry's SHA-256, hashed up with each sibling.
 fn merkle_root(entry: &[u8], proof: &[ProofNode]) -> [u8; 32] {
     proof.iter().fold(hashv(&[entry]).to_bytes(), |node, step| {
@@ -334,6 +374,19 @@ pub struct Outbound {
 #[derive(InitSpace)]
 pub struct MinimumWithdrawal {
     pub amount: u64,
+}
+
+/// Installed only by Acrux's executor at the configured native cut-over. Its credited, withdrawn
+/// and reserve counters use native lamports. No instruction creates this account.
+#[account]
+#[derive(InitSpace)]
+pub struct NativeGate {
+    pub solana_mint: Pubkey,
+    pub lamports_per_base_unit: u64,
+    pub credited: u64,
+    pub withdrawn: u64,
+    pub reserve: u64,
+    pub slot: u64,
 }
 
 /// On Acrux: one withdrawal, at `["withdrawal", sequence]`.
@@ -537,6 +590,25 @@ pub struct Withdraw<'info> {
 }
 
 #[derive(Accounts)]
+pub struct WithdrawNative<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    #[account(mut, seeds = [b"native"], bump)]
+    pub native: Account<'info, NativeGate>,
+    /// CHECK: exact per-mint PDA; its owner and data are checked before any native debit.
+    #[account(seeds = [b"minimum", native.solana_mint.as_ref()], bump)]
+    pub minimum: UncheckedAccount<'info>,
+    /// CHECK: the executor installs this empty bridge-owned account and removes its excess.
+    #[account(mut, seeds = [b"native_burn"], bump, owner = crate::ID, constraint = !burn.executable && burn.data_is_empty() @ BridgeError::InvalidNativeGate)]
+    pub burn: UncheckedAccount<'info>,
+    #[account(init_if_needed, payer = owner, space = 8 + Outbound::INIT_SPACE, seeds = [b"outbound"], bump)]
+    pub outbound: Account<'info, Outbound>,
+    #[account(init, payer = owner, space = 8 + Withdrawal::INIT_SPACE, seeds = [b"withdrawal", outbound.withdrawals.to_le_bytes().as_ref()], bump)]
+    pub record: Account<'info, Withdrawal>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 #[instruction(sequence: u64, recipient: Pubkey)]
 pub struct Release<'info> {
     #[account(mut)]
@@ -615,4 +687,10 @@ pub enum BridgeError {
     InvalidMinimum,
     #[msg("The withdrawal amount is below this mint's configured minimum.")]
     BelowMinimumWithdrawal,
+    #[msg("The native bridge gate or burn account is invalid.")]
+    InvalidNativeGate,
+    #[msg("The native withdrawal amount overflows its configured scale or counter.")]
+    NativeAmountOverflow,
+    #[msg("The native withdrawal exceeds the tokens credited from Solana.")]
+    UnbackedNativeWithdrawal,
 }

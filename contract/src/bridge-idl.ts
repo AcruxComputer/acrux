@@ -1070,6 +1070,161 @@ export const ACRUX_BRIDGE_IDL = {
      "type": "pubkey"
     }
    ]
+  },
+  {
+   "name": "withdraw_native",
+   "docs": [
+    "On Acrux after the native cut-over: debits `amount` in Solana base units, converted to",
+    "native lamports by the executor-installed gate, and writes the same withdrawal outbox record.",
+    "The executor removes the burn account's excess lamports at the end of this slot."
+   ],
+   "discriminator": [
+    113,
+    227,
+    26,
+    32,
+    53,
+    66,
+    90,
+    250
+   ],
+   "accounts": [
+    {
+     "name": "owner",
+     "writable": true,
+     "signer": true
+    },
+    {
+     "name": "native",
+     "writable": true,
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         110,
+         97,
+         116,
+         105,
+         118,
+         101
+        ]
+       }
+      ]
+     }
+    },
+    {
+     "name": "minimum",
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         109,
+         105,
+         110,
+         105,
+         109,
+         117,
+         109
+        ]
+       },
+       {
+        "kind": "account",
+        "path": "native.solana_mint",
+        "account": "NativeGate"
+       }
+      ]
+     }
+    },
+    {
+     "name": "burn",
+     "writable": true,
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         110,
+         97,
+         116,
+         105,
+         118,
+         101,
+         95,
+         98,
+         117,
+         114,
+         110
+        ]
+       }
+      ]
+     }
+    },
+    {
+     "name": "outbound",
+     "writable": true,
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         111,
+         117,
+         116,
+         98,
+         111,
+         117,
+         110,
+         100
+        ]
+       }
+      ]
+     }
+    },
+    {
+     "name": "record",
+     "writable": true,
+     "pda": {
+      "seeds": [
+       {
+        "kind": "const",
+        "value": [
+         119,
+         105,
+         116,
+         104,
+         100,
+         114,
+         97,
+         119,
+         97,
+         108
+        ]
+       },
+       {
+        "kind": "account",
+        "path": "outbound.withdrawals",
+        "account": "Outbound"
+       }
+      ]
+     }
+    },
+    {
+     "name": "system_program",
+     "address": "11111111111111111111111111111111"
+    }
+   ],
+   "args": [
+    {
+     "name": "amount",
+     "type": "u64"
+    },
+    {
+     "name": "recipient",
+     "type": "pubkey"
+    }
+   ]
   }
  ],
  "accounts": [
@@ -1123,6 +1278,19 @@ export const ACRUX_BRIDGE_IDL = {
     49,
     189,
     167
+   ]
+  },
+  {
+   "name": "NativeGate",
+   "discriminator": [
+    99,
+    204,
+    178,
+    203,
+    84,
+    107,
+    38,
+    65
    ]
   },
   {
@@ -1263,6 +1431,21 @@ export const ACRUX_BRIDGE_IDL = {
    "code": 6013,
    "name": "BelowMinimumWithdrawal",
    "msg": "The withdrawal amount is below this mint's configured minimum."
+  },
+  {
+   "code": 6014,
+   "name": "InvalidNativeGate",
+   "msg": "The native bridge gate or burn account is invalid."
+  },
+  {
+   "code": 6015,
+   "name": "NativeAmountOverflow",
+   "msg": "The native withdrawal amount overflows its configured scale or counter."
+  },
+  {
+   "code": 6016,
+   "name": "UnbackedNativeWithdrawal",
+   "msg": "The native withdrawal exceeds the tokens credited from Solana."
   }
  ],
  "types": [
@@ -1465,6 +1648,42 @@ export const ACRUX_BRIDGE_IDL = {
      },
      {
       "name": "amount",
+      "type": "u64"
+     },
+     {
+      "name": "slot",
+      "type": "u64"
+     }
+    ]
+   }
+  },
+  {
+   "name": "NativeGate",
+   "docs": [
+    "Installed only by Acrux's executor at the configured native cut-over. Its credited, withdrawn",
+    "and reserve counters use native lamports. No instruction creates this account."
+   ],
+   "type": {
+    "kind": "struct",
+    "fields": [
+     {
+      "name": "solana_mint",
+      "type": "pubkey"
+     },
+     {
+      "name": "lamports_per_base_unit",
+      "type": "u64"
+     },
+     {
+      "name": "credited",
+      "type": "u64"
+     },
+     {
+      "name": "withdrawn",
+      "type": "u64"
+     },
+     {
+      "name": "reserve",
       "type": "u64"
      },
      {

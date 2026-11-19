@@ -3,7 +3,7 @@ import { Address, Base64, BaseUnits, Signature, Timestamp, U64, page, PageQuery 
 import { defineErrors } from './errors.js'
 export { Address, Base64, BaseUnits, Signature, Timestamp, U64, PageQuery }
 export { CONTRACT_VERSION } from './version.js'
-export const errors = defineErrors({ FAUCET_LIMIT: 429, FAUCET_EMPTY: 503, GRANT_FAILED: 502, NET_STALLED: 503, NET_UNAVAILABLE: 503, INVALID_INPUT: 400 })
+export const errors = defineErrors({ FAUCET_LIMIT: 429, FAUCET_EMPTY: 503, FAUCET_RETIRED: 410, GRANT_FAILED: 502, NET_STALLED: 503, NET_UNAVAILABLE: 503, INVALID_INPUT: 400 })
 export const ApiError = errors.ApiError
 export const ErrorCode = errors.ErrorCode
 export type ErrorCode = z.infer<typeof ErrorCode>
@@ -118,6 +118,12 @@ export const BridgeCertified = z.strictObject({ consensusSlot: Count, epoch: Cou
 export const BridgeRelayer = z.strictObject({
   wallet: Address, lamports: U64, unpaid: Count, lastCblock: Count.nullable(), lastHandedEpoch: Count.nullable(), lastRelayedAt: Timestamp.nullable(),
 })
+/** Native backing counters after the configured cut-over; all amounts are native lamports. */
+export const BridgeNative = z.strictObject({
+  cutoverSlot: Count, mint: Address, scale: U64,
+  reserveLamports: U64, creditedLamports: U64, withdrawnLamports: U64, circulatingLamports: U64,
+})
+export type BridgeNative = z.infer<typeof BridgeNative>
 export const Bridge = z.strictObject({
   status: z.enum(['waiting', 'live']),
   /** The program's address, on Solana and on Acrux. */
@@ -126,6 +132,7 @@ export const Bridge = z.strictObject({
   fromSlot: Count.nullable(),
   lightClient: z.strictObject({ epoch: Count.nullable(), validators: Count, latestCertified: BridgeCertified.nullable() }),
   relayer: BridgeRelayer.nullable(),
+  native: BridgeNative.nullable(),
   vaults: z.array(BridgeVault),
   totals: z.strictObject({ deposits: Count, credited: Count, withdrawals: Count, released: Count }),
   readAt: Timestamp.nullable(),

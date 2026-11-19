@@ -40,6 +40,7 @@ const fields = <C extends z.ZodType<string>>(code: C) =>
     fieldErrors: z.record(z.string(), z.array(z.string())).optional(),
     programError: ProgramError.optional(),
     retryAfterSeconds: z.int().optional(),
+    cutoverSlot: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
     requestId: z.string().optional(),
   })
 
@@ -52,6 +53,7 @@ export type ApiErrorBody<Code extends string = string> = {
     fieldErrors?: Record<string, string[]>
     programError?: z.output<typeof ProgramError>
     retryAfterSeconds?: number
+    cutoverSlot?: number
     requestId?: string
   }
 }

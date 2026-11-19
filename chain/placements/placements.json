@@ -2,6 +2,7 @@
  "placements": [
   {"file": "memo-4c2p.json", "slot": 1100000},
   {"file": "raydium-cpmm.json", "slot": 1100000},
-  {"file": "acrux-bridge.json", "slot": 2711660}
+  {"file": "acrux-bridge.json", "slot": 2711660},
+  {"file": "acrux-bridge-native.json", "slot": 4752000}
  ]
 }

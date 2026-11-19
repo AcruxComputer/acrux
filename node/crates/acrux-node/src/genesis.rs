@@ -110,9 +110,27 @@ pub struct BridgeConfig {
     /// Minimum withdrawal base units per Solana mint. An unnamed mint has no minimum.
     #[serde(default, deserialize_with = "minimum_withdrawals")]
     pub min_withdrawal: BTreeMap<Pubkey, u64>,
+    /// Native ACRUX starts at this cblock boundary; these three fields are configured together.
+    #[serde(default)]
+    pub native_from_slot: Option<u64>,
+    #[serde(default, deserialize_with = "optional_pubkey")]
+    pub native_mint: Option<Pubkey>,
+    #[serde(default)]
+    pub native_scale: Option<u64>,
 }
 impl BridgeConfig {
     pub fn chain_tag(&self) -> [u8; 32] { crate::crypto::hash(self.chain_id.as_bytes()) }
+    pub fn native_cutover(&self) -> Result<Option<crate::execution::NativeCutover>> {
+        match (self.native_from_slot, self.native_mint, self.native_scale) {
+            (None, None, None) => Ok(None),
+            (Some(slot), Some(solana_mint), Some(lamports_per_base_unit)) => {
+                ensure!(slot > self.from_slot && slot % 4 == 0, "bridge nativeFromSlot must be a four-slot cblock boundary after fromSlot");
+                ensure!(lamports_per_base_unit > 0, "bridge nativeScale must be positive");
+                Ok(Some(crate::execution::NativeCutover { slot, solana_mint, lamports_per_base_unit }))
+            }
+            _ => anyhow::bail!("bridge nativeFromSlot, nativeMint and nativeScale must be configured together"),
+        }
+    }
 }
 fn minimum_withdrawals<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<BTreeMap<Pubkey, u64>, D::Error> {
     BTreeMap::<String, String>::deserialize(d)?.into_iter().map(|(mint, amount)| {
@@ -136,6 +154,9 @@ fn pubkey<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Pubkey,
     let s = String::deserialize(d)?;
     Pubkey::from_str(&s).map_err(serde::de::Error::custom)
 }
+fn optional_pubkey<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Pubkey>, D::Error> {
+    Option::<String>::deserialize(d)?.map(|s| Pubkey::from_str(&s).map_err(serde::de::Error::custom)).transpose()
+}
 
 /// `chain/bridge.json` beside the genesis, or the file `ACRUX_BRIDGE` names; none without one.
 fn bridge(chain: &Path) -> Result<Option<BridgeConfig>> {
@@ -146,6 +167,7 @@ fn bridge(chain: &Path) -> Result<Option<BridgeConfig>> {
     let config: BridgeConfig = serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("Read {}", path.display()))?)?;
     ensure!(config.epoch_slots > 0 && config.epoch_slots % 4 == 0, "bridge epochSlots must be positive and divisible by four");
     ensure!(config.from_slot % 4 == 0, "bridge fromSlot must start at a four-slot cblock boundary");
+    config.native_cutover()?;
     Ok(Some(config))
 }
 

@@ -252,6 +252,7 @@ fn load_follow_snapshot(mut snapshot: Value, genesis: &crate::genesis::Genesis, 
     if let Some(bridge) = &genesis.bridge {
         executor.set_bridge(bridge.program);
         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
+        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); }
     }
     executor.load(state)?;
     ensure!(executor.state_hash() == start_hash, "the loaded state does not hash to cblock {last}'s state hash");
@@ -317,6 +318,7 @@ impl Replay {
             }
             payloads.push((q as u8, txs));
         }
+        self.executor.activate_native_cutover(s)?;
         let mut inclusions = payloads.iter().flat_map(|(q, txs)| txs.iter().map(move |t| (t.header.fee_payer.clone(), *q, 1u64))).collect::<Vec<_>>();
         inclusions.extend(fragments.iter().map(|(q, f)| (f.header.fee_payer.clone(), *q, 1)));
         let mut admitted = self.executor.admit_inclusions(&inclusions, w)?.into_iter();
@@ -532,20 +534,24 @@ pub async fn import(url: &str, store: &str, genesis: &str) -> Result<()> {
     let block_hash = view["cblock"]["hash"].as_str().context("the net holds no hash for that cblock")?.to_owned();
     let genesis_hash = rpc(url, "getGenesisHash", json!([])).await?.as_str().context("genesis hash")?.to_owned();
     let counters = rpc(url, "getCounters", json!({})).await?;
-    let programs = crate::genesis::Genesis::load(std::path::Path::new(genesis))?
-        .programs
-        .into_iter()
-        .map(|(address, path)| crate::execution::GenesisProgram { address, path })
-        .collect::<Vec<_>>();
+    let genesis = crate::genesis::Genesis::load(std::path::Path::new(genesis))?;
+    let programs = genesis.programs.iter().map(|(address, path)| crate::execution::GenesisProgram { address: address.clone(), path: path.clone() }).collect::<Vec<_>>();
     let executables = executables(url, &state, &programs, cblock).await?;
     ensure!(net_hash == state.state_hash, "the snapshot's state hash {} is not the net's {net_hash} for cblock {cblock}", state.state_hash);
     println!("cblock {cblock} (slot {}): {} accounts and {} programs, state {} matches the net's", cblock * 4 + 3, state.accounts.len(), executables.len(), &net_hash[..12]);
     let empty = state.accounts.iter().filter(|(_, a)| a.lamports == 0).count();
     state.accounts.extend(executables);
     let mut executor = SvmExecutor::from_state(&programs, state)?;
+    executor.set_placements(genesis.placements.clone());
+    if let Some(bridge) = &genesis.bridge {
+        executor.set_bridge(bridge.program);
+        executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
+        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); }
+    }
     let senders = (0..24).map(|_| Keypair::new()).collect::<Vec<_>>();
-    for sender in &senders {
-        executor.fund(&sender.pubkey().to_string(), 100_000_000_000)?;
+    let native = executor.native_supply()?.is_some();
+    if !native {
+        for sender in &senders { executor.fund(&sender.pubkey().to_string(), 100_000_000_000)?; }
     }
     let checkpoint = executor.checkpoint();
     let meta = crate::state::Meta {
@@ -561,7 +567,7 @@ pub async fn import(url: &str, store: &str, genesis: &str) -> Result<()> {
         saved_at_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as u64,
     };
     crate::state::StateStore::open(&path)?.write(&checkpoint, None, &meta)?;
-    println!("{empty} accounts without lamports dropped; the traffic's 24 keys funded; saved to {} at state {}", path.display(), &executor.state_hash()[..12]);
+    println!("{empty} accounts without lamports dropped; traffic funding {}; saved to {} at state {}", if native { "retired" } else { "prepared" }, path.display(), &executor.state_hash()[..12]);
     println!("`acrux net up --store {store}` continues the chain from cblock {}", cblock + 1);
     Ok(())
 }

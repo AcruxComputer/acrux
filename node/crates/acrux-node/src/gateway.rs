@@ -44,6 +44,10 @@ pub enum GatewayCommand {
     Faucet {
         reply: CommandReply,
     },
+    /// Native ACRUX's counters, from the executor's hashed cutover account.
+    NativeSupply {
+        reply: CommandReply,
+    },
     Balance {
         address: String,
         reply: CommandReply,
@@ -362,6 +366,16 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
         "getSnapshot" => Ok(state.read().await.snapshot()),
         "getCurrentWindow" => Ok(state.read().await.current_window.clone()),
         "getCounters" => Ok(state.read().await.counters.clone()),
+        "getNativeSupply" => {
+            if params.as_object().is_some_and(|fields| !fields.is_empty()) {
+                Err(("INVALID_INPUT", "getNativeSupply takes no parameters."))
+            } else {
+                match command(&state, |reply| GatewayCommand::NativeSupply { reply }).await {
+                    Ok(value) => Ok(value),
+                    Err(_) => Err(("NET_UNAVAILABLE", "The native supply could not be read.")),
+                }
+            }
+        },
         "getCblockProof" => {
             let state = state.read().await;
             let selectors = [params.get("consensusSlot"), params.get("epoch"), params.get("latest")].iter().filter(|s| s.is_some()).count();
@@ -849,10 +863,7 @@ async fn credit(State(state): State<SharedGateway>, headers: HeaderMap, body: St
     .await
     {
         Ok(value) => Json(value).into_response(),
-        Err(message) => match message.strip_prefix("FAUCET_EMPTY: ") {
-            Some(message) => (StatusCode::SERVICE_UNAVAILABLE, Json(error("FAUCET_EMPTY", message))).into_response(),
-            None => (StatusCode::SERVICE_UNAVAILABLE, Json(error("NET_UNAVAILABLE", &message))).into_response(),
-        },
+        Err(message) => faucet_failure(&message),
     }
 }
 
@@ -888,11 +899,22 @@ async fn bridge_saved(State(state): State<SharedGateway>, headers: HeaderMap, bo
     Json(json!({"program": params.program, "nextWithdrawalSequence": cursor.to_string()})).into_response()
 }
 
+fn faucet_failure(message: &str) -> Response {
+    if let Some(cutover_slot) = message.strip_prefix("FAUCET_RETIRED: ").and_then(|slot| slot.parse::<u64>().ok()) {
+        let mut body = error("FAUCET_RETIRED", "The faucet is retired. Bridge ACRUX from Solana to fund this wallet.");
+        body["error"]["cutoverSlot"] = json!(cutover_slot);
+        return (StatusCode::GONE, Json(body)).into_response();
+    }
+    match message.strip_prefix("FAUCET_EMPTY: ") {
+        Some(message) => (StatusCode::SERVICE_UNAVAILABLE, Json(error("FAUCET_EMPTY", message))).into_response(),
+        None => (StatusCode::SERVICE_UNAVAILABLE, Json(error("NET_UNAVAILABLE", message))).into_response(),
+    }
+}
 /// The private port's read of what the faucet can still grant.
 async fn faucet(State(state): State<SharedGateway>) -> Response {
     match command(&state, |reply| GatewayCommand::Faucet { reply }).await {
         Ok(value) => Json(value).into_response(),
-        Err(message) => (StatusCode::SERVICE_UNAVAILABLE, Json(error("NET_UNAVAILABLE", &message))).into_response(),
+        Err(message) => faucet_failure(&message),
     }
 }
 

@@ -6,7 +6,7 @@ Acrux is a chain of its own, a faster Solana fork: Solana's transactions and pro
 
 ## ACRUX
 
-ACRUX is the chain's native token, with 9 decimals: amounts are in lamports, 1 ACRUX = 1,000,000,000 lamports, the unit every `lamports` field of the RPC, the API, the SDK and the CLI carries. Fees are paid in it (the base fee of 5,000 lamports per signature, half burned; 1,000 lamports per included copy or fragment; the priority fee), the fee payer's reserve is 0.001 ACRUX, and the faucet grants test ACRUX (2 ACRUX a grant, `FAUCET_GRANT_LAMPORTS`).
+Native amounts have 9 decimals: 1 ACRUX = 1,000,000,000 lamports. A bridge rule can name the slot at which bridged ACRUX becomes this native balance, without a fresh genesis. Before that slot the existing test-lamport ledger and SPL bridge continue. At it, system wallets' old lamports are retired, bridged ACRUX balances convert to their token authorities' native accounts, and the faucet and generated traffic stop. Data, token and program accounts retain the cut-over reserve. The fee rates and burn rules remain the existing ones; the later road steps change fees and stake.
 
 ## Hub Registry on Acrux
 
@@ -19,6 +19,51 @@ The genesis loads the same `hub_registry` program as Solana's (`ABjgHL8TcjxUjx6v
 From the first cblock whose initial slot reaches `fromSlot`, consensus votes sign `SHA256(chainId)` followed by their existing bincode vote bytes. Earlier votes, certificates and their stored encodings remain unchanged. A bridge-enabled node refuses an absent, blank, or published development `ACRUX_IDENTITY_SEED`, and requires `ACRUX_BRIDGE_RPC` to name the two deposit RPCs before starting network listeners. The follower continues checking attestation signatures and re-executed state; its existing historical flow does not require archived bridge proofs for ordinary cblocks.
 
 The optional `minWithdrawal` object maps each Solana mint address to its minimum withdrawal amount as a decimal u64 string in base units. The executor applies that rule from `fromSlot`; mints absent from the map have no minimum. Keep the same bridge rule on every validator and follower.
+
+### Native cut-over rule
+
+Configure these three optional bridge-rule fields together. Omitting all three
+preserves the SPL bridge behavior:
+
+- `nativeFromSlot`: the operator-selected four-slot cblock boundary, strictly
+  after `fromSlot`. It has no default.
+- `nativeMint`: the Solana mint becoming native; mainnet ACRUX is
+  `7Evw4uxTxLGGEFEvXLUNYyc1J7PnFk9EYwTUFagARUX`.
+- `nativeScale`: native lamports per Solana base unit, `1000` for ACRUX's six
+  Solana decimals and nine native decimals.
+
+Every validator and follower needs the same rule and append-only placement
+manifest before the cut-over. Keep the existing `acrux-bridge.json` placement;
+append a separate placement of the new bridge bytecode at `nativeFromSlot`.
+The executor checks both the executable account and its ProgramData, so another
+placement at the same program address upgrades the code. The host's actual slot
+and live rule are operator configuration; this release does not select one.
+
+At the named slot, the executor converts every classic SPL token account of the
+bridged mint, including non-associated, frozen and delegated accounts. It zeros
+those token balances and the mint supply, retires all empty system wallets, then
+credits each token authority with `amount * nativeScale`. Other accounts retain
+their data and lamports. A hashed `['native']` bridge PDA records the fixed
+reserve, converted/deposited native lamports, withdrawn native lamports and rule.
+Its presence makes conversion idempotent across replay, restore and rollback.
+Native deposits then credit the recipient's system wallet directly; an invalid
+recipient or overflow uses the existing skipped-credit record.
+
+`withdrawNative(amount, recipient)` takes an amount in Solana base units. It
+checks the configured minimum and the aggregate credited/withdrawn cap, moves
+`amount * nativeScale` to `['native_burn']`, and writes the existing Withdrawal
+record. At the end of the slot the executor removes the burn PDA's excess over
+rent. The executor alone installs the native gate, so this instruction cannot
+run against Solana's bridge. The aggregate cap does not track the provenance
+of wallet lamports: unlocked legacy reserve can consume backing otherwise held
+by native holders. The fixed reserve is accounting, not a lock on those accounts.
+
+From activation, private `GET`/`POST /internal/faucet` returns HTTP 410 with
+`FAUCET_RETIRED`, the fixed message and `cutoverSlot`; public faucet routes carry
+the same code and slot in the contract error envelope. Generated traffic stops
+without funding replacement senders. Existing native fees still burn their
+configured fraction, so circulating plus native fee burns is the relevant
+comparison with the Solana vault while releases are settled.
 
 Set `ACRUX_BRIDGE_PROOF_MAX` when enabling the bridge; it has no node default
 (host examples use 100,000). It is a soft shedding level, never an insertion cap.
@@ -80,7 +125,7 @@ Twelve validators, four per hub, three proposers per window drawn by Algorithm 3
 
 **The chain carries on across restarts.** As each cblock finalizes, validator 0 writes the state at it to `state.redb` in the store, only what changed and in one transaction: every account (programs and their data, token accounts, the registry), the executed transaction ids, the recent blockhashes, the fee accounting, the pending fragments and the built-in traffic's keys. A start finds it and continues from that cblock, a crash included: the same genesis hash, slot and cblock numbers going on from where they were, the next window built on that cblock. `--fresh` sets the saved state aside and starts a new chain from genesis. A new build reads the state an earlier one saved; a change to how transactions execute takes effect from a slot it names, never through a restart.
 
-`acrux net import <rpc>` takes a running net's latest finalized state into `--store` for a net that kept none of its own (0.3.7): its accounts from `getExecutionSnapshot`, its programs from `getProgramAccounts` of each loader, all checked against the net's state hash for that cblock before anything is written. Its genesis hash, counters and blockhashes carry over; the new build's rules apply from the next cblock, so accounts left with no lamports are dropped, and the built-in traffic gets new keys funded as at genesis.
+`acrux net import <rpc>` takes a running net's latest finalized state into `--store` for a net that kept none of its own (0.3.7): its accounts from `getExecutionSnapshot`, its programs from `getProgramAccounts` of each loader, all checked against the net's state hash for that cblock before anything is written. Its genesis hash, counters and blockhashes carry over; the new build's rules apply from the next cblock, so accounts left with no lamports are dropped, and the built-in traffic gets new keys funded as at genesis. An already activated native snapshot receives no new traffic funding.
 
 | Flag | Default | |
 |---|---|---|
@@ -130,8 +175,14 @@ fatal; re-anchoring does not substitute for checking a mismatched state.
 
 The Solana array-parameter surface also serves `getSupply`: a context and value
 with `total`, `circulating`, `nonCirculating` and `nonCirculatingAccounts`.
-Total is the executor's lamport supply; all of it is circulating in the current
-state model, with zero non-circulating lamports and an empty account list.
+Total is all executor lamports. Before native activation the reserve is zero.
+After activation `nonCirculating` is the fixed, hashed cut-over reserve and
+`circulating` is total minus that reserve. The account list is empty because the
+reserve is a fixed amount, rather than a live classification of addresses.
+`getNativeSupply {}` returns `null` before activation; afterwards it returns
+`{cutoverSlot, mint, scale, reserveLamports, creditedLamports, withdrawnLamports,
+circulatingLamports}`. Amounts and scale are decimal strings; the slot is a
+number. The API exposes this as `/v1/bridge`'s `native` field.
 
 The F7 check is `node node/scripts/follow-far-check.mjs` from `backend/` after a
 release build. It checks the usual local net ports before using them, starts its
