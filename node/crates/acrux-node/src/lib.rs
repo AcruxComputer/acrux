@@ -72,3 +72,5 @@ mod identity_tests {
         assert!(super::validate_bridge_identity(Some("isolated-test-identity")).is_ok());
     }
 }
+
+pub mod exchange_metrics;

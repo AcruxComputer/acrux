@@ -252,6 +252,7 @@ impl Identities {
 }
 struct Observer {
     connection: Connection,
+    receipts: bool,
 }
 #[derive(Clone, Copy)]
 enum Audience { Hub(usize), Identity([u8;32]) }
@@ -262,6 +263,7 @@ impl Audience {
 }
 struct HistoryPacket {
     audience: Audience,
+    needs_receipts: bool,
     slot: u64,
     bytes: Arc<Vec<u8>>,
 }
@@ -365,6 +367,21 @@ impl ExternalServer {
         self.representatives.contains_key(&to) || (!self.hubs.iter().any(|(_,peers)|peers.contains(&to)) && self.state.lock().unwrap().catalog.contains_key(&to))
     }
     pub fn active_connections(&self) -> usize { self.state.lock().unwrap().observers.len() }
+    /// Receipt support belongs to this authenticated connection, never a previous session.
+    pub fn enable_receipts(&self, input: &ExternalIngress) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(observer) = state.observers.get_mut(&input.identity) {
+            if observer.connection.stable_id() == input.connection.stable_id() {
+                observer.receipts = true;
+            }
+        }
+        drop(state);
+        self.published.notify_waiters();
+    }
+    pub fn supports_receipts(&self, to: usize) -> bool {
+        let state = self.state.lock().unwrap();
+        state.catalog.get(&to).and_then(|identity|state.observers.get(identity)).is_some_and(|observer|observer.receipts)
+    }
     /// The host may discover an invalid codeword only after enough authenticated shreds arrive.
     pub fn reject_identity(&self, identity: &[u8;32], reason: &str) {
         let connection = self.state.lock().unwrap().observers.get(identity).map(|observer|observer.connection.clone());
@@ -376,6 +393,13 @@ impl ExternalServer {
 
     /// A bounded memory operation only: no network await, timer or geography delay.
     pub fn publish(&self, from: usize, to: usize, slot: u64, payload: Arc<Vec<u8>>) {
+        self.publish_inner(from,to,slot,payload,false);
+    }
+    /// Optional telemetry uses the same held history but cannot make replay fall behind.
+    pub fn publish_receipt(&self, from: usize, to: usize, slot: u64, payload: Arc<Vec<u8>>) {
+        self.publish_inner(from,to,slot,payload,true);
+    }
+    fn publish_inner(&self, from: usize, to: usize, slot: u64, payload: Arc<Vec<u8>>, needs_receipts: bool) {
         assert!(u32::try_from(from).is_ok() && u32::try_from(to).is_ok() && payload.len() <= MAX_PACKET_BYTES, "invalid internal observer envelope");
         let bytes = packet_frame(from, to, slot, &payload);
         let mut state = self.state.lock().unwrap();
@@ -387,10 +411,11 @@ impl ExternalServer {
         let sequence = state.next_sequence;
         state.next_sequence = sequence.checked_add(1).expect("observer sequence exhausted");
         state.history_bytes += bytes.len();
-        state.history.insert(sequence, HistoryPacket { audience, slot, bytes: bytes.clone() });
+        state.history.insert(sequence, HistoryPacket { audience, needs_receipts, slot, bytes: bytes.clone() });
         while state.history_bytes > HISTORY_BYTES || state.history.len() > HISTORY_PACKETS {
             let (sequence, packet) = state.history.pop_first().unwrap();
             state.history_bytes -= packet.bytes.len();
+            if packet.needs_receipts { continue; }
             match packet.audience {
                 Audience::Hub(hub) => {
                     state.oldest_slot[hub] = state.oldest_slot[hub].max(packet.slot.saturating_add(1));
@@ -413,7 +438,8 @@ impl ExternalServer {
         let state = self.state.lock().unwrap();
         ensure!(state.evicted_sequence[hub].is_none_or(|evicted| evicted < cursor)
             && state.targeted_evicted.get(identity).is_none_or(|(_,evicted)| *evicted < cursor), "observer fell behind the held history");
-        Ok(state.history.range(cursor..).find(|(_, packet)| packet.audience.includes(hub,identity) && packet.slot >= from_slot)
+        let receipts = state.observers.get(identity).is_some_and(|observer|observer.receipts);
+        Ok(state.history.range(cursor..).find(|(_, packet)| (!packet.needs_receipts || receipts) && packet.audience.includes(hub,identity) && packet.slot >= from_slot)
             .map(|(sequence, packet)| (*sequence, packet.bytes.clone())))
     }
     fn remove(&self, identity: &[u8; 32], connection: &Connection) {
@@ -479,8 +505,8 @@ async fn serve(server: Weak<ExternalServer>, incoming: quinn::Incoming, permit: 
         ensure!(auth.from_slot >= state.oldest_slot[hub]
             && state.targeted_evicted.get(&auth.identity).is_none_or(|(oldest,_)|auth.from_slot >= *oldest), "observer requested history is no longer held");
         state.identities.reserve(auth.identity)?;
-        let cursor = state.history.iter().find(|(_, packet)| packet.audience.includes(hub,&auth.identity) && packet.slot >= auth.from_slot).map_or(state.next_sequence, |(sequence, _)| *sequence);
-        state.observers.insert(auth.identity, Observer { connection: connection.clone() });
+        let cursor = state.history.iter().find(|(_, packet)| !packet.needs_receipts && packet.audience.includes(hub,&auth.identity) && packet.slot >= auth.from_slot).map_or(state.next_sequence, |(sequence, _)| *sequence);
+        state.observers.insert(auth.identity, Observer { connection: connection.clone(), receipts: false });
         Ok::<_, anyhow::Error>((hub, cursor, server.hubs[hub].1.clone()))
     })();
     let (hub, mut cursor, peers) = match register {

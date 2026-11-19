@@ -90,6 +90,7 @@ pub enum GatewayCommand {
 }
 
 pub struct GatewayState {
+    pub exchange_metrics: Option<std::sync::Weak<crate::exchange::ExchangeEngine>>,
     pub slots: BTreeMap<u64, Value>,
     /// Same run store as Network; serves records evicted from the recent-memory cache.
     pub store: Option<Store>,
@@ -144,6 +145,7 @@ impl GatewayState {
     pub fn new(commands: mpsc::Sender<GatewayCommand>) -> Self {
         let (events, _) = broadcast::channel(8192);
         Self {
+            exchange_metrics: None,
             slots: BTreeMap::new(),
             store: None,
             transactions: BTreeMap::new(),
@@ -269,6 +271,7 @@ pub async fn run_gateway(
     // gets a public domain.
     let metrics = Router::new()
         .route("/metrics", get(metrics))
+        .route("/internal/hash-exchange", get(hash_exchange))
         .route("/health", get(health))
         .route("/internal/faucet", post(credit).get(faucet))
         .route("/internal/bridge-saved", post(bridge_saved).layer(DefaultBodyLimit::max(256)))
@@ -291,7 +294,7 @@ pub async fn run_gateway(
 }
 
 /// The `@acrux/contract` version whose shapes the gateway answers in.
-pub const CONTRACT_VERSION: &str = "0.1.11";
+pub const CONTRACT_VERSION: &str = "0.1.27";
 
 async fn health(State(state): State<SharedGateway>) -> Json<Value> {
     let state = state.read().await;
@@ -463,9 +466,12 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
                 }
             }
         },
-        "getFacts" => match state.read().await.facts.clone() {
-            Value::Null => Err(("NET_UNAVAILABLE", "The net has not measured enough slots yet.")),
-            facts => Ok(facts),
+        "getFacts" => {
+            let (facts,exchange)={let gateway=state.read().await;(gateway.facts.clone(),gateway.exchange_metrics.as_ref().and_then(std::sync::Weak::upgrade))};
+            match facts {
+                Value::Null => Err(("NET_UNAVAILABLE", "The net has not measured enough slots yet.")),
+                mut facts => {if let Some(exchange)=exchange {crate::facts::include_hash_exchange(&mut facts,exchange.metrics_json());}Ok(facts)},
+            }
         },
         "getRecentSlots" => match read_limit(&params, 64) {
             Ok(limit) => Ok(json!(state
@@ -1400,10 +1406,18 @@ async fn metrics(State(state): State<SharedGateway>) -> impl IntoResponse {
     if let Some((_, sent, payers)) = state.kept.as_ref().and_then(|kept| kept.use_by_hour(1).ok()).and_then(|h| h.first().copied()) {
         output.push_str(&format!("acrux_outside_transactions_hour {sent}\nacrux_outside_fee_payers_hour {payers}\n"));
     }
+    let exchange=state.exchange_metrics.as_ref().and_then(std::sync::Weak::upgrade);
+    drop(state);
+    if let Some(exchange)=exchange {output.push_str(&crate::exchange_metrics::prometheus(&exchange.metrics_json()));}
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         output,
     )
+}
+
+async fn hash_exchange(State(state):State<SharedGateway>)->std::result::Result<Json<Value>,StatusCode> {
+    let exchange=state.read().await.exchange_metrics.as_ref().and_then(std::sync::Weak::upgrade).ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    Ok(Json(exchange.metrics_json()))
 }
 
 #[cfg(test)]

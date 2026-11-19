@@ -500,6 +500,9 @@ fn observer_packet_slot(bytes: &[u8]) -> Option<u64> {
         Wire::Cblock(witness) => Some(witness.block.slot * 4),
         Wire::ValidatorEpoch {snapshot,..} => Some(snapshot.cutoff_slot),
         Wire::WindowStart {number,..} => Some(number*16),
+        // Receipt telemetry stays out of hub mirrors so older observing CLIs keep
+        // decoding their original wire. Capable members receive only their own receipts.
+        Wire::CommitReceipt(_) => None,
         Wire::Submit(tx) => Some(tx.header.target_slot),
         Wire::SubmitFragment(fragment) => Some(fragment.header.target_slot),
     }
@@ -732,6 +735,7 @@ impl Network {
             profile.clone(),
             config.fault.clone(),
         );
+        gateway.write().await.exchange_metrics=Some(Arc::downgrade(&exchange));
         let programs = config
             .genesis_programs
             .iter()
@@ -1236,9 +1240,10 @@ impl Network {
             signature: vec![],
         })?[8..12]
             .to_vec();
+        let receipt_tag=encode(&Envelope {from:0,body:Wire::CommitReceipt(CommitReceipt {slot:0,proposer:1,hash:[0;32]}),signature:vec![]})?[8..12].to_vec();
         tokio::spawn(async move {
             while let Some(packet) = incoming.recv().await {
-                if packet.payload.get(8..12) != Some(commit_tag.as_slice()) {
+                if packet.payload.get(8..12) != Some(commit_tag.as_slice()) && packet.payload.get(8..12)!=Some(receipt_tag.as_slice()) {
                     if data_txs[packet.to].send(packet).is_err() {
                         return;
                     }
@@ -1261,6 +1266,10 @@ impl Network {
                         continue;
                     }
                 };
+                if let Wire::CommitReceipt(receipt)=&envelope.body {
+                    ingress_exchange.receive_receipt(packet.to,envelope.from,receipt.clone(),packet.received_at);
+                    continue;
+                }
                 let exchange = ingress_exchange.clone();
                 let bases = ingress_bases.clone();
                 let destination = senders[packet.to].clone();
@@ -1960,6 +1969,13 @@ impl Network {
             },
         );
         let w = self.window_json(number)?;
+        // Derive both values under one guard. Recursive reads can deadlock when a
+        // finalization writer queues between them; telemetry must not retain the guard.
+        let (catalog,co_ids)={
+            let schedules=self.proposers.read().unwrap();
+            (schedules.catalog.clone(),schedules.ids(number)?)
+        };
+        self.exchange.set_window(number,w["hubCode"].as_str().unwrap().to_owned(),catalog,co_ids);
         let mut step = Step::new();
         if self.config.peer_port.is_some() {
             let schedules=self.proposers.read().unwrap();
@@ -2137,7 +2153,7 @@ impl Network {
         match e.body {
             // A commitment witness shares the wire with votes; every existing validator already
             // computed it locally. It is consumed by external replay, never as consensus input.
-            Wire::Cblock(_) | Wire::ValidatorEpoch {..} | Wire::WindowStart {..} => {}
+            Wire::Cblock(_) | Wire::ValidatorEpoch {..} | Wire::WindowStart {..} | Wire::CommitReceipt(_) => {}
             Wire::Submit(tx) => {
                 // Judged by the slot it targets: every actor, not only node zero's, admits submissions.
                 if self.native_cutover_slot().is_some_and(|cut| tx.header.target_slot >= cut) && self.built_in.contains(&tx.header.fee_payer) { return Ok(()) }
@@ -4086,7 +4102,7 @@ async fn member_votes(mut incoming:mpsc::Receiver<acrux_transport::external::Ext
     schedules:Arc<std::sync::RwLock<ProposerSchedules>>,gateway:crate::gateway::SharedGateway,chain_tag:Option<[u8;32]>) {
     while let Some(input)=incoming.recv().await {
         let started=gateway.read().await.current_window["number"].as_u64().unwrap_or(0)*4;
-        let checked=(||->Result<(usize,Vec<usize>)>{
+        let checked=(||->Result<(Envelope,Vec<usize>)>{
             ensure!(input.envelope.len()<=1024*1024,"Member frame too large");
             let envelope:Envelope=decode(&input.envelope)?;
             let frozen=schedules.read().unwrap();
@@ -4114,6 +4130,13 @@ async fn member_votes(mut incoming:mpsc::Receiver<acrux_transport::external::Ext
                     ensure!((1..=3).contains(&attestation.proposer)&&ids[attestation.proposer-1]==envelope.from&&attestation.pi.len()==3,"Unscheduled attestation");
                     (attestation.slot,(0..12).collect())
                 },
+                Wire::CommitReceipt(receipt)=> {
+                    ensure!(input.envelope.len()<=2048,"Member receipt frame too large");
+                    let ids=frozen.ids(receipt.slot/16)?;
+                    ensure!((1..=3).contains(&receipt.proposer) && ids.contains(&envelope.from)
+                        && ids[receipt.proposer-1]!=envelope.from,"Receipt is not from a co-proposer");
+                    (receipt.slot,vec![ids[receipt.proposer-1]])
+                },
                 Wire::Shreds(shreds)=> {
                     let first=shreds.first().context("Empty member shred group")?;
                     ensure!(first.meta.slice<(1024usize*1024).div_ceil(38_000)as u32+1,"Member block has too many slices");
@@ -4136,19 +4159,24 @@ async fn member_votes(mut incoming:mpsc::Receiver<acrux_transport::external::Ext
                 ensure!(!targets.is_empty()&&targets.iter().all(|to|allowed.contains(to)),"Invalid member recipients");targets.clone()
             }else {allowed};
             drop(frozen);
-            authenticate(Received {from:envelope.from,to:0,payload:input.envelope.clone(),received_at:input.received_at},&[],&schedules)?;
-            Ok((envelope.from,targets))
+            let auth_target=if matches!(&envelope.body,Wire::CommitReceipt(_)){targets[0]}else{0};
+            authenticate(Received {from:envelope.from,to:auth_target,payload:input.envelope.clone(),received_at:input.received_at},&[],&schedules)?;
+            Ok((envelope,targets))
         })();
         match checked {
-            Ok((from,targets))=>{
+            Ok((envelope,targets))=>{
+                let from=envelope.from;
+                if matches!(&envelope.body,Wire::CommitReceipt(_)) {
+                    if let Some(server)=transport.external_server() {server.enable_receipts(&input);}
+                }
                 // The outside send clock is not a measured host timestamp. Publish its
                 // signed commitment with an unknown (zero) send offset; arrivals below
                 // retain the actual socket time used by the common exchange deadline.
-                if let Wire::Commit(commitment)=decode::<Envelope>(&input.envelope).unwrap().body {
+                if let Wire::Commit(commitment)=&envelope.body {
                     let mut g=gateway.write().await;
                     if let Some(view)=g.slots.get_mut(&commitment.slot) {
                         if view["blocks"][commitment.proposer-1]["commitment"].is_null() {
-                            let data=json!({"slot":commitment.slot,"proposer":commitment.proposer,"hash":hex::encode(commitment.hash),"keyHash":hex::encode(commitment.key_hash),"signature":bs58::encode(decode::<Envelope>(&input.envelope).unwrap().signature).into_string(),"sentUs":0,"arrivals":[]});
+                            let data=json!({"slot":commitment.slot,"proposer":commitment.proposer,"hash":hex::encode(commitment.hash),"keyHash":hex::encode(commitment.key_hash),"signature":bs58::encode(&envelope.signature).into_string(),"sentUs":0,"arrivals":[]});
                             crate::projection::apply(view,"commitment.sent",&data);
                             g.emit(Some(bs58::encode(input.identity).into_string()),Some(commitment.slot),"slot",0,"commitment.sent",data);
                         }
@@ -4156,7 +4184,11 @@ async fn member_votes(mut incoming:mpsc::Receiver<acrux_transport::external::Ext
                 }
                 for to in targets {
                 let result=if to<12 {transport.inject_external_at(from,to,input.envelope.clone(),input.received_at)} else {
-                    if let Some(server)=transport.external_server() {server.publish(from,to,observer_packet_slot(&input.envelope).unwrap(),Arc::new(input.envelope.clone()));} Ok(())
+                    if let Some(server)=transport.external_server() {
+                        if let Wire::CommitReceipt(receipt)=&envelope.body {
+                            if server.supports_receipts(to) {server.publish_receipt(from,to,receipt.slot,Arc::new(input.envelope.clone()));}
+                        } else {server.publish(from,to,observer_packet_slot(&input.envelope).unwrap(),Arc::new(input.envelope.clone()));}
+                    } Ok(())
                 };
                 if result.is_err(){input.reject("Member receive capacity exceeded");break}
                 }
@@ -4183,6 +4215,11 @@ fn authenticate(
         remember_verified(outer);
     }
     match &e.body {
+        Wire::CommitReceipt(receipt)=> {
+            let ids=schedule.ids(receipt.slot/16)?;
+            ensure!((1..=3).contains(&receipt.proposer) && ids.get(receipt.proposer-1)==Some(&packet.to)
+                && ids.contains(&e.from) && e.from!=packet.to,"Incorrect commitment receipt route");
+        },
         Wire::Commit(commitment) => {
             ensure!(
                 (1..=3).contains(&commitment.proposer)

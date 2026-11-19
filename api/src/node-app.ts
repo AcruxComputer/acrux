@@ -23,6 +23,7 @@ import { readBuyback } from './buyback/read.js'
 import { createBurnReader, mountBurnRoutes, readNodeFeeBurns } from './burn.js'
 import { BridgeReader, readBridgeRelayer, readBridgeTransfers } from './bridge.js'
 import { readReplayRange } from './replay.js'
+import { createHashExchangeReader, hubHashExchange, memberHashExchange } from './hash-exchange.js'
 /** `?from=&to=`: the totals of one slot range, an epoch say. */
 const ReplayQuery = z.object({ from: z.coerce.number().int().nonnegative().optional(), to: z.coerce.number().int().nonnegative().optional() })
 import { createRpc } from './engines/rpc/client.js'
@@ -47,6 +48,7 @@ export function createNodeApi() {
     solana: new RegistryIndexer(db, 'solana', env.SOLANA_RPC_URL, env.REGISTRY_PROGRAM_ID!, env.REGISTRY_POLL_SECONDS * 1000, solanaStake(), env.REGISTRY_CLUSTER),
   }
   const lab = new NodeLab(db)
+  const hashExchange = createHashExchangeReader(env.GATEWAY_INTERNAL_URL)
   registries.acrux.start()
   registries.solana.start()
   const app = createApi({ origins: env.CORS_ORIGINS, contractVersion: CONTRACT_VERSION })
@@ -64,6 +66,10 @@ export function createNodeApi() {
   }
   const hubRows = (chain?: Chain) => db.hub.findMany({ where: chain ? { chain } : {}, include: { members: { orderBy: { stakeLamports: 'desc' } } }, orderBy: [{ chain: 'asc' }, { code: 'asc' }] })
   const ready = () => (['acrux', 'solana'] as const).filter(chain => registries[chain].state.readAt)
+  const exchangeMembers = () => {
+    if (!registries.acrux.state.readAt || registries.acrux.state.error) fail('NET_UNAVAILABLE', 'Acrux hub memberships are unavailable for hash-exchange measurements.', { retryable: true, stage: 'read' })
+    return registries.acrux.effectiveHubMembers()
+  }
 
   app.get('/health', async c => {
     let status: 'waiting' | 'ready' = 'waiting'
@@ -118,7 +124,10 @@ export function createNodeApi() {
     const rows = await db.hub.findMany({ where: { code, ...(chain ? { chain } : {}) }, include: { members: { orderBy: { stakeLamports: 'desc' } } }, orderBy: { chain: 'asc' } })
     const row = rows[0]
     if (!row) fail('NOT_FOUND', 'This hub was not found.')
-    return c.json(hubView(row, readyRegistry(row.chain as Chain)))
+    const view = hubView(row, readyRegistry(row.chain as Chain))
+    if (row.chain !== 'acrux') return c.json(view)
+    const telemetry = await hashExchange.read()
+    return c.json({ ...view, hashExchange: hubHashExchange(telemetry, exchangeMembers(), row.code) })
   })
   app.get('/v1/registry/config', c => c.json(registries[readQuery(c, chainQuery).chain ?? 'solana'].configView()))
   app.get('/v1/registry/members/:identity', async c => {
@@ -136,7 +145,10 @@ export function createNodeApi() {
     return c.json(await schedulePreview(epoch, hubs, Number(registries[chain].stake.total() / 1_000n)))
   })
 
-  app.get('/v1/facts', async c => c.json(await net('getFacts', {})))
+  app.get('/v1/facts', async c => {
+    const [facts, telemetry] = await Promise.all([net('getFacts', {}), hashExchange.read()])
+    return c.json({ ...facts, hashExchange: memberHashExchange(telemetry, exchangeMembers()), commitSpreadByLinkUs: telemetry.commitSpreadByLinkUs })
+  })
   app.get('/v1/spec', c => c.json(SpecMap.parse(JSON.parse(readFileSync(specPath, 'utf8')))))
   app.get('/v1/transactions/:id', async c => c.json(await net('getTransaction', { id: readParam(c, 'id', TxId) })))
 

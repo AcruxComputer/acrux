@@ -70,6 +70,14 @@ pub enum Wire {
     /// The hub representative's monotonic window start expressed on its public wall clock.
     /// A member maps it once to its own Instant; link delay never moves the deadline.
     WindowStart { number: u64, parent: Option<consensus::BlockRef>, started_at_unix_us: u64 },
+    /// An authenticated receipt for one actual commitment; telemetry only.
+    CommitReceipt(CommitReceipt),
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CommitReceipt {
+    pub slot: u64,
+    pub proposer: usize,
+    pub hash: [u8;32],
 }
 /// A Fault Lab scenario: the faulty behaviour of one proposer role in one window.
 #[derive(Clone, Debug, Serialize, Deserialize)]

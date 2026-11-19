@@ -1,10 +1,11 @@
 //! Algorithm 1's local hash exchange runs independently of validator execution.
 use crate::{
     crypto,
+    exchange_metrics::Recorder,
     gateway::GatewayState,
     profiling::Profiling,
     transport::LocalTransport,
-    types::{Attestation, Commitment, Envelope, Fault, Wire},
+    types::{Attestation, Commitment, CommitReceipt, Envelope, Fault, Wire},
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ed25519_dalek::SigningKey;
@@ -65,7 +66,22 @@ enum ExchangeLink {
 impl ExchangeLink {
     async fn send(&self, from: usize, to: usize, bytes: Vec<u8>) -> anyhow::Result<()> {
         match self {
-            Self::Local(transport) => transport.send(from,to,bytes).await,
+            Self::Local(transport) => {
+                // Receipt traffic stays out of the legacy hub mirror. Only a current outside
+                // connection that has sent a valid receipt can receive this appended Wire kind.
+                if to>=12 && bytes.get(8..12)==Some(13u32.to_le_bytes().as_slice()) {
+                    if let Some(server)=transport.external_server() {
+                        if server.supports_receipts(to) {
+                            let envelope:Envelope=bincode::deserialize(&bytes)?;
+                            if let Wire::CommitReceipt(receipt)=envelope.body {
+                                server.publish_receipt(from,to,receipt.slot,Arc::new(bytes));
+                            }
+                        }
+                    }
+                    return Ok(())
+                }
+                transport.send(from,to,bytes).await
+            }
             Self::Member(control) => control.send_to(&[to],&bytes).await,
         }
     }
@@ -84,6 +100,7 @@ pub struct ExchangeEngine {
     sent_at: Mutex<BTreeMap<(usize, u64), Instant>>,
     profile: Arc<Profiling>,
     fault: Option<Fault>,
+    metrics: Recorder,
 }
 
 #[derive(Default)]
@@ -113,6 +130,7 @@ impl ExchangeEngine {
             sent_at: Mutex::new(BTreeMap::new()),
             profile,
             fault,
+            metrics: Recorder::new(),
         })
     }
 
@@ -137,8 +155,21 @@ impl ExchangeEngine {
             sent_at: Mutex::new(BTreeMap::new()),
             profile,
             fault: None,
+            metrics: Recorder::new(),
         })
     }
+
+    /// Finalized draw metadata labels observations; it never changes a protocol deadline.
+    pub fn set_window(&self, number:u64, hub:String, catalog:Vec<String>, co_ids:Vec<usize>) {
+        self.metrics.set_window(number,hub,catalog,co_ids);
+    }
+
+    /// The caller has authenticated this signer and checked the scheduled receipt route.
+    pub fn receive_receipt(&self, owner:usize, from:usize, receipt:CommitReceipt, received_at:Instant) {
+        self.metrics.received(owner,from,receipt.slot,receipt.proposer,receipt.hash,received_at);
+    }
+
+    pub fn metrics_json(&self)->serde_json::Value { self.metrics.json() }
 
     pub fn launch(
         self: &Arc<Self>,
@@ -169,7 +200,7 @@ impl ExchangeEngine {
             }
             this.commit_times.lock().unwrap().entry(slot).and_modify(|t| *t = (*t).min(sent)).or_insert(sent);
             this.profile.record(Some(id),"exchange.commit_wake_overshoot",sent.saturating_duration_since(wake_deadline));
-            let notify = {
+            let (notify,received) = {
                 let lock_started=Instant::now();
                 let mut slots = this.slots.lock().unwrap();
                 this.profile.record(Some(id),"exchange.state_lock_wait",lock_started.elapsed());
@@ -177,8 +208,10 @@ impl ExchangeEngine {
                 let exchange = slots.entry((id, slot)).or_default();
                 if !exchange.local.sent(q,commitment.clone(),sent) { return }
                 exchange.role = Some(q);
-                exchange.notify.clone()
+                (exchange.notify.clone(),exchange.local.received.clone())
             };
+            this.metrics.sent(id,slot,commitment.hash,sent);
+            this.metrics.spreads(id,slot,received,sent);
             let body = Wire::Commit(commitment.clone());
             let bytes = bincode::serialize(&body).unwrap();
             let signature = crypto::sign_bytes(&this.keys[&id], &bytes);
@@ -360,7 +393,7 @@ impl ExchangeEngine {
         if let Some(sent) = self.sent_at.lock().unwrap().get(&(from, slot)).copied() {
             self.profile.record(Some(receiver), "exchange.commit_flight", received_at.saturating_duration_since(sent));
         }
-        let (notify, start, role) = {
+        let (notify, start, role, spread_received) = {
             let lock_started = Instant::now();
             let mut slots = self.slots.lock().unwrap();
             self.profile.record(
@@ -392,9 +425,24 @@ impl ExchangeEngine {
                 exchange.notify.clone(),
                 exchange.local.start.unwrap(),
                 exchange.role,
+                exchange.local.sent.then(||exchange.local.received.clone()),
             )
         };
         notify.notify_one();
+        if receiver!=from {
+            let link=self.transport.clone();
+            let signer=self.keys[&receiver].clone();
+            let receipt=CommitReceipt{slot,proposer:commitment.proposer,hash:commitment.hash};
+            tokio::spawn(async move {
+                let body=Wire::CommitReceipt(receipt);
+                let signature=crypto::sign_bytes(&signer,&bincode::serialize(&body).unwrap());
+                let bytes=bincode::serialize(&Envelope{from:receiver,body,signature}).unwrap();
+                if let Err(error)=link.send(receiver,from,bytes).await {tracing::warn!(%error,"commit receipt send failed");}
+            });
+        }
+        if let Some(received)=spread_received {
+            self.metrics.spreads(receiver,slot,received,received_at);
+        }
         // Receiver role comes from the same scheduled window, supplied by the node identities.
         let receiver_role = if role.is_some() {
             role

@@ -145,6 +145,7 @@ struct Observer {
     control: Option<std::sync::Arc<crate::external::ExternalControl>>,
     member: Option<crate::external_proposer::MemberProposer>,
     fast_lane: crate::external_proposer::FastLane,
+    member_metrics: crate::external_proposer::MemberMetrics,
     certified: BTreeSet<BlockRef>,
     window_notices: BTreeMap<u64,(Option<BlockRef>,u64)>,
     bridge: Option<crate::genesis::BridgeConfig>,
@@ -237,7 +238,10 @@ impl Observer {
                 }
             }
         }
-        if let Some(member)=&mut self.member {member.finalized(&self.replay.executor);}
+        if let Some(member)=&mut self.member {
+            member.finalized(&self.replay.executor);
+            self.member_metrics.set(member.metrics_engine());
+        }
         self.fast_lane.update(proposers.clone(),self.keys.clone(),self.member.as_ref().map(|member|member.inbox()),self.identity.clone(),self.hub.clone());
         for checkpoint in self.checkpoints.values_mut() { checkpoint.proposers = self.replay.proposers.clone(); }
         let ready = self.epoch_updates.iter().filter(|(epoch,_)|proposers.admissions.contains_key(epoch)).map(|(epoch,_)|*epoch).collect::<Vec<_>>();
@@ -421,9 +425,19 @@ impl Observer {
             let ids=proposers.ids(*number)?;
             let (identities,stakes)=proposers.voting_set(number*4)?;
             let view=crate::view::window_json(*number,&window,&identities,&stakes,None,&proposers.config.identities);
-            member.start_window(*number,*parent,*unix_us,ids,view)?;
+            member.start_window(*number,*parent,*unix_us,ids,view,proposers.catalog.clone())?;
         }
         Ok(())
+    }
+    fn own_exchange(&self,slot:u64)->Result<Option<crate::external_proposer::CommitInbox>> {
+        let Some(member)=&self.member else{return Ok(None)};
+        if self.votor.own_at(slot/4).is_none() {return Ok(None)}
+        let proposers=self.replay.proposers.as_ref().context("Missing proposer configuration")?;
+        let window=proposers.window(slot/16)?;
+        if window.hub_code!=self.hub||!window.proposers.contains(&self.identity) {return Ok(None)}
+        let inbox=member.inbox();
+        inbox.set_window(slot/16,window.hub_code,proposers.catalog.clone(),proposers.ids(slot/16)?);
+        Ok(Some(inbox))
     }
     async fn member_tick(&mut self)->Result<()> {
         if let Some(member)=&mut self.member {
@@ -444,6 +458,7 @@ impl Observer {
             Wire::Certificate {certificate,..} => known(certificate.slot),
             Wire::Shreds(shreds) | Wire::Relay(shreds) => shreds.iter().all(|shred|known(shred.meta.slot / 4)),
             Wire::Commit(commitment) => known(commitment.slot / 4),
+            Wire::CommitReceipt(receipt) => known(receipt.slot/4),
             Wire::Attest(attestation) => known(attestation.slot / 4),
             Wire::Handover {slot,shreds,attestations,..} => known(*slot / 4)
                 && shreds.iter().all(|shred|known(shred.meta.slot / 4))
@@ -474,9 +489,20 @@ impl Observer {
             Wire::Shreds(shreds) | Wire::Relay(shreds) => for shred in shreds { self.shred(shred)?; },
             Wire::Commit(commitment) => {
                 self.commitment(commitment.clone(), None, Some(envelope.from))?;
-                if let Some(member)=&self.member {
-                    let inbox=member.inbox();let signature=envelope.signature;
+                if let Some(inbox)=self.own_exchange(commitment.slot)? {
+                    let signature=envelope.signature;
                     tokio::spawn(async move{inbox.receive(envelope.from,commitment,signature,received_at).await;});
+                }
+            },
+            Wire::CommitReceipt(receipt) => {
+                ensure!((1..=3).contains(&receipt.proposer),"Invalid receipt proposer");
+                if let Some(inbox)=self.own_exchange(receipt.slot)? {
+                    let proposers=self.replay.proposers.as_ref().context("Missing proposer configuration")?;
+                    let ids=proposers.ids(receipt.slot/16)?;
+                    if to==ids[receipt.proposer-1] && proposers.catalog.get(ids[receipt.proposer-1])==Some(&self.identity) {
+                        ensure!(ids.contains(&envelope.from)&&proposers.catalog.get(envelope.from)!=Some(&self.identity),"Receipt signer is not a drawn co-proposer");
+                        inbox.receive_receipt(envelope.from,receipt,received_at);
+                    }
                 }
             },
             Wire::Attest(attestation) => self.attest(attestation, envelope.signature, Some(envelope.from))?,
@@ -652,7 +678,7 @@ impl Observer {
 
 }
 
-pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_port:Option<u16>) -> Result<()> {
+pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_port:Option<u16>, metrics_port:Option<u16>) -> Result<()> {
     let genesis = crate::genesis::Genesis::load(std::path::Path::new(genesis_path))?;
     let programs = genesis.programs.iter().map(|(address,path)|crate::execution::GenesisProgram {address:address.clone(),path:path.clone()}).collect::<Vec<_>>();
     let snapshot = cli::rpc(url,"getExecutionSnapshot",json!({})).await?;
@@ -693,7 +719,8 @@ pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_p
     let mut votor = Votor::new(0,legacy_stakes.clone())?;
     votor.install_stakes(0,None,legacy_stakes)?;
     let fast_lane=crate::external_proposer::FastLane::default();
-    let mut observer = Observer {checkpoints:BTreeMap::from([(anchor,replay.checkpoint())]),replay,anchor,keys,votor,signer,journal,identity,hub:hub.to_owned(),outgoing:vec![],epoch_updates:BTreeMap::new(),reported_epoch:None,control:Some(control.clone()),member:None,fast_lane:fast_lane.clone(),certified:BTreeSet::from([anchor]),window_notices:BTreeMap::new(),bridge:genesis.bridge.clone(),slots:BTreeMap::new(),witnesses:BTreeMap::new(),finalized:BTreeMap::new(),seen:BTreeMap::new(),pending:BTreeMap::new(),checked:0,buffered_bytes:0};
+    let member_metrics=crate::external_proposer::MemberMetrics::default();
+    let mut observer = Observer {checkpoints:BTreeMap::from([(anchor,replay.checkpoint())]),replay,anchor,keys,votor,signer,journal,identity,hub:hub.to_owned(),outgoing:vec![],epoch_updates:BTreeMap::new(),reported_epoch:None,control:Some(control.clone()),member:None,fast_lane:fast_lane.clone(),member_metrics:member_metrics.clone(),certified:BTreeSet::from([anchor]),window_notices:BTreeMap::new(),bridge:genesis.bridge.clone(),slots:BTreeMap::new(),witnesses:BTreeMap::new(),finalized:BTreeMap::new(),seen:BTreeMap::new(),pending:BTreeMap::new(),checked:0,buffered_bytes:0};
     observer.learn_finalized()?;
     observer.votor.resume(anchor);
     observer.status(last);
@@ -710,6 +737,7 @@ pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_p
     });
 
     let (mut rpc_requests,rpc_task)=match rpc_port {Some(port)=>{let (receiver,task)=crate::external_proposer::bind_rpc(port).await?;(Some(receiver),Some(task))},None=>(None,None)};
+    let metrics_task=match metrics_port {Some(port)=>Some(crate::external_proposer::bind_metrics(port,member_metrics).await?),None=>None};
     let mut member_tick=tokio::time::interval(Duration::from_millis(1));
     member_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
@@ -740,6 +768,7 @@ pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_p
     reader.abort();
     let _ = reader.await;
     if let Some(task)=rpc_task {task.abort();let _=task.await;}
+    if let Some(task)=metrics_task {task.abort();let _=task.await;}
     outcome
 }
 
@@ -774,7 +803,7 @@ mod tests {
         let mut observer = Observer {
             checkpoints:BTreeMap::from([(anchor,replay.checkpoint())]),replay,anchor,
             keys:signers.iter().map(SigningKey::verifying_key).collect(),votor,signer,journal,identity,
-            hub:"FRA".into(),outgoing:vec![],epoch_updates:BTreeMap::new(),reported_epoch:None,control:None,member:None,fast_lane:crate::external_proposer::FastLane::default(),certified:BTreeSet::from([anchor]),window_notices:BTreeMap::new(),bridge:None,
+            hub:"FRA".into(),outgoing:vec![],epoch_updates:BTreeMap::new(),reported_epoch:None,control:None,member:None,fast_lane:crate::external_proposer::FastLane::default(),member_metrics:crate::external_proposer::MemberMetrics::default(),certified:BTreeSet::from([anchor]),window_notices:BTreeMap::new(),bridge:None,
             slots:BTreeMap::new(),witnesses:BTreeMap::new(),finalized:BTreeMap::new(),seen:BTreeMap::new(),
             pending:BTreeMap::new(),checked:0,buffered_bytes:0,
         };

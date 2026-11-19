@@ -82,8 +82,23 @@ export const RegistryChain = z.enum(['acrux', 'solana'])
 export const Member = z.strictObject({ chain: RegistryChain, identity: Address, hubCode: HubCode, stake: U64, proposerStake: U64, capped: z.boolean(), effectiveEpoch: Count, joinedEpoch: Count, pendingMove: HubCode.nullable(), pendingLeave: z.boolean(), cooldownUntilEpoch: Count,
   validatorKind: z.enum(['genesis', 'external']).optional(), admittedAtEpoch: Count.nullable().optional() })
 export type Member = z.infer<typeof Member>
+/** Microseconds measured from a commitment's local send to its authenticated receipt. */
+export const HashExchangeStats = z.strictObject({ p50: Count, p99: Count, count: Count.min(1) }).refine(value => value.p99 >= value.p50, 'p99 must be at least p50.')
+export type HashExchangeStats = z.infer<typeof HashExchangeStats>
+export const HashExchangePair = z.strictObject({ members: z.tuple([Address, Address]), kind: z.enum(['applied', 'real']), p50: Count, p99: Count, count: Count.min(1) })
+  .refine(value => value.members[0] < value.members[1] && value.p99 >= value.p50, 'Pair members must be in canonical base58 order and percentiles must be ordered.')
+export type HashExchangePair = z.infer<typeof HashExchangePair>
+export const HashExchangeSpread = z.strictObject({ applied: HashExchangeStats.nullable(), real: HashExchangeStats.nullable() })
+export const HashExchangeHub = z.strictObject({ hubCode: HubCode, pairs: z.array(HashExchangePair), commitSpreadUs: HashExchangeSpread })
+export const HashExchange = z.strictObject({ measuredAt: Timestamp, measurement: z.literal('roundTrip'), hubs: z.array(HashExchangeHub) })
+export type HashExchange = z.infer<typeof HashExchange>
+/** The node's private aggregate: percentiles are computed from raw samples on the node. */
+export const HashExchangeTelemetry = HashExchange.extend({ commitSpreadByLinkUs: HashExchangeSpread })
+export type HashExchangeTelemetry = z.infer<typeof HashExchangeTelemetry>
+export const HubHashExchange = z.strictObject({ measuredAt: Timestamp, measurement: z.literal('roundTrip'), pairs: z.array(HashExchangePair), commitSpreadUs: HashExchangeSpread })
+export type HubHashExchange = z.infer<typeof HubHashExchange>
 /** ECEF coordinates are integer metres in the WGS84 geocentric reference frame. */
-export const Hub = z.strictObject({ chain: RegistryChain, code: HubCode, name: z.string(), region: z.string(), ecef: z.strictObject({ x: z.number().int(), y: z.number().int(), z: z.number().int() }).describe('Integer metres in WGS84 Earth-centred, Earth-fixed coordinates.'), latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), registrant: Address, depositLamports: U64, members: z.array(Member), stake: U64, proposerStake: U64, proposerStakeCap: U64, status: z.enum(['active', 'pending', 'inactive']), needs: z.strictObject({ members: Count, stake: U64 }), createdEpoch: Count, lastActiveEpoch: Count.nullable(), releasableEpoch: Count.nullable(), releasable: z.boolean() })
+export const Hub = z.strictObject({ chain: RegistryChain, code: HubCode, name: z.string(), region: z.string(), ecef: z.strictObject({ x: z.number().int(), y: z.number().int(), z: z.number().int() }).describe('Integer metres in WGS84 Earth-centred, Earth-fixed coordinates.'), latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), registrant: Address, depositLamports: U64, members: z.array(Member), stake: U64, proposerStake: U64, proposerStakeCap: U64, status: z.enum(['active', 'pending', 'inactive']), needs: z.strictObject({ members: Count, stake: U64 }), createdEpoch: Count, lastActiveEpoch: Count.nullable(), releasableEpoch: Count.nullable(), releasable: z.boolean(), hashExchange: HubHashExchange.optional() })
 export type Hub = z.infer<typeof Hub>
 export const Hubs = page(Hub)
 export const RegistryConfig = z.strictObject({ status: z.enum(['fixture', 'waiting', 'ready']), chain: RegistryChain, programId: Address.nullable(), cluster: z.enum(['localnet', 'mainnet-beta', 'acrux']), depositLamports: U64.nullable(), registrationFeeBps: Count.max(10000).nullable(), cooldownEpochs: Count.nullable(), inactivityEpochs: Count.nullable(), codeRules: z.strictObject({ pattern: z.string().nullable(), minLength: Count.nullable(), maxLength: Count.nullable() }), minimumMembers: Count.nullable(), minimumStake: U64.nullable(), currentEpoch: Count, missingConfiguration: z.array(z.string()) })
@@ -95,7 +110,8 @@ export const FaucetRequest = z.strictObject({ address: Address })
 export const FaucetGrant = z.strictObject({ id: z.string(), transactionId: TxId.optional(), address: Address, amountLamports: U64, signature: Signature, balance: Balance, grantedAt: Timestamp })
 export const Facts = z.strictObject({ source: z.enum(['fixture', 'measured']), measuredAt: Timestamp, sampleSize: Count, slotPacingUs: z.strictObject({ p50: Count, p99: Count }), commitSpreadUs: z.strictObject({ p50: Count, p99: Count }), attestationRelativeToBlockUs: z.strictObject({ p50: z.number().int(), p99: z.number().int() }), cblockFinalizationUs: z.strictObject({ p50: Count, p99: Count }),
   /** Window handovers per hub link (e.g. "FRA-NYC"): measured p50/p99 and the link's Rotor floor (50 ms plus the second hub's votes for the 60% certificate). */
-  handoverUs: z.record(z.string(), z.strictObject({ p50: Count, p99: Count, floorUs: Count, count: Count })) })
+  handoverUs: z.record(z.string(), z.strictObject({ p50: Count, p99: Count, floorUs: Count, count: Count })),
+  hashExchange: HashExchange.optional(), commitSpreadByLinkUs: HashExchangeSpread.optional() })
 export const ScenarioId = z.enum(['last-look', 'censorship', 'crash', 'equivocation', 'split-commitments', 'private-front-run'])
 export const Evidence = z.strictObject({ kind: z.enum(['late_block_dropped', 'transaction_included', 'two_proposers_continue', 'slashing_proof', 'skip_certificate', 'unreadable_fragment']), slot: SlotNumber, proposer: ProposerIndex.nullable(), txId: TxId.nullable(), description: z.string(), hashes: z.array(Hash), signatures: z.array(Signature), observedFragments: Count.nullable(), threshold: Count.nullable() })
 export const LabScenario = z.strictObject({ id: ScenarioId, title: z.string(), description: z.string(), seed: z.string(), parameters: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])), lemma: z.string(), expectedOutcome: z.string() })

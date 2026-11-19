@@ -2,7 +2,7 @@
 use crate::{consensus::BlockRef, crypto, exchange::ExchangeEngine, execution::{SvmExecutor,ValidatedTx},
     external::{ExternalControl,Packet}, gateway::{GatewayState,SharedGateway}, profiling::Profiling,
     protocol::ProposerSchedules, proposer::{self,BuiltBlock,ProposalLink}, threshold::VerifiedFragment,
-    types::{BlockPayload,Commitment,Envelope,Wire}};
+    types::{BlockPayload,Commitment,CommitReceipt,Envelope,Wire}};
 use anyhow::{ensure,Context,Result};
 use ed25519_dalek::{SigningKey,VerifyingKey};
 use serde_json::{json,Value};
@@ -21,7 +21,14 @@ pub(crate) fn host_instant(unix_us:u64)->Result<Instant> {
 #[derive(Clone)]
 pub(crate) struct CommitInbox {id:usize,exchange:Arc<ExchangeEngine>,starts:Arc<RwLock<BTreeMap<u64,Instant>>>}
 impl CommitInbox {
+    pub(crate) fn set_window(&self,number:u64,hub:String,catalog:Vec<String>,co_ids:Vec<usize>) {
+        self.exchange.set_window(number,hub,catalog,co_ids);
+    }
+    pub(crate) fn receive_receipt(&self,from:usize,receipt:CommitReceipt,received_at:Instant) {
+        self.exchange.receive_receipt(self.id,from,receipt,received_at);
+    }
     pub(crate) async fn receive(&self,from:usize,commitment:Commitment,signature:Vec<u8>,received_at:Instant) {
+        if from==self.id {return}
         let start = self.starts.read().unwrap().get(&(commitment.slot/16)).copied();
         // Base affects event offsets only. The exchange always anchors its deadline to
         // the first real arrival, even when the clock notice is still behind this packet.
@@ -48,14 +55,14 @@ impl FastLane {
     }
     pub(crate) async fn receive(&self,packet:&Packet,received_at:Instant)->Result<()> {
         // Envelope starts with a fixed-width usize; Wire's appended discriminants stay stable.
-        // Decode only the two timing-sensitive kinds, leaving bulk Rotor frames to normal intake.
+        // Decode only the timing-sensitive kinds, leaving bulk Rotor frames to normal intake.
         let Some(tag)=packet.payload.get(8..12) else {return Ok(())};
-        if tag!=2u32.to_le_bytes() && tag!=12u32.to_le_bytes() {return Ok(())}
+        if tag!=2u32.to_le_bytes() && tag!=12u32.to_le_bytes() && tag!=13u32.to_le_bytes() {return Ok(())}
         let envelope:Envelope=crate::propose::decode(&packet.payload)?;
         let context=self.context.read().unwrap().clone();
         let Some(context)=context else {return Ok(())};
         let Some(member)=context.member else {return Ok(())};
-        let window=match &envelope.body {Wire::Commit(commit)=>commit.slot/16,Wire::WindowStart{number,..}=>*number,_=>return Ok(())};
+        let window=match &envelope.body {Wire::Commit(commit)=>commit.slot/16,Wire::CommitReceipt(receipt)=>receipt.slot/16,Wire::WindowStart{number,..}=>*number,_=>return Ok(())};
         if !context.schedules.ready(window) {return Ok(())}
         let draw=context.schedules.window(window)?;
         if draw.hub_code!=context.hub || !draw.proposers.contains(&context.identity) {return Ok(())}
@@ -64,6 +71,8 @@ impl FastLane {
         ensure!(packet.from==envelope.from,"Fast lane envelope has another sender");
         let key=context.keys.get(envelope.from).context("Fast lane sender is not in the finalized catalog")?;
         crypto::verify_bytes(key,&bincode::serialize(&envelope.body)?,&envelope.signature)?;
+        let co_ids=context.schedules.ids(window)?;
+        member.set_window(window,draw.hub_code.clone(),context.schedules.catalog.clone(),co_ids.clone());
         match envelope.body {
             Wire::WindowStart{number,started_at_unix_us,..}=>{
                 let hub=context.schedules.config.hubs.iter().find(|hub|hub.code==context.hub).context("Missing configured hub")?;
@@ -74,6 +83,14 @@ impl FastLane {
                 ensure!((1..=3).contains(&commitment.proposer)
                     && context.schedules.ids(window)?.get(commitment.proposer-1)==Some(&envelope.from),"Fast lane commitment is not from a drawn proposer");
                 member.receive(envelope.from,commitment,envelope.signature,received_at).await;
+            }
+            Wire::CommitReceipt(receipt)=>{
+                ensure!((1..=3).contains(&receipt.proposer),"Invalid receipt proposer");
+                // Hub mirrors can contain receipts for another co-proposer's commitment.
+                if packet.to==member.id && co_ids[receipt.proposer-1]==member.id {
+                    ensure!(envelope.from!=member.id&&co_ids.contains(&envelope.from),"Receipt signer is not a drawn co-proposer");
+                    member.receive_receipt(envelope.from,receipt,received_at);
+                }
             }
             _=>{},
         }
@@ -99,8 +116,10 @@ impl MemberProposer {
         Self{id,key,identity,control,seed,gateway,exchange,inbox,windows:BTreeMap::new(),building:None,mempool:BTreeMap::new(),fragments:BTreeMap::new(),in_flight:BTreeMap::new()}
     }
     pub(crate) fn inbox(&self)->CommitInbox {self.inbox.clone()}
-    pub(crate) fn start_window(&mut self,number:u64,parent:Option<BlockRef>,unix_us:u64,co_ids:Vec<usize>,view:Value)->Result<()> {
+    pub(crate) fn metrics_engine(&self)->Arc<ExchangeEngine> {self.exchange.clone()}
+    pub(crate) fn start_window(&mut self,number:u64,parent:Option<BlockRef>,unix_us:u64,co_ids:Vec<usize>,view:Value,catalog:Vec<String>)->Result<()> {
         let role=co_ids.iter().position(|id|*id==self.id).context("Own identity is not drawn")?+1;
+        self.exchange.set_window(number,view["hubCode"].as_str().context("Window hub code")?.to_owned(),catalog,co_ids.clone());
         if let Some(known)=self.windows.get(&number) {ensure!(known.parent==parent&&known.co_ids==co_ids,"Conflicting window notice");return Ok(())}
         let start=self.inbox.start(number,unix_us)?;
         self.windows.insert(number,Window{number,parent,start,co_ids,role,next:number*16,view});
@@ -255,4 +274,27 @@ pub(crate) fn rpc(request:RpcRequest,member:Option<&mut MemberProposer>,executor
         }
     })().map_err(|error|error.to_string());
     let _=request.reply.send(result);
+}
+
+
+#[derive(Clone,Default)]
+pub(crate) struct MemberMetrics {engine:Arc<RwLock<Option<Arc<ExchangeEngine>>>>}
+impl MemberMetrics {
+    pub(crate) fn set(&self,engine:Arc<ExchangeEngine>) {*self.engine.write().unwrap()=Some(engine);}
+    fn snapshot(&self)->Value {
+        let engine=self.engine.read().unwrap().clone();
+        engine.map_or_else(crate::exchange_metrics::empty_json,|engine|engine.metrics_json())
+    }
+}
+pub(crate) async fn bind_metrics(port:u16,metrics:MemberMetrics)->Result<JoinHandle<Result<()>>> {
+    use axum::{extract::State,routing::get,Json,Router};
+    async fn snapshot(State(metrics):State<MemberMetrics>)->Json<Value> {Json(metrics.snapshot())}
+    async fn prometheus(State(metrics):State<MemberMetrics>)->impl axum::response::IntoResponse {
+        ([("content-type","text/plain; version=0.0.4")],crate::exchange_metrics::prometheus(&metrics.snapshot()))
+    }
+    let bind:std::net::IpAddr=std::env::var("ACRUX_BIND").unwrap_or_else(|_|"127.0.0.1".into()).parse()?;
+    let listener=tokio::net::TcpListener::bind((bind,port)).await?;
+    let router=Router::new().route("/metrics",get(prometheus)).route("/internal/hash-exchange",get(snapshot)).with_state(metrics);
+    println!("member metrics listening on {bind}:{port}");
+    Ok(tokio::spawn(async move {axum::serve(listener,router).await?;Ok(())}))
 }

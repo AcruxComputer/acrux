@@ -584,8 +584,8 @@ For FRA, delta-local is **10 ms**, so **2 delta-local is 20 ms**, inclusive from
 the first authenticated commitment arrival or the proposer's own actual send.
 Commit is scheduled at slot start + 50 ms. An arrival at +20.000 ms is on time;
 +20.001 ms is late. A far operator does not receive a larger budget, and a late
-block follows the same exclusion/skip rules as a late genesis block. This step
-does not publish measured delta-local. Outside send offsets in the explorer's
+block follows the same exclusion/skip rules as a late genesis block. Commitment receipt round trips are exported separately from this one-way
+arrival deadline. Outside send offsets in the explorer's
 slice and commitment records are zero (unknown); their host arrival offsets and
 on-time decisions use actual socket receipt times.
 
@@ -619,6 +619,76 @@ co-proposer commitment arrivals, all twelve validator hashes and an independent
 RPC follower. It uses only its own loopback processes and leaves the operator's
 local Solana validator alone. No program rebuild or new placement is needed for this
 step.
+
+## Measured hash exchange
+
+Node 0.4.27 exports actual Algorithm 1 commitment exchanges. A drawn co-proposer
+returns a signed receipt for the original commitment's slot, proposer and hash.
+The sender measures its round trip with its monotonic clock, matching the first
+receipt once. Retransmissions do not add samples. These are round-trip
+microseconds, not one-way delay estimates or the CLI's independent ping RTT.
+No wall-clock subtraction, division by two or configured transport delay enters
+the measurement. Proposing still requires the clock synchronization above.
+
+An unordered pair is labelled `applied` when both endpoints are hosted genesis
+validators using `LocalTransport::link_delay`, and `real` when an endpoint is an
+outside member. Its two public addresses are sorted lexicographically. The
+shared hosted engine pools its raw observations for each pair, so both hosted
+directions count when available. The API uses these hosted observations while
+pairs have a hosted endpoint. Outside-only collection belongs to the later hub
+step.
+
+`commitSpreadUs` keeps its existing series. New applied/real subset spreads use
+one hosted observer per slot: the lowest hosted co-proposer ID. Each subset
+contains its own actual send and all peer arrivals of that link kind. A mixed
+window can contribute both kinds. The subset becomes a sample when complete;
+late commitments retain their actual arrival time, and a missing peer creates
+no zero-valued sample. Deadline decisions never wait for telemetry.
+
+Pair and spread statistics retain at most ten minutes and 4,096 observations per
+series, with nearest-rank p50/p99 and retained sample counts. Empty classes are
+null; pairs without recent observations are absent. Percentiles are calculated
+from raw samples on a dedicated metrics worker. Protocol hooks submit through a
+bounded, nonblocking 4,096-event channel; overload drops telemetry instead of
+delaying a validator. The worker expires samples and publishes a cached snapshot
+once a second. Readers copy that snapshot without locking validator state.
+
+The net's existing private metrics port (4989 by default) serves:
+
+- `GET /metrics`: labelled `acrux_hash_exchange_rtt_microseconds`,
+  `acrux_hash_exchange_samples`, and `acrux_commit_spread_by_link_*` series.
+- `GET /internal/hash-exchange`: JSON with `measuredAt`,
+  `measurement: "roundTrip"`, per-hub pairs and spread subsets, and the combined
+  `commitSpreadByLinkUs` summary.
+
+The gateway's `getFacts` includes the same additive `hashExchange` and
+`commitSpreadByLinkUs` fields. The API reads the private endpoint through its
+existing `GATEWAY_INTERNAL_URL`, caches a successful read for two seconds, and
+joins pairs to effective Acrux registry members. `/v1/facts` and
+`/v1/hubs/FRA?chain=acrux` expose them. An unavailable or invalid private read
+returns the existing retryable `NET_UNAVAILABLE` error after cache expiry.
+
+An outside member can expose its own private measurements explicitly:
+
+```text
+acrux node propose --hub FRA --identity validator.json --genesis chain/genesis/acrux-net.json --metrics-port 5077
+```
+
+This optional listener uses `ACRUX_BIND`, loopback by default, and serves both
+metrics paths above. It reports its own receipt observations; the site does not
+need to connect to it yet. Receipt telemetry stays out of hub mirrors and is
+sent to an outside connection only after it demonstrates receipt support. The
+shared pull history remains bounded at 64 MiB, with no outgoing per-peer queue.
+
+The checks are `api/scripts/hash-exchange-check.mjs` (an owned unbridged local net
+and API with a temporary local database) and
+`chain/scripts/native-exchange-check.mjs` (the outside-member bridge stand,
+operator-run with a local Solana validator). The second reuses the external-block
+setup, keeps its direct submission on 5076, and checks the member's metrics on
+5077. Both verify the API and private exports; the first is genesis-only and the
+second also compares real loopback pairs with applied FRA pairs. The first runs
+with default traffic and checks continued finalization and responsive API reads
+after the net's fifteen-second warm-up.
 
 ## Measured
 

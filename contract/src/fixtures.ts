@@ -3,7 +3,7 @@ import type { z } from 'zod'
 import { toBase58, toBase64 } from './encoding.js'
 import { PROTOCOL_PARAMETERS, errors } from './schemas.js'
 import type { Balance, Bridge, BridgeTransfer, Burn, BurnEpoch, DemoPool, Evidence, Facts, FaucetPolicy, FaucetStatus, FaucetGrant, LabScenario, RegistryConfig, SchedulePreview, SpecMap } from './schemas.js'
-import type { Cblock, Certificate, ExecutionSchedule, Hub, LabRun, Member, MergedTransaction, NetSnapshot, Parameters, Proposer, Slot, Transaction, Window } from './schemas.js'
+import type { HashExchangePair, HashExchange as HashExchangeView, HubHashExchange, Cblock, Certificate, ExecutionSchedule, Hub, LabRun, Member, MergedTransaction, NetSnapshot, Parameters, Proposer, Slot, Transaction, Window } from './schemas.js'
 import type { ApiErrorBody } from './errors.js'
 import type { LabReplay, ProtocolEvent } from './events.js'
 
@@ -125,8 +125,27 @@ export function makeSchedulePreview(epoch = 43): z.infer<typeof SchedulePreview>
   return { epoch, seed: `epoch-${epoch}`, source: 'fixture', algorithm: 3, alpha: 0.5, totalWindows, shares, regionalRuns, windows }
 }
 export const schedulePreview = makeSchedulePreview()
+const pairFixtures = (members: Member[]): HashExchangePair[] => members.flatMap((left, index) => members.slice(index + 1).map(right => {
+  const real = left.validatorKind === 'external' || right.validatorKind === 'external'
+  return { members: [left.identity, right.identity].sort() as [string, string], kind: real ? 'real' as const : 'applied' as const,
+    p50: real ? 720 : 6500, p99: real ? 1400 : 11000, count: 512 }
+}))
+const appliedSpread = { p50: 5800, p99: 14200, count: 4096 }
+export const hashExchangeGenesisOnly: HashExchangeView = { measuredAt: FIXTURE_TIME, measurement: 'roundTrip', hubs: hubs.slice(0, 3).map(hub => ({
+  hubCode: hub.code, pairs: pairFixtures(hub.members), commitSpreadUs: { applied: { ...appliedSpread, count: 1024 }, real: null },
+})) }
+const outsideFixtureIdentity = fixtureAddress('external-validator-FRA')
+const outsideFixtureMembers: Member[] = frankfurt.members.map((member, index) => index === 3
+  ? { ...member, identity: outsideFixtureIdentity, validatorKind: 'external', joinedEpoch: 41, effectiveEpoch: 42, admittedAtEpoch: 42 } : member)
+export const hashExchangeWithOutside: HashExchangeView = { ...hashExchangeGenesisOnly, hubs: hashExchangeGenesisOnly.hubs.map(hub => hub.hubCode === 'FRA'
+  ? { ...hub, pairs: pairFixtures(outsideFixtureMembers), commitSpreadUs: { applied: { ...appliedSpread, count: 768 }, real: { p50: 3400, p99: 6800, count: 256 } } } : hub) }
+const hubExchange = (hub: HashExchangeView['hubs'][number]): HubHashExchange => ({ measuredAt: FIXTURE_TIME, measurement: 'roundTrip', pairs: hub.pairs, commitSpreadUs: hub.commitSpreadUs })
+for (const hub of hubs.slice(0, 3)) hub.hashExchange = hubExchange(hashExchangeGenesisOnly.hubs.find(measured => measured.hubCode === hub.code)!)
+export const hubHashExchangeGenesisOnly: Hub = { ...frankfurt, hashExchange: hubExchange(hashExchangeGenesisOnly.hubs[0]!) }
+export const hubHashExchangeWithOutside: Hub = { ...frankfurt, members: outsideFixtureMembers, hashExchange: hubExchange(hashExchangeWithOutside.hubs[0]!) }
 export const facts: z.infer<typeof Facts> = {
   source: 'fixture', measuredAt: FIXTURE_TIME, sampleSize: 4096,
+  hashExchange: hashExchangeGenesisOnly, commitSpreadByLinkUs: { applied: appliedSpread, real: null },
   slotPacingUs: { p50: 50000, p99: 50700 }, commitSpreadUs: { p50: 5800, p99: 14200 },
   attestationRelativeToBlockUs: { p50: -6200, p99: 13000 }, cblockFinalizationUs: { p50: 388000, p99: 571000 },
   handoverUs: {
@@ -135,6 +154,10 @@ export const facts: z.infer<typeof Facts> = {
     'NYC-TYO': { p50: 160092, p99: 162921, floorUs: 151000, count: 6 }, 'TYO-FRA': { p50: 167554, p99: 171325, floorUs: 158000, count: 7 },
   },
 }
+export const factsGenesisOnly = facts
+export const factsWithOutside: z.infer<typeof Facts> = { ...facts, hashExchange: hashExchangeWithOutside,
+  commitSpreadByLinkUs: { applied: { ...appliedSpread, count: 3840 }, real: { p50: 3400, p99: 6800, count: 256 } } }
+export const hashExchangeFixtures = { genesisOnly: { facts: factsGenesisOnly, hub: hubHashExchangeGenesisOnly }, withOutside: { facts: factsWithOutside, hub: hubHashExchangeWithOutside } }
 export const demoPool: z.infer<typeof DemoPool> = {
   address: fixtureAddress('demo-pool'), mints: [
     { address: fixtureAddress('demo-mint-a'), symbol: 'AXA', name: 'Acrux Demo A', decimals: 6 },

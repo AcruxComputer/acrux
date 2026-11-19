@@ -109,10 +109,12 @@ export class RegistryIndexer {
   state: RegistryState = { config: null, epoch: 0, slot: 0, readAt: null, error: null }
   private timer?: NodeJS.Timeout
   private seen = ''
+  private exchangeMembers: ReadonlyMap<string, ReadonlySet<string>> = new Map()
   constructor(private db: PrismaClient, readonly chain: Chain, private rpcUrl: string, private programId: string, private pollMs: number, readonly stake: StakeSource, private cluster: 'localnet' | 'mainnet-beta' | 'acrux') {}
 
   start() { const tick = () => this.refresh().catch(e => { this.state.error = String(e?.message ?? e) }).finally(() => { this.timer = setTimeout(tick, this.pollMs) }); tick() }
   stop() { clearTimeout(this.timer) }
+  effectiveHubMembers() { return this.exchangeMembers }
 
   private async rpc<T>(method: string, params: unknown): Promise<T> {
     const response = await fetch(this.rpcUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal: AbortSignal.timeout(5000) })
@@ -193,6 +195,15 @@ export class RegistryIndexer {
           joinedEpoch: m.joinedEpoch } })
       }
     })
+    const exchangeMembers = new Map(hubs.map(hub => [hub.code, new Set<string>()]))
+    for (const member of memberships) {
+      const changed = member.pending !== 'none' && member.pendingEpoch <= epoch
+      if (changed && member.pending === 'leave') continue
+      const hub = byAddress.get(changed ? member.pendingHub : member.hub)
+      const effectiveEpoch = changed ? member.pendingEpoch : member.effectiveEpoch
+      if (hub && effectiveEpoch <= epoch) exchangeMembers.get(hub.code)!.add(member.identity)
+    }
+    this.exchangeMembers = exchangeMembers
     this.state = { config, epoch: epochInfo.epoch, slot: epochInfo.absoluteSlot, readAt: Date.now(), error: null }
     this.seen = seen
   }

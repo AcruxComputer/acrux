@@ -3,6 +3,13 @@ use crate::transport::{great_circle_km, Peer};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 
+/// Add measured exchange reads without changing the existing facts series.
+pub fn include_hash_exchange(facts:&mut Value,mut measurements:Value) {
+    facts["commitSpreadByLinkUs"]=measurements["commitSpreadByLinkUs"].take();
+    measurements.as_object_mut().unwrap().remove("commitSpreadByLinkUs");
+    facts["hashExchange"]=measurements;
+}
+
 /// About ten minutes of 50 ms slots.
 const KEEP: usize = 12_000;
 /// Handovers are one per window; keep the last thousand per link.
