@@ -85,7 +85,7 @@ struct PlacementManifest {
 #[derive(Deserialize)]
 struct ManifestEntry {
     file: String,
-    slot: u64,
+    slot: Value,
 }
 #[derive(Deserialize)]
 struct PlacementFile {
@@ -117,6 +117,12 @@ pub struct BridgeConfig {
     pub native_mint: Option<Pubkey>,
     #[serde(default)]
     pub native_scale: Option<u64>,
+    /// Stake placement and genesis votes enter at this Acrux epoch boundary.
+    #[serde(default)]
+    pub stake_from_slot: Option<u64>,
+    /// Virtual genesis weight, in native lamports; configured as an unsigned decimal string.
+    #[serde(default, deserialize_with = "optional_lamports")]
+    pub genesis_stake_lamports: Option<u64>,
 }
 impl BridgeConfig {
     pub fn chain_tag(&self) -> [u8; 32] { crate::crypto::hash(self.chain_id.as_bytes()) }
@@ -131,6 +137,29 @@ impl BridgeConfig {
             _ => anyhow::bail!("bridge nativeFromSlot, nativeMint and nativeScale must be configured together"),
         }
     }
+    pub fn stake_activation(&self) -> Result<Option<(u64, u64)>> {
+        match (self.stake_from_slot, self.genesis_stake_lamports) {
+            (None, None) => Ok(None),
+            (Some(slot), Some(weight)) => {
+                let native = self.native_cutover()?.context("bridge stakeFromSlot requires nativeFromSlot, nativeMint and nativeScale")?;
+                ensure!(self.epoch_slots > 0 && slot % self.epoch_slots == 0, "bridge stakeFromSlot must be an Acrux epoch boundary");
+                ensure!(self.epoch_slots % 16 == 0, "bridge epochSlots must be divisible by sixteen when stakeFromSlot is set");
+                ensure!(slot >= native.slot, "bridge stakeFromSlot must be at or after nativeFromSlot");
+                ensure!(weight > 0, "bridge genesisStakeLamports must be positive so genesis hubs can propose before delegation");
+                weight.checked_mul(12).context("bridge genesisStakeLamports total overflows u64")?;
+                Ok(Some((slot, weight)))
+            }
+            _ => anyhow::bail!("bridge stakeFromSlot and genesisStakeLamports must be configured together"),
+        }
+    }
+}
+fn optional_lamports<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<u64>, D::Error> {
+    Option::<String>::deserialize(d)?.map(|amount| {
+        if amount.is_empty() || !amount.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(serde::de::Error::custom("genesisStakeLamports must be an unsigned decimal u64 string"));
+        }
+        amount.parse::<u64>().map_err(serde::de::Error::custom)
+    }).transpose()
 }
 fn minimum_withdrawals<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<BTreeMap<Pubkey, u64>, D::Error> {
     BTreeMap::<String, String>::deserialize(d)?.into_iter().map(|(mint, amount)| {
@@ -168,32 +197,37 @@ fn bridge(chain: &Path) -> Result<Option<BridgeConfig>> {
     ensure!(config.epoch_slots > 0 && config.epoch_slots % 4 == 0, "bridge epochSlots must be positive and divisible by four");
     ensure!(config.from_slot % 4 == 0, "bridge fromSlot must start at a four-slot cblock boundary");
     config.native_cutover()?;
+    config.stake_activation()?;
     Ok(Some(config))
 }
 
 /// The placements the chain applies: `chain/placements/placements.json` beside the genesis, or the
 /// manifest `ACRUX_PLACEMENTS` names; none when there is no manifest.
-fn placements(chain: &Path) -> Result<Vec<crate::execution::Placement>> {
+fn placements(chain: &Path, bridge: Option<&BridgeConfig>) -> Result<Vec<crate::execution::Placement>> {
     let manifest = std::env::var("ACRUX_PLACEMENTS").map(PathBuf::from).unwrap_or_else(|_| chain.join("placements/placements.json"));
     if !manifest.exists() {
         return Ok(vec![]);
     }
     let dir = manifest.parent().context("placement manifest folder")?;
     let entries: PlacementManifest = serde_json::from_slice(&std::fs::read(&manifest).with_context(|| format!("Read {}", manifest.display()))?)?;
-    entries
-        .placements
-        .into_iter()
-        .map(|entry| {
-            let file: PlacementFile = serde_json::from_slice(&std::fs::read(dir.join(&entry.file)).with_context(|| format!("Read placement {}", entry.file))?)?;
-            let accounts = file
-                .accounts
-                .into_iter()
-                .map(|a| Ok((Pubkey::from_str(&a.address)?, Account { lamports: a.lamports, data: B64.decode(a.data)?, owner: Pubkey::from_str(&a.owner)?, executable: a.executable, rent_epoch: 0 })))
-                .collect::<Result<Vec<_>>>()?;
-            ensure!(accounts.last().is_some_and(|(_, a)| a.executable), "placement {} must end with its program account", file.name);
-            Ok(crate::execution::Placement { name: file.name, slot: entry.slot, accounts })
-        })
-        .collect()
+    let mut placements = Vec::new();
+    for entry in entries.placements {
+        let slot = match entry.slot {
+            Value::Number(number) => number.as_u64().context("placement slot must be an unsigned slot number")?,
+            Value::String(name) if name == "stakeFromSlot" => match bridge.and_then(|rule| rule.stake_from_slot) {
+                Some(slot) => slot,
+                None => continue, // The Stake placement is enabled by the rule, without a guessed slot.
+            },
+            _ => anyhow::bail!("placement slot must be an unsigned slot number or stakeFromSlot"),
+        };
+        let file: PlacementFile = serde_json::from_slice(&std::fs::read(dir.join(&entry.file)).with_context(|| format!("Read placement {}", entry.file))?)?;
+        let accounts = file.accounts.into_iter().map(|a| Ok((Pubkey::from_str(&a.address)?, Account {
+            lamports: a.lamports, data: B64.decode(a.data)?, owner: Pubkey::from_str(&a.owner)?, executable: a.executable, rent_epoch: 0,
+        }))).collect::<Result<Vec<_>>>()?;
+        ensure!(accounts.last().is_some_and(|(_, a)| a.executable), "placement {} must end with its program account", file.name);
+        placements.push(crate::execution::Placement { name: file.name, slot, accounts });
+    }
+    Ok(placements)
 }
 
 impl Genesis {
@@ -203,6 +237,8 @@ impl Genesis {
         let chain = path.parent().and_then(Path::parent).context("Genesis file has no chain workspace")?;
         let faucet = keypair_from_seed(&Sha256::digest(format!("{}/faucet", file.seed))).map_err(|e| anyhow::anyhow!("{e}"))?;
         ensure!(faucet.pubkey().to_string() == file.faucet.address, "Genesis faucet key does not derive from the seed");
+        let bridge = bridge(chain)?;
+        let placements = placements(chain, bridge.as_ref())?;
         Ok(Self {
             programs: file.programs.into_iter().map(|p| (p.address, chain.join(p.path))).collect(),
             accounts: file
@@ -216,8 +252,8 @@ impl Genesis {
             pool: file.pool,
             faucet,
             faucet_token_accounts: file.faucet.token_accounts,
-            placements: placements(chain)?,
-            bridge: bridge(chain)?,
+            placements,
+            bridge,
         })
     }
 

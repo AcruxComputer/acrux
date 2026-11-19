@@ -91,6 +91,105 @@ Proofs become readable only after their execution state is durable. A finalized 
 
 `getCblockProof` accepts exactly one selector: `{consensusSlot}` for that cblock in the rolling window or archive, `{epoch}` for a retained representative of that bridge epoch, or `{latest: true}` for the newest finalized proof held. Proofs include `epochSlots`, `chainId`, the hash preimage, encoded outbox entries and the validators' signed votes. A cblock outside both the rolling window and archive answers `NOT_FOUND`.
 
+## Stake on Acrux
+
+From node 0.4.18, two optional bridge-rule fields enable native ACRUX staking:
+
+- `stakeFromSlot`: an operator-selected Acrux epoch boundary at or after
+  `nativeFromSlot`. It has no default. With staking enabled, `epochSlots` must
+  be divisible by 16 so a proposer window never straddles a stake epoch.
+- `genesisStakeLamports`: a positive unsigned decimal **string**, in native
+  lamports, added to each genesis identity's delegated stake. It is required
+  with `stakeFromSlot` and has no default. This is virtual proposer weight;
+  it creates no spendable balance or staking rewards.
+
+The checked-in placement manifest contains
+`{"file":"stake.json","slot":"stakeFromSlot"}`. That entry resolves to the
+rule's slot and is disabled while the rule omits it. Numeric placement slots
+continue to work. Thus the operator selects the real slot in the rule once,
+without changing the current live rule or guessing a slot in this release.
+Distribute the rule and matching placement manifest to validators and followers
+before activation. The Stake bytecode in `chain/placements/stake.json` is
+already fetched; this step does not deploy a Solana program.
+
+At activation the executor installs twelve rent-exempt Vote accounts, one per
+genesis identity, at the Vote-program PDA seeds
+`["acrux_genesis_vote", identity_bytes]`. Each valid VoteState names that identity
+as node, authorized voter and authorized withdrawer. Solana's placed Stake
+program reads those accounts; Acrux does not run a Vote program. The protocol's
+new Stake placement, Vote and activation-account rent joins the recorded native
+reserve, so installing them adds no circulating ACRUX. A hashed activation account
+retains three fixed-size schedule snapshots and the Stake program's own minimum
+delegation. Restore and rollback reproduce activation and snapshots.
+
+Clock uses the rule's `epochSlots` from the stake slot (432,000 on mainnet).
+StakeHistory stays empty: stake becomes fully active in the epoch after
+activation, and fully withdrawable in the epoch after deactivation. The live
+weight predicate is `activation_epoch < epoch && deactivation_epoch >= epoch`.
+There is no reward processing or issuance. The genesis weight is added to each
+identity's counted delegations in `getVoteAccounts` and the proposer draw.
+
+The first canonical slot of epoch `e + 1` freezes the state inherited from the
+last canonical slot of `e` for the draw of `e + 2`. Delegations are evaluated for
+that target epoch. The snapshot becomes usable when its checkpoint finalizes;
+no wall-clock or RPC observation changes a draw. The two bootstrap epochs use
+only configured genesis weight. Draws use the existing seed and
+`windows_per_epoch` (96), with `build_schedule(target_epoch, ...)` and the same
+global `window_number % 96` indexing. Earlier slots use the byte-identical legacy
+draw. Consensus certificate weights and bridge validator-set weights remain the
+existing genesis weights in this proposer-only step.
+
+The lead requires finality during the intervening epoch. Window preparation
+waits if its required finalized snapshot is unavailable; it does not substitute
+another draw. A whole epoch with no canonical execution can require a restart
+from durable finalized state to resume the slot clock. Algorithm 3's existing
+hub admission rule also remains: four members and at least 1% of total raw
+stake after capping. For the current three four-member hubs, baseline weight
+`B` per identity and total delegated stake `D`, `D <= 388 * B` is a sufficient
+bound to keep every hub eligible. Select the genesis weight for the intended
+maximum delegation; a draw with no eligible hub fails rather than inventing a
+fallback schedule.
+
+`getVoteAccounts` returns each identity's real `votePubkey`, `nodePubkey` and
+current activated stake plus virtual genesis weight. `getStakeActivation`,
+`getStakeMinimumDelegation` and `getEpochInfo` support stock tooling. Acrux's
+`getProposerEpoch {epoch}` returns `{epoch, weights: [{identity, stake}], schedule}`
+with decimal-string weights and the full Algorithm 3 draw. Existing `getSchedule`
+continues serving upcoming proposer windows. Execution snapshots include public
+proposer configuration so followers need no validator private seed to rebuild
+and check the same draws. The API already reads Acrux `getVoteAccounts`; no API
+or contract shape change is required.
+
+Use an existing funded native wallet and a separate stake-account keypair.
+Read `getVoteAccounts` to choose the vote address belonging to the intended
+identity, then use stock commands (replace `VOTE_ACCOUNT` and `RECIPIENT`):
+
+```text
+solana --url https://rpc.acrux.computer --keypair wallet.json create-stake-account stake.json 2
+solana --url https://rpc.acrux.computer --keypair wallet.json delegate-stake stake.json VOTE_ACCOUNT
+solana --url https://rpc.acrux.computer --keypair wallet.json deactivate-stake stake.json
+solana --url https://rpc.acrux.computer --keypair wallet.json withdraw-stake stake.json RECIPIENT ALL
+```
+
+Wait until the epoch after deactivation before withdrawing the whole account.
+The CLI labels its amount SOL; at an Acrux URL one displayed unit is one ACRUX
+(10^9 native lamports). Keep additional wallet balance for fees and rent. With
+web3.js use `StakeProgram.createAccount`, `delegate`, `deactivate` and `withdraw`;
+fund the stake account with the intended delegation plus its queried rent.
+
+The operator's local check, from `chain/`, is:
+
+```text
+node scripts/native-stake-check.mjs --native-from-slot 8192 --stake-from-slot 8448 --epoch-slots 256 --native-scale 1000 --genesis-stake-lamports 1000000000
+```
+
+These explicit local values are not production defaults. With an existing fresh
+Solana validator on 4990, the rebuilt native bridge and a private local identity
+seed, it deposits before native activation, delegates after stake activation,
+checks the epoch-two draw and live vote weights, then deactivates and withdraws.
+It prints the schedule, stake, weights and zero rewards. Its own net uses TCP
+5041-5043 and QUIC 5062-5073, and it removes its child and temporary store.
+
 ## Crates
 
 | Crate | Concern |
@@ -176,8 +275,9 @@ fatal; re-anchoring does not substitute for checking a mismatched state.
 The Solana array-parameter surface also serves `getSupply`: a context and value
 with `total`, `circulating`, `nonCirculating` and `nonCirculatingAccounts`.
 Total is all executor lamports. Before native activation the reserve is zero.
-After activation `nonCirculating` is the fixed, hashed cut-over reserve and
-`circulating` is total minus that reserve. The account list is empty because the
+After activation `nonCirculating` is the hashed reserve (the cut-over reserve
+plus protocol-installed Stake activation rent), and `circulating` is total minus
+that reserve. The account list is empty because the
 reserve is a fixed amount, rather than a live classification of addresses.
 `getNativeSupply {}` returns `null` before activation; afterwards it returns
 `{cutoverSlot, mint, scale, reserveLamports, creditedLamports, withdrawnLamports,

@@ -48,6 +48,10 @@ pub enum GatewayCommand {
     NativeSupply {
         reply: CommandReply,
     },
+    ProposerEpoch {
+        epoch: u64,
+        reply: CommandReply,
+    },
     Balance {
         address: String,
         reply: CommandReply,
@@ -366,6 +370,15 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
         "getSnapshot" => Ok(state.read().await.snapshot()),
         "getCurrentWindow" => Ok(state.read().await.current_window.clone()),
         "getCounters" => Ok(state.read().await.counters.clone()),
+        "getProposerEpoch" => {
+            match params.get("epoch").and_then(safe_integer) {
+                Some(epoch) => match command(&state, |reply| GatewayCommand::ProposerEpoch { epoch, reply }).await {
+                    Ok(value) => Ok(value),
+                    Err(_) => Err(("NET_UNAVAILABLE", "This epoch's finalized proposer schedule is not available.")),
+                },
+                None => Err(("INVALID_INPUT", "epoch must be a nonnegative safe integer.")),
+            }
+        },
         "getNativeSupply" => {
             if params.as_object().is_some_and(|fields| !fields.is_empty()) {
                 Err(("INVALID_INPUT", "getNativeSupply takes no parameters."))

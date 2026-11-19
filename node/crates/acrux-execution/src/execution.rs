@@ -205,6 +205,32 @@ pub struct NativeSupply {
     pub circulating_lamports: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StakeConfig {
+    pub from_slot: u64,
+    pub epoch_slots: u64,
+    pub genesis_stake_lamports: u64,
+    pub identities: Vec<Pubkey>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StakeMarker {
+    rule: StakeConfig,
+    prepared_through_epoch: u64,
+    minimum_delegation_lamports: u64,
+    /// Three fixed-size entries: the two bootstrap epochs and a sentinel initially, then the
+    /// three newest schedules. Its rent does not grow as epochs pass.
+    schedules: Vec<(u64, Vec<u64>)>,
+}
+
+pub fn genesis_vote_address(identity: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"acrux_genesis_vote",identity.as_ref()],&solana_sdk::vote::program::id()).0
+}
+
+fn bridge_stake_marker(bridge: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"stake_activation"],bridge).0
+}
+
 pub fn bridge_native(bridge: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"native"], bridge).0
 }
@@ -305,6 +331,7 @@ pub struct SvmExecutor {
     /// Rule-owned minimum accounts enter committed state at the bridge activation slot.
     bridge_minimums: Option<(u64, Vec<MinimumWithdrawal>)>,
     native_cutover: Option<NativeCutover>,
+    stake_config: Option<StakeConfig>,
 }
 
 impl SvmExecutor {
@@ -498,6 +525,7 @@ impl SvmExecutor {
             credits: vec![],
             bridge_minimums: None,
             native_cutover: None,
+            stake_config: None,
         };
         for program in [
             "ComputeBudget111111111111111111111111111111",
@@ -877,6 +905,141 @@ impl SvmExecutor {
         self.native_cutover = Some(rule);
     }
 
+    pub fn set_stake_config(&mut self, rule: StakeConfig) {
+        self.stake_config = Some(rule);
+    }
+
+    fn decode_stake_marker(&self, account: &Account) -> Result<StakeMarker> {
+        let bridge = self.bridge.context("Stake activation requires the bridge")?;
+        anyhow::ensure!(account.owner == bridge && !account.executable && account.data.get(..8) == Some(&Sha256::digest(b"account:StakeActivation")[..8]), "Invalid stake activation account");
+        let marker:StakeMarker = bincode::deserialize(&account.data[8..])?;
+        anyhow::ensure!(self.stake_config.as_ref() == Some(&marker.rule) && marker.schedules.len() == 3
+            && marker.schedules.iter().all(|(_,weights)| weights.len() == marker.rule.identities.len()), "Stake rule differs from committed activation");
+        Ok(marker)
+    }
+
+    fn stake_marker(&self) -> Result<Option<StakeMarker>> {
+        let Some(bridge) = self.bridge else { return Ok(None) };
+        let Some(account) = self.svm.get_account(&bridge_stake_marker(&bridge)) else { return Ok(None) };
+        if native_wallet(&account) { return Ok(None) }
+        self.decode_stake_marker(&account).map(Some)
+    }
+
+    pub fn get_stake_minimum_delegation(&self) -> Result<Option<u64>> {
+        Ok(self.stake_marker()?.map(|marker| marker.minimum_delegation_lamports))
+    }
+
+    /// Read the placed program's own minimum once, without inserting a fee payer into committed
+    /// account state. The temporary account is restored before returning even if simulation fails.
+    fn read_stake_minimum_delegation(&mut self) -> Result<u64> {
+        use solana_sdk::{signature::{Keypair,Signer},transaction::Transaction};
+        let payer = Keypair::new();
+        let previous = self.svm.get_account(&payer.pubkey());
+        // LiteSVM's own fee is fixed at 5000; configured NewCon fees are charged separately,
+        // just as execute_slot reimburses this same SVM fee before simulating a transaction.
+        self.svm.set_account(payer.pubkey(),Account { lamports:BASE_FEE_PER_SIGNATURE,..Account::default() })?;
+        let instruction = solana_sdk::stake::instruction::get_minimum_delegation();
+        let transaction = Transaction::new_signed_with_payer(&[instruction],Some(&payer.pubkey()),&[&payer],self.svm.latest_blockhash());
+        let outcome = self.svm.simulate_transaction(transaction);
+        self.svm.set_account(payer.pubkey(),previous.unwrap_or_default())?;
+        let info = outcome.map_err(|failed| anyhow!("Stake minimum delegation query failed: {}",failed.err))?;
+        anyhow::ensure!(info.meta.return_data.program_id == solana_sdk::stake::program::id() && info.meta.return_data.data.len() == 8, "Stake program returned an invalid minimum delegation");
+        Ok(u64::from_le_bytes(info.meta.return_data.data[..].try_into().unwrap()))
+    }
+
+    /// Eligible native-funded delegations, in the fixed genesis identity order. Uninitialized or
+    /// malformed public Stake-owned accounts are not delegations. Other validators join in build 5.
+    pub fn stake_weights(&self, epoch: u64) -> Result<Vec<u64>> {
+        use solana_sdk::stake::state::StakeStateV2;
+        let rule = self.stake_config.as_ref().context("Stake rule is not configured")?;
+        let mut weights = vec![rule.genesis_stake_lamports;rule.identities.len()];
+        let votes = rule.identities.iter().enumerate().map(|(index,identity)| (genesis_vote_address(identity),index)).collect::<BTreeMap<_,_>>();
+        for account in self.accounts.values().filter(|account| account.owner == solana_sdk::stake::program::id() && !account.executable && account.data.len() == StakeStateV2::size_of()) {
+            let Ok(StakeStateV2::Stake(meta,stake,_)) = bincode::deserialize::<StakeStateV2>(&account.data) else { continue };
+            let delegation = stake.delegation;
+            if delegation.activation_epoch >= epoch || delegation.deactivation_epoch < epoch { continue }
+            let Some(index) = votes.get(&delegation.voter_pubkey) else { continue };
+            anyhow::ensure!(delegation.stake <= account.lamports.saturating_sub(meta.rent_exempt_reserve), "Delegation exceeds its funded stake account");
+            weights[*index] = weights[*index].checked_add(delegation.stake).context("Proposer stake overflow")?;
+        }
+        Ok(weights)
+    }
+
+    pub fn stake_schedule_snapshots(&self, checkpoint: &ExecutorCheckpoint) -> Result<Vec<(u64,Vec<u64>)>> {
+        let Some(bridge) = self.bridge else { return Ok(vec![]) };
+        let Some(account) = checkpoint.accounts.get(&bridge_stake_marker(&bridge)) else { return Ok(vec![]) };
+        Ok(self.decode_stake_marker(account)?.schedules.into_iter().filter(|(epoch,_)| *epoch != u64::MAX).collect())
+    }
+
+    pub fn stake_schedule_weights(&self, checkpoint: &ExecutorCheckpoint, target_epoch: u64) -> Result<Option<Vec<u64>>> {
+        Ok(self.stake_schedule_snapshots(checkpoint)?.into_iter().find(|(epoch,_)| *epoch == target_epoch).map(|(_,weights)| weights))
+    }
+
+    /// After restoring the canonical parent, before inclusion fees: activate once and freeze the
+    /// next future schedule at an epoch boundary. A rollback restores this marker and its snapshots.
+    pub fn prepare_stake_epoch(&mut self, slot: u64) -> Result<()> {
+        use solana_sdk::vote::state::{VoteInit,VoteState,VoteStateVersions};
+        let Some(rule) = self.stake_config.clone().filter(|rule| slot >= rule.from_slot) else { return Ok(()) };
+        anyhow::ensure!(rule.epoch_slots > 0 && rule.from_slot % rule.epoch_slots == 0 && rule.genesis_stake_lamports > 0
+            && rule.identities.len() == 12 && rule.identities.iter().collect::<BTreeSet<_>>().len() == 12, "Invalid stake activation rule");
+        self.activate_native_cutover(slot)?;
+        let bridge = self.bridge.context("Stake activation requires the bridge")?;
+        let marker_key = bridge_stake_marker(&bridge);
+        let epoch = slot / rule.epoch_slots;
+        let mut marker = match self.stake_marker()? {
+            Some(marker) => marker,
+            None => {
+                let mut gate = self.native_gate()?.context("Stake activation requires native ACRUX")?;
+                let before = self.total_lamports()?;
+                self.apply_placements(slot)?;
+                anyhow::ensure!(self.svm.get_account(&solana_sdk::stake::program::id()).is_some_and(|account| account.executable), "Stake program placement is not active");
+                anyhow::ensure!(self.svm.get_sysvar::<solana_sdk::stake_history::StakeHistory>().is_empty(), "Acrux stake activation requires empty StakeHistory");
+                let minimum_delegation_lamports = self.read_stake_minimum_delegation()?;
+                let first_epoch = rule.from_slot / rule.epoch_slots;
+                let clock = Clock { slot:rule.from_slot,epoch:first_epoch,..self.svm.get_sysvar::<Clock>() };
+                let mut additions = vec![];
+                for identity in &rule.identities {
+                    let key = genesis_vote_address(identity);
+                    let existing = self.svm.get_account(&key);
+                    anyhow::ensure!(existing.as_ref().is_none_or(native_wallet), "Genesis vote address has an incompatible account");
+                    let init = VoteInit { node_pubkey:*identity,authorized_voter:*identity,authorized_withdrawer:*identity,commission:0 };
+                    let mut data = vec![0;VoteState::size_of()];
+                    VoteState::serialize(&VoteStateVersions::new_current(VoteState::new(&init,&clock)),&mut data)?;
+                    additions.push((key,Account { lamports:existing.map_or(0,|account| account.lamports).max(self.rent_exempt_minimum(data.len())),data,owner:solana_sdk::vote::program::id(),executable:false,rent_epoch:0 }));
+                }
+                let baseline = vec![rule.genesis_stake_lamports;rule.identities.len()];
+                let marker = StakeMarker { rule:rule.clone(),prepared_through_epoch:first_epoch,minimum_delegation_lamports,
+                    schedules:vec![(first_epoch,baseline.clone()),(first_epoch.checked_add(1).context("Stake epoch overflow")?,baseline.clone()),(u64::MAX,baseline)] };
+                let mut data = Sha256::digest(b"account:StakeActivation")[..8].to_vec();
+                data.extend(bincode::serialize(&marker)?);
+                let existing = self.svm.get_account(&marker_key);
+                anyhow::ensure!(existing.as_ref().is_none_or(native_wallet), "Stake activation address has an incompatible account");
+                additions.push((marker_key,Account { lamports:existing.map_or(0,|account| account.lamports).max(self.rent_exempt_minimum(data.len())),data,owner:bridge,executable:false,rent_epoch:0 }));
+                for (key,account) in additions { self.put(key,account)?; }
+                let added = self.total_lamports()?.checked_sub(before).context("Stake activation reduced account rent")?;
+                let reserve = u64::from_le_bytes(gate.data[64..72].try_into().unwrap()).checked_add(added).context("Stake activation reserve overflow")?;
+                gate.data[64..72].copy_from_slice(&reserve.to_le_bytes());
+                self.put(bridge_native(&bridge),gate)?;
+                marker
+            }
+        };
+        if epoch <= marker.prepared_through_epoch { return Ok(()) }
+        for entered in marker.prepared_through_epoch + 1..=epoch {
+            let target = entered.checked_add(1).context("Stake epoch overflow")?;
+            let weights = self.stake_weights(target)?;
+            marker.schedules.retain(|(held,_)| *held != u64::MAX);
+            marker.schedules.push((target,weights));
+            if marker.schedules.len() > 3 { marker.schedules.remove(0); }
+        }
+        marker.prepared_through_epoch = epoch;
+        let mut account = self.svm.get_account(&marker_key).context("Stake activation account missing")?;
+        let mut data = Sha256::digest(b"account:StakeActivation")[..8].to_vec();
+        data.extend(bincode::serialize(&marker)?);
+        anyhow::ensure!(data.len() == account.data.len(), "Stake schedule marker changed its fixed size");
+        account.data = data;
+        self.put(marker_key,account)
+    }
+
     /// Canonical execution and followers call this after restoring the parent, before inclusion
     /// fees. Only the first native activation moves these steps earlier; historical ordering and
     /// placements arriving after the cutover keep their normal execute_slot ordering.
@@ -1176,6 +1339,7 @@ impl SvmExecutor {
     }
 
     pub fn execute_slot(&mut self, slot: u64, items: Vec<ExecutionItem>) -> Result<SlotExecution> {
+        self.prepare_stake_epoch(slot)?;
         self.set_slot_clock(slot)?;
         self.apply_placements(slot)?;
         self.apply_bridge_minimums(slot)?;
@@ -1411,9 +1575,10 @@ impl SvmExecutor {
     fn set_slot_clock(&mut self, slot: u64) -> Result<()> {
         let mut clock = self.svm.get_sysvar::<Clock>();
         clock.slot = slot;
-        clock.epoch = slot / 432_000;
+        let epoch_slots = self.stake_config.as_ref().filter(|rule| slot >= rule.from_slot).map_or(432_000,|rule| rule.epoch_slots);
+        clock.epoch = slot / epoch_slots;
         clock.leader_schedule_epoch = clock.epoch;
-        clock.epoch_start_timestamp = 1_794_787_200 + (clock.epoch * 432_000 / 20) as i64;
+        clock.epoch_start_timestamp = 1_794_787_200 + (clock.epoch * epoch_slots / 20) as i64;
         clock.unix_timestamp = 1_794_787_200 + (slot / 20) as i64;
         self.svm.set_sysvar(&clock);
         self.refresh(solana_sdk::sysvar::clock::id());
@@ -1716,6 +1881,103 @@ mod tests {
         let record = executor.svm.get_account(&bridge_skipped_credit(&bridge, 1)).unwrap();
         assert_eq!(bincode::deserialize::<SkippedBridgeCredit>(&record.data).unwrap(), SkippedBridgeCredit { credit: overflow, reason: BridgeCreditSkipReason::BalanceOverflow });
         executor.execute_slot(2, vec![]).unwrap();
+    }
+
+    #[test]
+    fn stake_activation_places_program_bootstraps_votes_and_freezes_schedules_through_restore() {
+        use base64::Engine;
+        use solana_sdk::{instruction::Instruction,stake::{instruction as stake_instruction,state::{Authorized,Lockup,StakeStateV2}},vote::state::VoteState};
+        let owner = Keypair::new();
+        let bridge = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let identities = (0..12).map(|_| Pubkey::new_unique()).collect::<Vec<_>>();
+        let rule = StakeConfig { from_slot:8,epoch_slots:8,genesis_stake_lamports:100_000_000,identities:identities.clone() };
+        let native = NativeCutover { slot:4,solana_mint:mint,lamports_per_base_unit:1000 };
+        let file:serde_json::Value = serde_json::from_slice(&std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../chain/placements/stake.json")).unwrap()).unwrap();
+        let accounts = file["accounts"].as_array().unwrap().iter().map(|a| (Pubkey::from_str(a["address"].as_str().unwrap()).unwrap(),Account {
+            lamports:a["lamports"].as_u64().unwrap(),data:base64::engine::general_purpose::STANDARD.decode(a["data"].as_str().unwrap()).unwrap(),
+            owner:Pubkey::from_str(a["owner"].as_str().unwrap()).unwrap(),executable:a["executable"].as_bool().unwrap(),rent_epoch:0,
+        })).collect::<Vec<_>>();
+        let placement = Placement { name:"Stake".into(),slot:8,accounts };
+        let mut executor = SvmExecutor::new([(owner.pubkey().to_string(),100_000_000)],&[]).unwrap();
+        executor.set_bridge(bridge);
+        executor.set_native_cutover(native.clone());
+        executor.set_stake_config(rule.clone());
+        executor.set_placements(vec![placement.clone()]);
+        executor.set_proposers(&[(1,identities[1].to_string())]).unwrap();
+        executor.set_credits(vec![BridgeCredit { sequence:0,solana_mint:mint.to_string(),decimals:6,recipient:owner.pubkey().to_string(),amount:20_000_000 }]);
+        executor.execute_slot(3,vec![]).unwrap();
+        executor.execute_slot(4,vec![]).unwrap();
+        executor.execute_slot(7,vec![]).unwrap();
+        executor.prepare_stake_epoch(7).unwrap();
+        assert!(executor.get_stake_minimum_delegation().unwrap().is_none());
+        assert!(executor.svm.get_account(&genesis_vote_address(&identities[0])).is_none());
+        let before = executor.checkpoint();
+        let supply_before = executor.native_supply().unwrap().unwrap();
+        let total_before = executor.total_lamports().unwrap();
+        executor.prepare_stake_epoch(8).unwrap();
+        let activated_hash = executor.state_hash();
+        executor.prepare_stake_epoch(8).unwrap();
+        assert_eq!(executor.state_hash(),activated_hash,"activation and its rent reserve are applied once");
+        let supply = executor.native_supply().unwrap().unwrap();
+        assert_eq!(supply.circulating_lamports,supply_before.circulating_lamports,"new code, vote and marker rent is unbacked reserve");
+        assert_eq!(supply.reserve_lamports - supply_before.reserve_lamports,executor.total_lamports().unwrap() - total_before);
+        for identity in &identities {
+            let vote = executor.svm.get_account(&genesis_vote_address(identity)).unwrap();
+            assert_eq!(vote.owner,solana_sdk::vote::program::id());
+            assert_eq!(vote.lamports,executor.rent_exempt_minimum(VoteState::size_of()));
+            let state = VoteState::deserialize(&vote.data).unwrap();
+            assert_eq!((state.node_pubkey,state.authorized_withdrawer),(*identity,*identity));
+            assert_eq!(state.get_authorized_voter(1),Some(*identity));
+        }
+        executor.restore(before).unwrap();
+        executor.prepare_stake_epoch(8).unwrap();
+        assert_eq!(executor.state_hash(),activated_hash,"rollback recreates the same valid vote states and reserve");
+        executor.execute_slot(8,vec![]).unwrap();
+        assert_eq!(executor.svm.get_sysvar::<Clock>().epoch,1);
+        let checkpoint = executor.checkpoint();
+        assert_eq!(executor.stake_schedule_snapshots(&checkpoint).unwrap(),vec![(1,vec![100_000_000;12]),(2,vec![100_000_000;12])]);
+        let mut saved = executor.snapshot_meta(&checkpoint);
+        saved.accounts = checkpoint.account_changes(None).0.into_iter().map(|(key,account)| (key.to_string(),account.as_ref().clone())).collect();
+        saved.executed = checkpoint.executed_changes(None).0;
+        let mut loaded = SvmExecutor::from_state(&[],saved).unwrap();
+        loaded.set_bridge(bridge); loaded.set_native_cutover(native); loaded.set_stake_config(rule); loaded.set_placements(vec![placement]);
+        loaded.set_proposers(&[(1,identities[1].to_string())]).unwrap();
+        loaded.prepare_stake_epoch(8).unwrap();
+        assert_eq!(executor.state_hash(),loaded.state_hash(),"loading hashed activation does not issue vote rent again");
+        let minimum = executor.get_stake_minimum_delegation().unwrap().unwrap();
+        assert!(minimum > 0);
+        let stake_key = Keypair::new();
+        let delegated = minimum.checked_mul(2).unwrap();
+        let stake_rent = executor.rent_exempt_minimum(StakeStateV2::size_of());
+        let send = |executor:&mut SvmExecutor,instructions:Vec<Instruction>,extra:Option<&Keypair>,slot:u64| {
+            let mut signers = vec![&owner]; if let Some(extra) = extra { signers.push(extra); }
+            let tx = Transaction::new_signed_with_payer(&instructions,Some(&owner.pubkey()),&signers,Hash::from_str(&executor.latest_blockhash()).unwrap());
+            let transaction = executor.validate_transaction(&bincode::serialize(&tx).unwrap(),slot).unwrap();
+            let result = executor.execute_slot(slot,vec![ExecutionItem { transaction,source_proposers:vec![1] }]).unwrap().results.remove(0);
+            assert!(result.success,"{result:?}");
+        };
+        let mut create = stake_instruction::create_account(&owner.pubkey(),&stake_key.pubkey(),&Authorized::auto(&owner.pubkey()),&Lockup::default(),stake_rent + delegated);
+        create.push(stake_instruction::delegate_stake(&stake_key.pubkey(),&owner.pubkey(),&genesis_vote_address(&identities[0])));
+        send(&mut executor,create,Some(&stake_key),9);
+        assert_eq!(executor.stake_weights(1).unwrap()[0],100_000_000);
+        assert_eq!(executor.stake_weights(2).unwrap()[0],100_000_000 + delegated);
+        let held = executor.svm.get_account(&stake_key.pubkey()).unwrap().lamports;
+        executor.prepare_stake_epoch(16).unwrap();
+        let checkpoint = executor.checkpoint();
+        assert_eq!(executor.stake_schedule_weights(&checkpoint,3).unwrap().unwrap()[0],100_000_000 + delegated);
+        send(&mut executor,vec![stake_instruction::deactivate_stake(&stake_key.pubkey(),&owner.pubkey())],None,17);
+        assert_eq!(executor.stake_weights(2).unwrap()[0],100_000_000 + delegated);
+        assert_eq!(executor.stake_weights(3).unwrap()[0],100_000_000);
+        executor.execute_slot(24,vec![]).unwrap();
+        let checkpoint = executor.checkpoint();
+        assert_eq!(executor.stake_schedule_weights(&checkpoint,3).unwrap().unwrap()[0],100_000_000 + delegated,"a captured future schedule stays frozen");
+        assert_eq!(executor.stake_schedule_weights(&checkpoint,4).unwrap().unwrap()[0],100_000_000);
+        assert_eq!(executor.svm.get_account(&stake_key.pubkey()).unwrap().lamports,held,"epochs issue no rewards");
+        assert!(executor.svm.get_sysvar::<solana_sdk::stake_history::StakeHistory>().is_empty());
+        send(&mut executor,vec![stake_instruction::withdraw(&stake_key.pubkey(),&owner.pubkey(),&owner.pubkey(),held,None)],None,25);
+        assert!(executor.svm.get_account(&stake_key.pubkey()).is_none_or(|account| account.lamports == 0),"empty StakeHistory permits withdrawal after the deactivation epoch");
+        assert_eq!(executor.native_supply().unwrap().unwrap().reserve_lamports,supply.reserve_lamports,"fixed snapshot storage allocates no per-epoch rent");
     }
 
     #[test]

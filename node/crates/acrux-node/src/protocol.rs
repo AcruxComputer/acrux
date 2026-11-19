@@ -152,13 +152,167 @@ impl Step {
         })
     }
 }
+/// Public schedule inputs accompany follower snapshots; weights themselves come only from
+/// finalized, hashed stake snapshots. Consensus certificate voting keeps its genesis weights.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProposerConfig {
+    pub seed: String,
+    pub windows_per_epoch: u64,
+    pub identities: Vec<String>,
+    pub hubs: Vec<schedule::Hub>,
+    pub epoch_slots: u64,
+    pub stake_from_slot: Option<u64>,
+    pub genesis_stake_lamports: Option<u64>,
+}
+
+pub(crate) struct ProposerSchedules {
+    pub config: ProposerConfig,
+    legacy: schedule::Schedule,
+    epochs: BTreeMap<u64, (Vec<u64>, schedule::Schedule)>,
+}
+impl ProposerSchedules {
+    pub fn new(config: ProposerConfig) -> Result<Self> {
+        ensure!(config.windows_per_epoch > 0 && config.epoch_slots > 0 && (config.stake_from_slot.is_none() || config.epoch_slots % 16 == 0), "Invalid proposer schedule lengths");
+        let legacy = schedule::build_schedule(0, &config.seed, &config.hubs, config.identities.len() as u64 * 100_000_000, config.windows_per_epoch)?;
+        let mut this = Self { config, legacy, epochs: BTreeMap::new() };
+        if let (Some(slot), Some(weight)) = (this.config.stake_from_slot, this.config.genesis_stake_lamports) {
+            let epoch = slot / this.config.epoch_slots;
+            let weights = vec![weight; this.config.identities.len()];
+            this.learn(epoch, weights.clone())?;
+            this.learn(epoch + 1, weights)?;
+        }
+        Ok(this)
+    }
+    pub fn learn(&mut self, epoch: u64, weights: Vec<u64>) -> Result<()> {
+        ensure!(weights.len() == self.config.identities.len(), "Stake snapshot has another validator count");
+        if let Some((known, _)) = self.epochs.get(&epoch) {
+            ensure!(known == &weights, "Finalized stake snapshots disagree for epoch {epoch}");
+            return Ok(());
+        }
+        let total = weights.iter().try_fold(0u64, |sum, weight| sum.checked_add(*weight)).context("Proposer stake overflow")?;
+        let mut hubs = self.config.hubs.clone();
+        for member in hubs.iter_mut().flat_map(|hub| hub.members.iter_mut()) {
+            let index = self.config.identities.iter().position(|identity| identity == &member.identity).context("Unknown proposer identity")?;
+            member.stake = weights[index];
+        }
+        let drawn = schedule::build_schedule(epoch, &self.config.seed, &hubs, total, self.config.windows_per_epoch)?;
+        self.epochs.insert(epoch, (weights, drawn));
+        Ok(())
+    }
+    fn active(&self, window: u64) -> bool {
+        self.config.stake_from_slot.is_some_and(|slot| window.saturating_mul(16) >= slot)
+    }
+    pub fn ready(&self, window: u64) -> bool {
+        !self.active(window) || self.epochs.contains_key(&(window * 16 / self.config.epoch_slots))
+    }
+    pub fn window(&self, number: u64) -> Result<schedule::Window> {
+        let schedule = if self.active(number) {
+            &self.epochs.get(&(number * 16 / self.config.epoch_slots)).context("The proposer epoch's stake snapshot is not finalized yet")?.1
+        } else { &self.legacy };
+        let mut window = schedule.windows[number as usize % schedule.windows.len()].clone();
+        window.number = number;
+        Ok(window)
+    }
+    pub fn weights(&self, number: u64) -> Result<Vec<u64>> {
+        if self.active(number) { Ok(self.epochs.get(&(number * 16 / self.config.epoch_slots)).context("The proposer epoch's stake snapshot is not finalized yet")?.0.clone()) }
+        else { Ok(vec![100_000_000; self.config.identities.len()]) }
+    }
+    pub fn ids(&self, number: u64) -> Result<Vec<usize>> {
+        self.window(number)?.proposers.iter().map(|identity| self.config.identities.iter().position(|known| known == identity).context("Unknown drawn proposer")).collect()
+    }
+    fn epoch(&self, epoch: u64) -> Result<Value> {
+        let (weights, schedule) = if self.config.stake_from_slot.is_some_and(|slot| epoch >= slot / self.config.epoch_slots) {
+            let (weights, schedule) = self.epochs.get(&epoch).context("The proposer epoch's stake snapshot is not finalized yet")?;
+            (weights.clone(), schedule)
+        } else { (vec![100_000_000; self.config.identities.len()], &self.legacy) };
+        Ok(json!({"epoch":epoch,"weights":self.config.identities.iter().zip(weights).map(|(identity,stake)| json!({"identity":identity,"stake":stake.to_string()})).collect::<Vec<_>>(),"schedule":schedule}))
+    }
+}
+
+#[cfg(test)]
+mod proposer_stake_tests {
+    use super::*;
+    use solana_sdk::{account::Account, pubkey::Pubkey, stake::state::{Delegation, Meta, Stake, StakeStateV2}};
+
+    fn config() -> ProposerConfig {
+        let identities = (0..12).map(|index| Pubkey::new_from_array([index + 1;32]).to_string()).collect::<Vec<_>>();
+        let hubs = ["FRA","NYC","TYO"].into_iter().enumerate().map(|(hub,code)| schedule::Hub {
+            code:code.into(),region:code.into(),members:identities[hub * 4..hub * 4 + 4].iter().map(|identity| schedule::Member { identity:identity.clone(),stake:100_000_000 }).collect(),
+        }).collect();
+        ProposerConfig { seed:"9".into(),windows_per_epoch:96,identities,hubs,epoch_slots:256,stake_from_slot:Some(512),genesis_stake_lamports:Some(100_000_000) }
+    }
+    fn delegation(executor: &mut SvmExecutor, config: &ProposerConfig, deactivation_epoch: u64) {
+        let vote = crate::execution::genesis_vote_address(&config.identities[0].parse().unwrap());
+        let state = StakeStateV2::Stake(Meta::default(),Stake { delegation:Delegation {
+            voter_pubkey:vote,stake:1_000_000_000,activation_epoch:2,deactivation_epoch,..Delegation::default()
+        },credits_observed:0 },Default::default());
+        let mut data = bincode::serialize(&state).unwrap();
+        data.resize(StakeStateV2::size_of(),0);
+        executor.set_account(&Pubkey::new_from_array([99;32]).to_string(),Account { lamports:1_000_000_000,data,owner:solana_sdk::stake::program::id(),executable:false,rent_epoch:0 }).unwrap();
+    }
+    fn executor(config: &ProposerConfig) -> SvmExecutor {
+        let mut executor = SvmExecutor::new(Vec::<(String,u64)>::new(),&[]).unwrap();
+        executor.set_stake_config(crate::execution::StakeConfig {
+            from_slot:512,epoch_slots:256,genesis_stake_lamports:100_000_000,identities:config.identities.iter().map(|identity| identity.parse().unwrap()).collect(),
+        });
+        executor
+    }
+    #[test]
+    fn delegated_stake_changes_epoch_e_plus_two_proposer_draw() {
+        let config = config();
+        let mut executor = executor(&config);
+        let mut schedules = ProposerSchedules::new(config).unwrap();
+        let current = serde_json::to_vec(&schedules.epoch(2).unwrap()).unwrap();
+        delegation(&mut executor,&schedules.config,u64::MAX);
+        assert!(!schedules.ready(4 * 256 / 16));
+        schedules.learn(4,executor.stake_weights(4).unwrap()).unwrap();
+        assert_eq!(serde_json::to_vec(&schedules.epoch(2).unwrap()).unwrap(),current,"delegation cannot rewrite the current or already-frozen next epoch");
+        assert_eq!(executor.stake_weights(2).unwrap()[0],100_000_000,"same-epoch activation is excluded");
+        let baseline = schedules.epochs.get(&3).unwrap().1.shares.iter().find(|hub| hub.hub_code == "FRA").unwrap().proposer_stake;
+        let weighted = schedules.epochs.get(&4).unwrap().1.shares.iter().find(|hub| hub.hub_code == "FRA").unwrap().proposer_stake;
+        assert!(weighted > baseline,"Algorithm3 must cap and draw from the delegated weights");
+        assert_eq!(schedules.weights(4 * 256 / 16).unwrap()[0],1_100_000_000);
+    }
+    #[test]
+    fn deactivated_stake_leaves_next_snapshot_without_rewriting_the_current_draw() {
+        let config = config();
+        let mut executor = executor(&config);
+        let mut schedules = ProposerSchedules::new(config).unwrap();
+        delegation(&mut executor,&schedules.config,u64::MAX);
+        schedules.learn(4,executor.stake_weights(4).unwrap()).unwrap();
+        let frozen = serde_json::to_vec(&schedules.epoch(4).unwrap()).unwrap();
+        delegation(&mut executor,&schedules.config,4);
+        assert_eq!(executor.stake_weights(4).unwrap()[0],1_100_000_000,"deactivation remains active in its own epoch");
+        schedules.learn(5,executor.stake_weights(5).unwrap()).unwrap();
+        assert_eq!(schedules.weights(5 * 256 / 16).unwrap(),vec![100_000_000;12]);
+        assert_eq!(serde_json::to_vec(&schedules.epoch(4).unwrap()).unwrap(),frozen);
+    }
+    #[test]
+    fn pre_stake_draw_is_byte_identical_to_the_legacy_schedule() {
+        let mut config = config();
+        config.stake_from_slot = Some(4096);
+        let expected = schedule::build_schedule(0,&config.seed,&config.hubs,1_200_000_000,96).unwrap();
+        let configured = ProposerSchedules::new(config.clone()).unwrap();
+        config.stake_from_slot = None;
+        config.genesis_stake_lamports = None;
+        let disabled = ProposerSchedules::new(config).unwrap();
+        for number in 0..192 {
+            let mut legacy = expected.windows[number as usize % 96].clone();
+            legacy.number = number;
+            assert_eq!(bincode::serialize(&configured.window(number).unwrap()).unwrap(),bincode::serialize(&legacy).unwrap());
+            assert_eq!(bincode::serialize(&disabled.window(number).unwrap()).unwrap(),bincode::serialize(&legacy).unwrap());
+        }
+    }
+}
+
 pub struct Network {
     config: Configuration,
     profile: Arc<crate::profiling::Profiling>,
     keys: Vec<SigningKey>,
     identities: Vec<String>,
     stakes: Vec<u64>,
-    schedule: Vec<schedule::Window>,
+    proposers: Arc<std::sync::RwLock<ProposerSchedules>>,
     nodes: NodeSet,
     transport: Arc<LocalTransport>,
     exchange: Arc<crate::exchange::ExchangeEngine>,
@@ -487,13 +641,13 @@ impl Network {
                     .collect(),
             })
             .collect::<Vec<_>>();
-        let planned = schedule::build_schedule(
-            0,
-            &config.seed.to_string(),
-            &hubs,
-            stakes.iter().sum(),
-            config.windows_per_epoch as u64,
-        )?;
+        let stake_rule = genesis.as_ref().and_then(|g| g.bridge.as_ref()).map(|bridge| bridge.stake_activation()).transpose()?.flatten();
+        let proposer_config = ProposerConfig {
+            seed: config.seed.to_string(), windows_per_epoch: config.windows_per_epoch as u64,
+            identities: identities.clone(), hubs: hubs.clone(),
+            epoch_slots: genesis.as_ref().and_then(|g| g.bridge.as_ref()).map_or(432_000, |bridge| bridge.epoch_slots),
+            stake_from_slot: stake_rule.map(|rule| rule.0), genesis_stake_lamports: stake_rule.map(|rule| rule.1),
+        };
         // A net that persists continues from its saved state, when it has one: the last finalized
         // cblock, its accounts, the executed ids and recent blockhashes, and the traffic's keys.
         let state_store = if config.persist {
@@ -580,6 +734,9 @@ impl Network {
                         executor.set_bridge(bridge.program);
                         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
                         if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); }
+                        if let Some((from_slot, genesis_stake_lamports)) = bridge.stake_activation()? {
+                            executor.set_stake_config(crate::execution::StakeConfig { from_slot, epoch_slots: bridge.epoch_slots, genesis_stake_lamports, identities: identities.iter().map(|identity| identity.parse()).collect::<std::result::Result<Vec<_>, _>>()? });
+                        }
                     }
                     anyhow::ensure!(executor.state_hash() == saved.state.state_hash, "the saved state at cblock {} hashes to {}, not to its saved hash {}", block.slot, executor.state_hash(), saved.state.state_hash);
                     executor
@@ -592,6 +749,9 @@ impl Network {
                         executor.set_bridge(bridge.program);
                         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
                         if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); }
+                        if let Some((from_slot, genesis_stake_lamports)) = bridge.stake_activation()? {
+                            executor.set_stake_config(crate::execution::StakeConfig { from_slot, epoch_slots: bridge.epoch_slots, genesis_stake_lamports, identities: identities.iter().map(|identity| identity.parse()).collect::<std::result::Result<Vec<_>, _>>()? });
+                        }
                     }
                     executor.set_fees(crate::execution::Fees {
                         reserve_lamports: config.reserve,
@@ -658,6 +818,9 @@ impl Network {
             None
         };
         gateway.write().await.kept = kept.clone();
+        let mut proposer_schedules = ProposerSchedules::new(proposer_config)?;
+        for (epoch, weights) in nodes[0].executor.as_ref().unwrap().stake_schedule_snapshots(&nodes[0].genesis)? { proposer_schedules.learn(epoch, weights)?; }
+        let proposers = Arc::new(std::sync::RwLock::new(proposer_schedules));
         let kept_writer = kept.clone().map(crate::history::spawn_writer).transpose()?;
         let keep_from = resumed.map_or(0, |block| block.slot * 4 + 4);
         let built_in = senders
@@ -715,7 +878,7 @@ impl Network {
             keys,
             identities,
             stakes,
-            schedule: planned.windows,
+            proposers,
             nodes: NodeSet(nodes.into_iter().map(Some).collect()),
             transport,
             exchange,
@@ -777,18 +940,9 @@ impl Network {
             built_in,
         })
     }
-    fn window(&self, number: u64) -> schedule::Window {
-        let mut w = self.schedule[number as usize % self.schedule.len()].clone();
-        w.number = number;
-        w
-    }
-    fn proposer_ids(&self, number: u64) -> Vec<usize> {
-        self.window(number)
-            .proposers
-            .iter()
-            .map(|a| self.identities.iter().position(|x| x == a).unwrap())
-            .collect()
-    }
+    fn window(&self, number: u64) -> Result<schedule::Window> { self.proposers.read().unwrap().window(number) }
+    fn proposer_ids(&self, number: u64) -> Result<Vec<usize>> { self.proposers.read().unwrap().ids(number) }
+    fn schedule_ready(&self, number: u64) -> bool { self.proposers.read().unwrap().ready(number) }
     /// Cblock `i`'s outbox: every cblock carries the next epoch's validator set, so any one of an
     /// epoch certified on Solana hands its light client on, whichever slots were skipped.
     fn outbox(&self, i: u64) -> Vec<crate::bridge::OutboxEntry> {
@@ -891,18 +1045,18 @@ impl Network {
         let next = self.nodes[id].executor.as_ref().unwrap().next_credit();
         self.bridge_deposits.lock().unwrap().range(next..).take(16).map(|(_, c)| c.clone()).collect()
     }
-    fn window_json(&self, number: u64) -> Value {
-        view::window_json(
+    fn window_json(&self, number: u64) -> Result<Value> {
+        Ok(view::window_json(
             number,
-            &self.window(number),
+            &self.window(number)?,
             &self.identities,
-            &self.stakes,
+            &self.proposers.read().unwrap().weights(number)?,
             if self.config.crash_window == Some(number) {
                 Some(self.config.crash_proposer)
             } else {
                 None
             },
-        )
+        ))
     }
     pub async fn run(mut self) -> Result<()> {
         let mut senders = Vec::new();
@@ -917,17 +1071,7 @@ impl Network {
             .iter()
             .map(|k| k.verifying_key())
             .collect::<Vec<_>>();
-        let schedule_ids = Arc::new(
-            self.schedule
-                .iter()
-                .map(|w| {
-                    w.proposers
-                        .iter()
-                        .map(|a| self.identities.iter().position(|id| id == a).unwrap())
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>(),
-        );
+        let schedule_ids = self.proposers.clone();
         let window_bases = Arc::new(std::sync::Mutex::new(
             BTreeMap::<(usize, u64), Instant>::new(),
         ));
@@ -1074,7 +1218,7 @@ impl Network {
                     keys: self.keys.clone(),
                     identities: self.identities.clone(),
                     stakes: self.stakes.clone(),
-                    schedule: self.schedule.clone(),
+                    proposers: self.proposers.clone(),
                     nodes: NodeSet::default(),
                     transport: self.transport.clone(),
                     exchange: self.exchange.clone(),
@@ -1351,7 +1495,7 @@ impl Network {
         if fault.scenario == "censorship" {
             self.record_sent(&valid.header, "plain", 3, 1).await?;
             let mut step = Step::new();
-            step.out.push(Outbox { from: 0, to: self.proposer_ids(fault.window), body: Wire::Submit(valid) });
+            step.out.push(Outbox { from: 0, to: self.proposer_ids(fault.window)?, body: Wire::Submit(valid) });
             return self.dispatch(0, step).await;
         }
         // Private front-run: a 2-of-3 transaction; the attacking receiver holds one fragment.
@@ -1457,7 +1601,7 @@ impl Network {
         let mut gaps = vec![];
         for slot in self.facts_cursor.commit_slot + 1..=until {
             let (Some(at), Some(previous)) = (commits.get(&slot), commits.get(&(slot - 1))) else { continue };
-            let link = (slot % 16 == 0).then(|| format!("{}-{}", self.window(slot / 16 - 1).hub_code, self.window(slot / 16).hub_code));
+            let link = if slot % 16 == 0 { self.window(slot / 16 - 1).ok().zip(self.window(slot / 16).ok()).map(|(a,b)| format!("{}-{}",a.hub_code,b.hub_code)) } else { None };
             gaps.push((link, offset(*at, *previous)));
         }
         self.facts_cursor.commit_slot = self.facts_cursor.commit_slot.max(until);
@@ -1575,7 +1719,7 @@ impl Network {
                 })
                 .collect::<Vec<_>>();
             for w in windows {
-                let ids = self.proposer_ids(w);
+                let ids = self.proposer_ids(w)?;
                 let index = ids.iter().position(|x| *x == id);
                 let mut produce = vec![];
                 {
@@ -1708,6 +1852,10 @@ impl Network {
         if self.nodes[id].windows.contains_key(&number) {
             return Ok(());
         }
+        if !self.schedule_ready(number) {
+            self.nodes[id].pending_starts.push((number, parent));
+            return Ok(());
+        }
         let start = Instant::now();
         self.nodes[id].windows.insert(
             number,
@@ -1718,7 +1866,7 @@ impl Network {
                 skipped_from: None,
             },
         );
-        let w = self.window_json(number);
+        let w = self.window_json(number)?;
         let mut step = Step::new();
         // A transaction this node carried two windows ago that has still not executed went down
         // with a skipped slot: it goes to this window's proposer in the role that carried it.
@@ -1735,14 +1883,14 @@ impl Network {
             if executor.is_executed(&key) || !executor.blockhash_valid(&tx.bytes) {
                 continue;
             }
-            let to = vec![self.proposer_ids(number)[role - 1]];
+            let to = vec![self.proposer_ids(number)?[role - 1]];
             step.out.push(Outbox { from: id, to, body: Wire::Submit(tx) });
         }
         // A proposer of the window before hands on what it did not get to include (its window was
         // skipped, or the transaction arrived late) to the proposer in its role of this window.
         if number > 0 {
-            if let Some(role) = self.proposer_ids(number - 1).iter().position(|x| *x == id) {
-                let to = vec![self.proposer_ids(number)[role]];
+            if let Some(role) = self.proposer_ids(number - 1)?.iter().position(|x| *x == id) {
+                let to = vec![self.proposer_ids(number)?[role]];
                 let first = number * 16;
                 let node = &mut self.nodes[id];
                 let late = node.mempool.iter().filter(|(_, t)| t.header.target_slot < first).map(|(k, _)| k.clone()).collect::<Vec<_>>();
@@ -1778,8 +1926,9 @@ impl Network {
         self.dispatch(id, step).await?;
         if id == 0 {
             let upcoming = (number + 1..number + 9)
+                .take_while(|n| self.schedule_ready(*n))
                 .map(|n| self.window_json(n))
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             let mut g = self.gateway.write().await;
             g.upcoming_windows = upcoming;
         }
@@ -1787,7 +1936,7 @@ impl Network {
     }
     async fn begin_block(&mut self, id: usize, s: u64) -> Result<()> {
         let _phase = self.profile.measure(Some(id), "proposer.build");
-        let ids = self.proposer_ids(s / 16);
+        let ids = self.proposer_ids(s / 16)?;
         let q = ids.iter().position(|x| *x == id).unwrap() + 1;
         if s % 16 == 0 {
             if let Some(early) = self.nodes[id].early.remove(&(s / 16)) {
@@ -1871,7 +2020,7 @@ impl Network {
         let start =
             node.windows[&(s / 16)].start + std::time::Duration::from_micros(s % 16 * 50000);
         self.exchange
-            .launch(id, s, q, commit, key, start, self.proposer_ids(s / 16));
+            .launch(id, s, q, commit, key, start, self.proposer_ids(s / 16)?);
         let mut pending = vec![];
         for (index, shreds) in packets.into_iter().enumerate() {
             pending.push((index, shreds));
@@ -1926,13 +2075,14 @@ impl Network {
         Ok(())
     }
     async fn prepare_early(&mut self, id: usize, window: u64) -> Result<()> {
+        if !self.schedule_ready(window) { return Ok(()) }
         if self.nodes[id].windows.contains_key(&window)
             || self.nodes[id].early.contains_key(&window)
         {
             return Ok(());
         }
         let q = self
-            .proposer_ids(window)
+            .proposer_ids(window)?
             .iter()
             .position(|n| *n == id)
             .unwrap()
@@ -2020,7 +2170,7 @@ impl Network {
             commit,
             early.key,
             run.start,
-            self.proposer_ids(s / 16),
+            self.proposer_ids(s / 16)?,
         );
         let transport = self.transport.clone();
         let signer = self.keys[id].clone();
@@ -2121,7 +2271,7 @@ impl Network {
                 );
                 let target = tx.header.target_slot / 16;
                 let window = self.nodes[id].windows.keys().next_back().copied().unwrap_or(0).max(target);
-                let role = self.proposer_ids(window).iter().position(|x| *x == id).map_or(1, |q| q + 1);
+                let role = self.proposer_ids(window)?.iter().position(|x| *x == id).map_or(1, |q| q + 1);
                 ensure!(
                     self.nodes[id].executor.as_ref().unwrap().can_pay_inclusion(&tx.header.fee_payer, role as u8, window, 1),
                     "Fee payer cannot pay the inclusion fee"
@@ -2136,7 +2286,7 @@ impl Network {
                 let latest = self.nodes[id].windows.keys().next_back().copied().unwrap_or(0).max(target);
                 ensure!(
                     (target..=(latest + 1).min(target + 64))
-                        .any(|w| self.proposer_ids(w)[fragment.receiver as usize - 1] == id),
+                        .map(|w| self.proposer_ids(w)).collect::<Result<Vec<_>>>()?.iter().any(|ids| ids[fragment.receiver as usize - 1] == id),
                     "Fragment delivered to wrong proposer"
                 );
                 self.nodes[id]
@@ -2144,13 +2294,9 @@ impl Network {
                     .insert((fragment.header.id.clone(), fragment.index), fragment);
             }
             Wire::Shreds(shreds) => {
-                ensure!(
-                    shreds.iter().all(|x| self
-                        .proposer_ids(x.meta.slot / 16)
-                        .get(x.meta.proposer.saturating_sub(1))
-                        == Some(&e.from)),
-                    "Wrong proposer shred"
-                );
+                for shred in &shreds {
+                    ensure!(self.proposer_ids(shred.meta.slot / 16)?.get(shred.meta.proposer.saturating_sub(1)) == Some(&e.from), "Wrong proposer shred");
+                }
                 step.out.push(Outbox {
                     from: id,
                     to: (0..12).collect(),
@@ -2233,7 +2379,7 @@ impl Network {
                         .await;
                 }
                 let s = c.slot;
-                let ids = self.proposer_ids(s / 16);
+                let ids = self.proposer_ids(s / 16)?;
                 ensure!(
                     ids.get(c.proposer.saturating_sub(1)) == Some(&e.from),
                     "Incorrect commitment proposer"
@@ -2263,7 +2409,7 @@ impl Network {
             }
             Wire::Attest(a) => {
                 let s = a.slot;
-                let ids = self.proposer_ids(s / 16);
+                let ids = self.proposer_ids(s / 16)?;
                 ensure!(
                     ids.get(a.proposer.saturating_sub(1)) == Some(&e.from) && a.pi.len() == 3,
                     "Invalid attester"
@@ -2380,8 +2526,8 @@ impl Network {
                 let actions = self.nodes[id]
                     .votor
                     .receive(consensus::Message::Certificate(certificate.clone()))?;
-                let mut targets = self.proposer_ids(certificate.slot / 4);
-                targets.extend(self.proposer_ids(certificate.slot / 4 + 1));
+                let mut targets = self.proposer_ids(certificate.slot / 4)?;
+                if self.schedule_ready(certificate.slot / 4 + 1) { targets.extend(self.proposer_ids(certificate.slot / 4 + 1)?); }
                 targets.sort_unstable();
                 targets.dedup();
                 if targets.contains(&id) {
@@ -2411,7 +2557,7 @@ impl Network {
                         shred.meta.slot / 4 == slot / 4 && (1..=3).contains(&shred.meta.proposer),
                         "Invalid handover shred slot"
                     );
-                    let origin = self.proposer_ids(shred.meta.slot / 16)[shred.meta.proposer - 1];
+                    let origin = self.proposer_ids(shred.meta.slot / 16)?[shred.meta.proposer - 1];
                     if self.nodes[id]
                         .slots
                         .get(&shred.meta.slot)
@@ -2460,7 +2606,7 @@ impl Network {
                             && att.pi.len() == 3,
                         "Invalid handover attestation"
                     );
-                    let origin = self.proposer_ids(att.slot / 16)[att.proposer - 1];
+                    let origin = self.proposer_ids(att.slot / 16)?[att.proposer - 1];
                     crypto::verify_bytes(
                         &self.keys[origin].verifying_key(),
                         &encode(&Wire::Attest(att.clone()))?,
@@ -2490,7 +2636,7 @@ impl Network {
             .filter(|(_, kind, _)| *kind == consensus::CertificateKind::Skip)
             .map(|(i, _, _)| *i)
             .min();
-        let ids = self.proposer_ids(w);
+        let ids = self.proposer_ids(w)?;
         let recipients = ids
             .iter()
             .enumerate()
@@ -2699,6 +2845,7 @@ impl Network {
             // Restore the selected parent first, then retire legacy money before this slot's
             // inclusion fees. A rollback restores the marker along with every other account.
             self.nodes[id].executor.as_mut().unwrap().activate_native_cutover(s)?;
+            self.nodes[id].executor.as_mut().unwrap().prepare_stake_epoch(s)?;
             let mut validation = payloads
                 .iter()
                 .flat_map(|(q, txs)| {
@@ -2775,7 +2922,7 @@ impl Network {
                             "fragments",
                             n,
                             t,
-                            &self.window_json(w)["proposers"].as_array().unwrap(),
+                            &self.window_json(w)?["proposers"].as_array().unwrap(),
                         );
                         failed["state"] = json!("failed");
                         failed["failure"] = json!(error.to_string());
@@ -2794,7 +2941,7 @@ impl Network {
                             None,
                             None,
                             None,
-                            &self.window_json(w),
+                            &self.window_json(w)?,
                             self.config.fragment_expiry_slots,
                         ));
                     }
@@ -2820,7 +2967,7 @@ impl Network {
                                     None,
                                     None,
                                     None,
-                                    &self.window_json(w),
+                                    &self.window_json(w)?,
                                     self.config.fragment_expiry_slots,
                                 );
                                 failed["result"] = json!("error");
@@ -2956,13 +3103,10 @@ impl Network {
             step.event(s, at, "slot.merged", json!({"transactions":merged}));
             let sched = json!({"algorithm":4,"tracks":4,"capacityCu":self.config.track_capacity_cu,"placements":execution.schedule.placements,"gaps":execution.schedule.gaps});
             step.event(s, at, "slot.scheduled", sched.clone());
-            let mut view = self.slot_views.get(&s).cloned().unwrap_or_else(|| {
-                view::pending_slot(
-                    s,
-                    self.window_json(w),
-                    utc(self.wall + offset(base, self.origin) / 1000),
-                )
-            });
+            let mut view = match self.slot_views.get(&s).cloned() {
+                Some(view) => view,
+                None => view::pending_slot(s,self.window_json(w)?,utc(self.wall + offset(base, self.origin) / 1000)),
+            };
             view["status"] = json!("executed");
             view["agreedSet"] = json!(accepted);
             view["mergedOrder"] = json!(merged);
@@ -3010,7 +3154,7 @@ impl Network {
                     if outcome.is_none() && !fragment_info.contains_key(&h.id) {
                         continue;
                     }
-                    let mut tx = json!({"header":h,"state":if outcome.map_or(false,|r|r.success){"executed"}else{"failed"},"kind":"plain","n":source[&h.id].len(),"t":1,"receivers":self.window_json(w)["proposers"],"fragments":source[&h.id].iter().map(|p|json!({"index":*p-1,"receiver":p,"slot":s,"proposer":p,"includedUs":at})).collect::<Vec<_>>(),"includedCount":source[&h.id].len(),"readableSlot":s,"executedSlot":s,"mergedPosition":position,"result":if outcome.map_or(false,|r|r.success){"success"}else{"error"},"logs":outcome.map(|r|r.logs.clone()).unwrap_or_default(),"failure":outcome.and_then(|r|r.error.clone()),"expiresAfterSlot":null,"finalization":null});
+                    let mut tx = json!({"header":h,"state":if outcome.map_or(false,|r|r.success){"executed"}else{"failed"},"kind":"plain","n":source[&h.id].len(),"t":1,"receivers":self.window_json(w)?["proposers"],"fragments":source[&h.id].iter().map(|p|json!({"index":*p-1,"receiver":p,"slot":s,"proposer":p,"includedUs":at})).collect::<Vec<_>>(),"includedCount":source[&h.id].len(),"readableSlot":s,"executedSlot":s,"mergedPosition":position,"result":if outcome.map_or(false,|r|r.success){"success"}else{"error"},"logs":outcome.map(|r|r.logs.clone()).unwrap_or_default(),"failure":outcome.and_then(|r|r.error.clone()),"expiresAfterSlot":null,"finalization":null});
                     if let Some((n, t, inclusions)) = fragment_info.get(&h.id) {
                         tx = threshold_transaction(
                             h,
@@ -3025,7 +3169,7 @@ impl Network {
                             Some(s),
                             Some(position),
                             outcome,
-                            &self.window_json(w),
+                            &self.window_json(w)?,
                             self.config.fragment_expiry_slots,
                         );
                     }
@@ -3049,7 +3193,7 @@ impl Network {
                 }
             }
             self.dispatch(id, step).await?;
-            if s % 16 == 15 && self.proposer_ids(w + 1).contains(&id) {
+            if s % 16 == 15 && self.schedule_ready(w + 1) && self.proposer_ids(w + 1)?.contains(&id) {
                 self.prepare_early(id, w + 1).await?;
             }
         }
@@ -3157,8 +3301,8 @@ impl Network {
                     parent,
                 };
                 self.nodes[id].executed_blocks.insert(i, block.id);
-                if i % 4 == 3 && self.proposer_ids(w).contains(&id) {
-                    let next = self.proposer_ids(w + 1);
+                if i % 4 == 3 && self.schedule_ready(w + 1) && self.proposer_ids(w)?.contains(&id) {
+                    let next = self.proposer_ids(w + 1)?;
                     // 32 shreds rebuild a slice, so no more go; the rest is split into messages
                     // under the network limit, the attestations riding on the first.
                     let shreds = (i * 4..i * 4 + 4)
@@ -3333,6 +3477,11 @@ impl Network {
                     });
                 }
                 Action::Finalized(block) => {
+                    if let Some(checkpoint) = self.nodes[id].checkpoints.get(&block.slot) {
+                        let snapshots = self.nodes[id].executor.as_ref().unwrap().stake_schedule_snapshots(checkpoint)?;
+                        let mut schedules = self.proposers.write().unwrap();
+                        for (epoch, weights) in snapshots { schedules.learn(epoch, weights)?; }
+                    }
                     self.sign_finalized_ancestors(id, block, step)?;
                     let at = self.consensus_time(id, block.slot);
                     let state = self.nodes[id]
@@ -3404,7 +3553,7 @@ impl Network {
     async fn traffic(&mut self) -> Result<()> {
         let s = self.latest_started() + 3;
         if self.native_cutover_slot().is_some_and(|cut| s >= cut) { return Ok(()) }
-        let ids = self.proposer_ids(s / 16);
+        let ids = self.proposer_ids(s / 16)?;
         let n = self.traffic_seq as usize;
         self.traffic_seq += 1;
         let sender = &self.senders[n % self.senders.len()];
@@ -3464,6 +3613,7 @@ impl Network {
                         "anchor": {"consensusSlot": finalized.slot, "hash": hex::encode(finalized.hash), "stateHash": executor.state_hash},
                         "executor": executor,
                         "threshold": threshold,
+                        "proposerConfig": self.proposers.read().unwrap().config,
                     }))
                 })();
                 let _ = reply.send(result.map_err(|e| e.to_string()));
@@ -3499,6 +3649,10 @@ impl Network {
             }
             GatewayCommand::Faucet { reply } => {
                 let _ = reply.send(self.faucet_available().map_err(|e| e.to_string()));
+            }
+            GatewayCommand::ProposerEpoch { epoch, reply } => {
+                let result = self.proposers.read().unwrap().epoch(epoch).map_err(|error| error.to_string());
+                let _ = reply.send(result);
             }
             GatewayCommand::NativeSupply { reply } => {
                 let result = (|| {
@@ -3638,7 +3792,7 @@ impl Network {
         let mut step = Step::new();
         step.out.push(Outbox {
             from: 0,
-            to: self.proposer_ids(target / 16),
+            to: self.proposer_ids(target / 16)?,
             body: Wire::Submit(valid),
         });
         self.dispatch(0, step).await?;
@@ -3741,7 +3895,7 @@ impl Network {
         n: u8,
         t: u8,
     ) -> Result<()> {
-        let receivers = self.window_json(header.target_slot / 16)["proposers"]
+        let receivers = self.window_json(header.target_slot / 16)?["proposers"]
             .as_array()
             .unwrap()
             .clone();
@@ -3790,7 +3944,7 @@ impl Network {
         let mut step = Step::new();
         step.out.push(Outbox {
             from: 0,
-            to: vec![self.proposer_ids(window)[q as usize - 1]],
+            to: vec![self.proposer_ids(window)?[q as usize - 1]],
             body: Wire::SubmitFragment(fragment),
         });
         self.dispatch(0, step).await?;
@@ -3826,7 +3980,7 @@ impl Network {
             // An identical retry of a transaction that has not executed goes out again, to the
             // proposers now due: its first copies may have gone down with a skipped slot.
             if !self.nodes[0].executor.as_ref().unwrap().is_executed(&key) {
-                let ids = self.proposer_ids((self.latest_started() + 1) / 16);
+                let ids = self.proposer_ids((self.latest_started() + 1) / 16)?;
                 let mut step = Step::new();
                 step.out.push(Outbox { from: 0, to: roles.iter().map(|q| ids[q - 1]).collect(), body: Wire::Submit(valid) });
                 self.dispatch(0, step).await?;
@@ -3843,7 +3997,7 @@ impl Network {
             self.nodes[0].executor.as_ref().unwrap().admit_inclusions(&inclusions, window)?.iter().all(|ok| *ok),
             "The fee payer cannot pay the inclusion fee: fund it first"
         );
-        let ids = self.proposer_ids(window);
+        let ids = self.proposer_ids(window)?;
         let targets = roles.iter().map(|q| ids[q - 1]).collect::<Vec<_>>();
         let id = valid.header.id.clone();
         crate::submission::remember(&mut self.admissions, &id, &params)?;
@@ -3915,7 +4069,7 @@ impl Network {
         let trace = self.handover_trace.lock().unwrap().clone();
         let handover_trace = trace.iter().rev().filter(|(w, _)| **w > 0).take(64).filter_map(|(w, events)| {
             let anchor = commits.get(&(w * 16 - 1))?;
-            Some(json!({"window":w,"link":format!("{}-{}", self.window(w - 1).hub_code, self.window(*w).hub_code),"nextProposers":self.proposer_ids(*w),"events":events.iter().map(|(node, kind, at)| json!([node, kind, at.saturating_duration_since(*anchor).as_micros() as u64])).collect::<Vec<_>>()}))
+            Some(json!({"window":w,"link":format!("{}-{}", self.window(w - 1).ok()?.hub_code, self.window(*w).ok()?.hub_code),"nextProposers":self.proposer_ids(*w).ok()?,"events":events.iter().map(|(node, kind, at)| json!([node, kind, at.saturating_duration_since(*anchor).as_micros() as u64])).collect::<Vec<_>>()}))
         }).collect::<Vec<_>>();
         let facts = self.facts.as_ref().map_or(Value::Null, |facts| facts.json(String::new()));
         let memory = {
@@ -3972,9 +4126,10 @@ pub fn utc(ms: u64) -> String {
 fn authenticate(
     packet: Received,
     keys: &[ed25519_dalek::VerifyingKey],
-    schedule: &[Vec<usize>],
+    schedule: &std::sync::RwLock<ProposerSchedules>,
 ) -> Result<(Received, Envelope)> {
     let e: Envelope = decode(&packet.payload)?;
+    let schedule = schedule.read().unwrap();
     ensure!(
         e.from == packet.from && e.from < keys.len(),
         "Wrong envelope signer"
@@ -3988,7 +4143,7 @@ fn authenticate(
         Wire::Commit(commitment) => {
             ensure!(
                 (1..=3).contains(&commitment.proposer)
-                    && schedule[(commitment.slot / 16) as usize % schedule.len()]
+                    && schedule.ids(commitment.slot / 16)?
                         .get(commitment.proposer - 1)
                         == Some(&e.from),
                 "Incorrect commitment proposer"
@@ -4000,7 +4155,7 @@ fn authenticate(
                     (1..=3).contains(&shred.meta.proposer),
                     "Invalid proposer role"
                 );
-                let signer = schedule[(shred.meta.slot / 16) as usize % schedule.len()]
+                let signer = schedule.ids(shred.meta.slot / 16)?
                     [shred.meta.proposer - 1];
                 let digest = crypto::hash(&encode(&(signer, shred))?);
                 if !verified_cached(digest) {
@@ -4017,7 +4172,7 @@ fn authenticate(
                     && (1..=3).contains(&first.0.proposer),
                 "Not an equivocation"
             );
-            let origin = schedule[(first.0.slot / 16) as usize % schedule.len()][first.0.proposer - 1];
+            let origin = schedule.ids(first.0.slot / 16)?[first.0.proposer - 1];
             for (commitment, signature) in [first, second] {
                 crypto::verify_bytes(&keys[origin], &encode(&Wire::Commit(commitment.clone()))?, signature)?;
             }
@@ -4030,7 +4185,7 @@ fn authenticate(
                 (1..=3).contains(&a.proposer) && a.pi.len() == 3,
                 "Invalid handover attestation"
             );
-            let q = schedule[(a.slot / 16) as usize % schedule.len()][a.proposer - 1];
+            let q = schedule.ids(a.slot / 16)?[a.proposer - 1];
             crypto::verify_bytes(&keys[q], &encode(&Wire::Attest(a.clone()))?, sig)?;
         }
     }
@@ -4151,7 +4306,11 @@ impl Network {
             "getHealth" => json!("ok"),
             "getVersion" => json!({"solana-core": concat!("acrux-", env!("CARGO_PKG_VERSION")), "feature-set": 0}),
             "getSlot" | "getBlockHeight" => json!(slot),
-            "getEpochInfo" => json!({"absoluteSlot": slot, "blockHeight": slot, "epoch": slot / 432_000, "slotIndex": slot % 432_000, "slotsInEpoch": 432_000}),
+            "getEpochInfo" => {
+                let config = &self.proposers.read().unwrap().config;
+                let slots = if config.stake_from_slot.is_some_and(|from| slot >= from) { config.epoch_slots } else { 432_000 };
+                json!({"absoluteSlot":slot,"blockHeight":slot,"epoch":slot / slots,"slotIndex":slot % slots,"slotsInEpoch":slots})
+            },
             "getLatestBlockhash" => json!({"context": context, "value": {"blockhash": executor.latest_blockhash(), "lastValidBlockHeight": slot + crate::execution::BLOCKHASH_AGE_SLOTS - 8}}),
             "getBalance" => json!({"context": context, "value": executor.balance(arg(0).as_str().context("address")?)?}),
             "getSupply" => {
@@ -4247,7 +4406,48 @@ impl Network {
                 }
                 json!(out)
             }
-            "getVoteAccounts" => json!({"current": self.identities.iter().zip(&self.stakes).map(|(identity, stake)| json!({"nodePubkey": identity, "votePubkey": identity, "activatedStake": stake, "epochVoteAccount": true, "commission": 0, "lastVote": slot, "rootSlot": slot})).collect::<Vec<_>>(), "delinquent": []}),
+            "getVoteAccounts" => {
+                let schedules = self.proposers.read().unwrap();
+                let active = schedules.config.stake_from_slot.is_some_and(|from| slot >= from);
+                let weights = if active { executor.stake_weights(slot / schedules.config.epoch_slots)? } else { self.stakes.clone() };
+                let current = self.identities.iter().zip(weights).map(|(identity, stake)| {
+                    if !active {
+                        return Ok::<_, anyhow::Error>(json!({"nodePubkey":identity,"votePubkey":identity,"activatedStake":stake,"epochVoteAccount":true,"commission":0,"lastVote":slot,"rootSlot":slot}));
+                    }
+                    let vote = crate::execution::genesis_vote_address(&identity.parse()?);
+                    let account = executor.account(&vote.to_string())?.context("Genesis vote account is missing")?;
+                    ensure!(account.owner == solana_sdk::vote::program::id() && !account.executable, "Invalid genesis vote account");
+                    let state = solana_sdk::vote::state::VoteState::deserialize(&account.data)?;
+                    ensure!(state.node_pubkey.to_string() == *identity, "Genesis vote account names another validator");
+                    Ok(json!({"nodePubkey":identity,"votePubkey":vote.to_string(),"activatedStake":stake,"epochVoteAccount":true,
+                        "commission":state.commission,"lastVote":state.last_voted_slot().unwrap_or(0),"rootSlot":state.root_slot,"epochCredits":state.epoch_credits}))
+                }).collect::<Result<Vec<_>>>()?;
+                json!({"current":current,"delinquent":[]})
+            },
+            "getStakeMinimumDelegation" => json!({"context":context,"value":executor.get_stake_minimum_delegation()?.context("The Stake program is not active")?}),
+            "getStakeActivation" => {
+                use solana_sdk::stake::state::StakeStateV2;
+                let account = executor.account(arg(0).as_str().context("stake account")?)?.context("Stake account not found")?;
+                ensure!(account.owner == solana_sdk::stake::program::id() && !account.executable && account.data.len() == StakeStateV2::size_of(), "Invalid Stake account");
+                let schedules = self.proposers.read().unwrap();
+                let config = arg(1);
+                ensure!(config.is_null() || config.is_object(), "Invalid Stake activation configuration");
+                let epoch_slots = if schedules.config.stake_from_slot.is_some_and(|from| slot >= from) { schedules.config.epoch_slots } else { 432_000 };
+                let epoch = match config.get("epoch") {
+                    Some(value) => value.as_u64().context("Stake activation epoch must be an unsigned integer")?,
+                    None => slot / epoch_slots,
+                };
+                match bincode::deserialize::<StakeStateV2>(&account.data)? {
+                    StakeStateV2::Stake(meta, stake, _) => {
+                        let status = stake.delegation.stake_activating_and_deactivating(epoch,&solana_sdk::stake_history::StakeHistory::default(),None);
+                        let state = if status.deactivating > 0 { "deactivating" } else if status.activating > 0 { "activating" }
+                            else if status.effective > 0 { "active" } else { "inactive" };
+                        json!({"state":state,"active":status.effective,"inactive":account.lamports.saturating_sub(meta.rent_exempt_reserve).saturating_sub(status.effective)})
+                    },
+                    StakeStateV2::Initialized(meta) => json!({"state":"inactive","active":0,"inactive":account.lamports.saturating_sub(meta.rent_exempt_reserve)}),
+                    _ => anyhow::bail!("Stake account is not initialized"),
+                }
+            },
             "sendTransaction" => {
                 let encoded = arg(0).as_str().context("transaction")?.to_owned();
                 anyhow::ensure!(encoded.len() <= 1_684, "Transaction exceeds Solana packet size");

@@ -197,12 +197,22 @@ pub async fn follow(url: &str, genesis: &str) -> Result<()> {
                 let entry = fetched.get(&s).with_context(|| format!("slot {s} was not fetched"))?;
                 let view = &entry["view"];
                 let blocks = &entry["blocks"];
+                if let Some(proposers) = &replay.proposers {
+                    let expected = proposers.window(s / 16)?;
+                    let actual = view["window"]["proposers"].as_array().context("proposers")?.iter().map(|proposer| proposer["identity"].as_str().context("proposer identity")).collect::<Result<Vec<_>>>()?;
+                    ensure!(expected.proposers.iter().map(String::as_str).eq(actual), "slot {s}: proposers differ from the finalized stake schedule");
+                }
                 check_slot(view, &blocks["attestations"]).with_context(|| format!("slot {s}"))?;
                 let recipients = view["window"]["proposers"].as_array().context("proposers")?.iter()
                     .map(|p| Ok((p["index"].as_u64().context("proposer index")? as u8, p["identity"].as_str().context("proposer identity")?.to_owned())))
                     .collect::<Result<Vec<_>>>()?;
                 let state = replay.apply(s, &recipients, blocks).with_context(|| format!("re-executing slot {s}"))?;
                 ensure!(view["stateHash"].as_str() == Some(state.as_str()), "slot {s}: re-executed state {} differs from the net's {}", &state[..12], view["stateHash"]);
+                if s % 4 == 3 {
+                    if let Some(proposers) = &mut replay.proposers {
+                        for (epoch, weights) in replay.executor.stake_schedule_snapshots(&replay.executor.checkpoint())? { proposers.learn(epoch, weights)?; }
+                    }
+                }
                 checked += 1;
                 println!("slot {s} re-executed  agreed {}  state {} matches  checked {checked}", view["agreedSet"], &state[..12]);
             }
@@ -241,28 +251,67 @@ async fn follower_rpc(client: &reqwest::Client, url: &str, method: &str, params:
     }
 }
 
+fn validate_proposer_config(config: &crate::protocol::ProposerConfig, genesis: &crate::genesis::Genesis) -> Result<()> {
+    let seed = config.seed.parse::<u64>().context("Invalid public schedule seed")?;
+    ensure!(seed.to_string() == config.seed, "The public schedule seed must be canonical decimal");
+    ensure!(config.windows_per_epoch == crate::types::Configuration::default().windows_per_epoch as u64, "The public schedule window count differs from this product's configuration");
+    ensure!(config.identities.len() == 12 && config.identities.iter().collect::<std::collections::BTreeSet<_>>().len() == 12, "Invalid public validator identities");
+    for identity in &config.identities { Pubkey::from_str(identity).context("Invalid public validator identity")?; }
+    ensure!(config.hubs.iter().all(|hub| hub.members.iter().all(|member| member.stake == 100_000_000)), "The public legacy schedule template has different genesis stakes");
+    let registry = genesis.registry_hubs()?;
+    if !registry.is_empty() {
+        let expected = registry.iter().flat_map(|hub| hub.members.iter().cloned()).collect::<std::collections::BTreeSet<_>>();
+        ensure!(config.identities.iter().cloned().collect::<std::collections::BTreeSet<_>>() == expected, "Snapshot validators differ from the genesis registry");
+        let codes = config.hubs.iter().map(|hub| &hub.code).collect::<std::collections::BTreeSet<_>>();
+        ensure!(config.hubs.len() == registry.len() && codes.len() == registry.len()
+            && config.hubs.iter().zip(&registry).all(|(hub, source)| hub.code == source.code), "Snapshot hubs must include every genesis hub once, in registry order");
+        for (hub, source) in config.hubs.iter().zip(&registry) {
+            ensure!(hub.region == crate::genesis::region_of(source.latitude, source.longitude), "Snapshot hub region differs from genesis coordinates");
+            let members = hub.members.iter().map(|member| &member.identity).collect::<std::collections::BTreeSet<_>>();
+            ensure!(members.len() == hub.members.len() && members == source.members.iter().collect(), "Snapshot hub members differ from genesis");
+        }
+    }
+    let stake_rule = genesis.bridge.as_ref().map(|bridge| bridge.stake_activation()).transpose()?.flatten();
+    ensure!(config.stake_from_slot == stake_rule.map(|rule| rule.0) && config.genesis_stake_lamports == stake_rule.map(|rule| rule.1), "Snapshot stake activation differs from the local rule");
+    ensure!(config.epoch_slots == genesis.bridge.as_ref().map_or(432_000, |bridge| bridge.epoch_slots), "Snapshot epoch length differs from the local rule");
+    Ok(())
+}
+
 fn load_follow_snapshot(mut snapshot: Value, genesis: &crate::genesis::Genesis, programs: &[crate::execution::GenesisProgram]) -> Result<(Replay, u64, String)> {
     let last = snapshot["consensusSlot"].as_u64().context("snapshot consensusSlot")?;
     ensure!(snapshot["anchor"]["consensusSlot"].as_u64() == Some(last), "snapshot anchor names another cblock");
     let state: crate::execution::ExecutorSnapshot = serde_json::from_value(snapshot["executor"].take())?;
     let start_hash = state.state_hash.clone();
     ensure!(snapshot["anchor"]["stateHash"].as_str() == Some(start_hash.as_str()), "the starting state does not hash to cblock {last}'s state hash");
+    let config = snapshot.get("proposerConfig").filter(|value| !value.is_null()).cloned().map(serde_json::from_value::<crate::protocol::ProposerConfig>).transpose()?;
+    let stake_rule = genesis.bridge.as_ref().map(|bridge| bridge.stake_activation()).transpose()?.flatten();
+    ensure!(stake_rule.is_none() || config.is_some(), "The snapshot is missing its public proposer configuration");
+    if let Some(config) = &config { validate_proposer_config(config, genesis)?; }
     let mut executor = crate::execution::SvmExecutor::new(Vec::<(String, u64)>::new(), programs)?;
     executor.set_placements(genesis.placements.clone());
     if let Some(bridge) = &genesis.bridge {
         executor.set_bridge(bridge.program);
         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
         if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); }
+        if let Some((from_slot, genesis_stake_lamports)) = stake_rule {
+            let identities = config.as_ref().context("Public proposer configuration is missing")?.identities.iter().map(|identity| identity.parse()).collect::<std::result::Result<Vec<_>, _>>()?;
+            executor.set_stake_config(crate::execution::StakeConfig { from_slot, epoch_slots: bridge.epoch_slots, genesis_stake_lamports, identities });
+        }
     }
     executor.load(state)?;
     ensure!(executor.state_hash() == start_hash, "the loaded state does not hash to cblock {last}'s state hash");
-    Ok((Replay { executor, threshold: serde_json::from_value(snapshot["threshold"].take())?, window: None }, last, start_hash))
+    let mut proposers = config.map(crate::protocol::ProposerSchedules::new).transpose()?;
+    if let Some(proposers) = &mut proposers {
+        for (epoch, weights) in executor.stake_schedule_snapshots(&executor.checkpoint())? { proposers.learn(epoch, weights)?; }
+    }
+    Ok((Replay { executor, threshold: serde_json::from_value(snapshot["threshold"].take())?, window: None, proposers }, last, start_hash))
 }
 
 struct Replay {
     executor: crate::execution::SvmExecutor,
     threshold: crate::threshold::ThresholdCache,
     window: Option<u64>,
+    proposers: Option<crate::protocol::ProposerSchedules>,
 }
 
 impl Replay {
@@ -319,6 +368,7 @@ impl Replay {
             payloads.push((q as u8, txs));
         }
         self.executor.activate_native_cutover(s)?;
+        self.executor.prepare_stake_epoch(s)?;
         let mut inclusions = payloads.iter().flat_map(|(q, txs)| txs.iter().map(move |t| (t.header.fee_payer.clone(), *q, 1u64))).collect::<Vec<_>>();
         inclusions.extend(fragments.iter().map(|(q, f)| (f.header.fee_payer.clone(), *q, 1)));
         let mut admitted = self.executor.admit_inclusions(&inclusions, w)?.into_iter();
@@ -547,6 +597,12 @@ pub async fn import(url: &str, store: &str, genesis: &str) -> Result<()> {
         executor.set_bridge(bridge.program);
         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
         if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); }
+        if let Some((from_slot, genesis_stake_lamports)) = bridge.stake_activation()? {
+            let config: crate::protocol::ProposerConfig = serde_json::from_value(snapshot.get("proposerConfig").context("Public proposer configuration is missing")?.clone())?;
+            validate_proposer_config(&config, &genesis)?;
+            let identities = config.identities.iter().map(|identity| identity.parse()).collect::<std::result::Result<Vec<_>, _>>()?;
+            executor.set_stake_config(crate::execution::StakeConfig { from_slot, epoch_slots: bridge.epoch_slots, genesis_stake_lamports, identities });
+        }
     }
     let senders = (0..24).map(|_| Keypair::new()).collect::<Vec<_>>();
     let native = executor.native_supply()?.is_some();
