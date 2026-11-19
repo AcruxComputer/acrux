@@ -14,6 +14,9 @@ import { attestationBatches, pendingFinalityStore } from './transactions.js'
 export const reason = (error: unknown) => error instanceof Error ? `${error.name}: ${error.message.replace(/https?:\/\/\S+/g, '<url>')}` : 'Error'
 const RPC_MS = 10_000
 const CONFIRM_MS = 30_000
+// About one Released bucket's rent and a cblock post: below it a payout cannot land, so its
+// withdrawals are retried each minute and pay within a minute of the relayer being funded.
+const UNFUNDED_LAMPORTS = 10_000_000
 const RETIRED_ACCOUNT_CREATION = 'The previous recipient-account creation transaction is retired. Waiting for its blockhash to expire.'
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -77,9 +80,11 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
     const accounts = await solana.getProgramAccounts(config.program, { commitment, minContextSlot: commitment === 'confirmed' ? solanaConfirmedSlot : solanaFinalizedSlot, filters: [{ memcmp: { offset: 0, bytes: coder.accountDiscriminator(name).toString('base64'), encoding: 'base64' } }] })
     return accounts.map(({ pubkey, account: info }) => ({ address: pubkey, value: decode<T>(name, info) }))
   }
+  let balance = Number.POSITIVE_INFINITY
   async function report(patch: { lastCblock?: bigint; lastHandedEpoch?: bigint; lastRelayedAt?: Date; nextWithdrawalSequence?: bigint } = {}) {
     own()
-    const lamports = exact(await solana.getBalance(signer.publicKey, 'finalized'), 'relayer balance').toString()
+    balance = exact(await solana.getBalance(signer.publicKey, 'finalized'), 'relayer balance')
+    const lamports = balance.toString()
     await db.bridgeRelayerState.upsert({ where: { program: programName }, create: { program: programName, wallet, lamports, ...patch }, update: { wallet, lamports, ...patch } })
   }
   async function proof(params: { consensusSlot: number } | { epoch: number } | { latest: true }) {
@@ -132,7 +137,8 @@ export function createBridgeRelayer(options: { config: BridgeRelayerConfig; sign
     const attempts = unpaid.attempts + 1
     const missing = error instanceof Error && error.message === BRIDGE_RECIPIENT_TOKEN_ACCOUNT_MISSING
     const retired = error instanceof Error && error.message === RETIRED_ACCOUNT_CREATION
-    const nextAttemptAt = new Date(Date.now() + (missing || retired ? 1 : attempts === 1 ? 2 : attempts === 2 ? 5 : 60) * 60_000)
+    const unfunded = balance < UNFUNDED_LAMPORTS
+    const nextAttemptAt = new Date(Date.now() + (missing || retired || unfunded ? 1 : attempts === 1 ? 2 : attempts === 2 ? 5 : 60) * 60_000)
     const failure = missing ? BRIDGE_RECIPIENT_TOKEN_ACCOUNT_MISSING : reason(error)
     await db.bridgeUnpaidWithdrawal.update({ where: unpaidKey(sequence), data: { reason: failure, attempts, nextAttemptAt } })
     log({ event: 'bridge_release_deferred', sequence, cblock: proof.consensusSlot, epoch: Math.floor(proof.consensusSlot * 4 / epochSlots), attempts, nextAttemptAt: nextAttemptAt.toISOString(), error: failure })
