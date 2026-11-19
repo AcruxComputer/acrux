@@ -1,12 +1,13 @@
 import { z } from 'zod'
 import { createHttp, type HttpOptions, type CallOptions } from './http.js'
-import { ApiError, Health, Hubs, Hub, Member, RegistryConfig, SchedulePreview, Facts, SpecMap, Transaction, FaucetRequest, FaucetGrant, FaucetStatus, LabScenario, LabRunRequest, LabRun, LabRuns, PageQuery, Buyback, ReplayRange, ReplaySlotRecord, Bridge, BridgeTransfers } from './schemas.js'
+import { ApiError, Health, Hubs, Hub, Member, RegistryConfig, SchedulePreview, Facts, SpecMap, Transaction, FaucetRequest, FaucetGrant, FaucetStatus, LabScenario, LabRunRequest, LabRun, LabRuns, PageQuery, Buyback, Burn, ReplayRange, ReplaySlotRecord, Bridge, BridgeTransfers } from './schemas.js'
 import { LabReplay } from './events.js'
 export function createClient(baseUrl: string, options: Omit<HttpOptions, 'apiError'> = {}) {
   const http = createHttp(baseUrl, { ...options, apiError: ApiError })
   const path = encodeURIComponent
   return {
     health: (call?: CallOptions) => http.get('/health', Health, call),
+    burn: (query: z.input<typeof PageQuery> = {}, call?: CallOptions) => http.get('/v1/burn', Burn, { ...call, query }),
     buyback: (call?: CallOptions) => http.get('/v1/buyback', Buyback, call),
     bridge: (call?: CallOptions) => http.get('/v1/bridge', Bridge, call),
     bridgeTransfers: (query: { address?: string; kind?: 'deposit' | 'withdrawal'; cursor?: string; limit?: number } = {}, call?: CallOptions) => http.get('/v1/bridge/transfers', BridgeTransfers, { ...call, query }),

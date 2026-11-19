@@ -235,8 +235,26 @@ export const Buyback = z.strictObject({
 export type BuybackAction = z.infer<typeof BuybackAction>
 export type BuybackRow = z.infer<typeof BuybackRow>
 export type Buyback = z.infer<typeof Buyback>
+/** A finalized Solana supply observation; sampledAt is when the API read it. */
+export const BurnSupply = z.strictObject({ amount: U64, decimals: z.number().int().min(0).max(255), sampledAt: Timestamp })
+export const BurnEpoch = z.strictObject({
+  epoch: Count, firstSlot: Count, lastSlot: Count,
+  startedAt: Timestamp.nullable(), endedAt: Timestamp.nullable(), closed: z.boolean(),
+  /** Null means this node has no complete historical observation. */
+  baseFeeBurnedLamports: U64.nullable(), feeBurnAmountBaseUnits: U64.nullable(), remainderLamports: U64.nullable(),
+  solanaBurn: z.strictObject({ signature: Signature.nullable(), state: z.enum(['not_yet_due', 'pending', 'burned']) }),
+  buybackBurnBaseUnits: BaseUnits.nullable(), mintSupplyAtEnd: BurnSupply.nullable(),
+})
+export const Burn = z.strictObject({
+  mint: Address.nullable(), mintSupply: BurnSupply.nullable(),
+  totals: z.strictObject({ baseFeeBurnBaseUnits: BaseUnits, buybackBurnBaseUnits: BaseUnits }),
+  epochs: page(BurnEpoch),
+})
+export type BurnSupply = z.infer<typeof BurnSupply>
+export type BurnEpoch = z.infer<typeof BurnEpoch>
+export type Burn = z.infer<typeof Burn>
 export const Health = z.strictObject({ status: z.enum(['fixture', 'waiting', 'ready']), contractVersion: z.string(), missingConfiguration: z.array(z.string()) })
-export const SCENARIOS = ['normal', 'empty', 'waiting', 'pending', 'executed', 'finalized', 'skipped', 'sent', 'partly_included', 'failed', 'expired', 'unknown', 'active', 'inactive', 'pending_only', 'queued', 'running', 'done', 'failed_to_start', 'limit_reached', 'unfunded', 'stalled', 'unavailable', 'code_taken', 'crash', 'disagreeing_vectors', 'missing_attestation', 'equivocation', 'majority_lost'] as const
+export const SCENARIOS = ['normal', 'empty', 'waiting', 'pending', 'executed', 'finalized', 'skipped', 'sent', 'partly_included', 'failed', 'expired', 'unknown', 'active', 'inactive', 'pending_only', 'queued', 'running', 'done', 'failed_to_start', 'limit_reached', 'unfunded', 'stalled', 'unavailable', 'code_taken', 'crash', 'disagreeing_vectors', 'missing_attestation', 'equivocation', 'majority_lost', 'burn-no-epochs', 'burn-pending', 'burn-burned', 'burn-running'] as const
 // Inferred wire types: schema and type share a name without separate interfaces.
 export type Slice = z.infer<typeof Slice>
 export type CommitmentArrival = z.infer<typeof CommitmentArrival>

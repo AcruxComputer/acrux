@@ -44,6 +44,47 @@ Methods with no parameters take `{}`. Every response and event parses under the 
 
 `?fixture=<name>` (or `X-Fixture`) on the API in `MODE=fixture`, and the exports of `@acrux/contract/fixtures`, give every screen state its fixture: registry, slot, transaction, send, lab and connectivity states.
 
+## Burn read model
+
+`GET /v1/burn?limit=24&cursor=<epoch>` publishes the Token page's ACRUX supply and
+burn history. `createClient(...).burn()` parses its additive `Burn` contract.
+Epochs run newest first from the native cut-over; `epochs.page.nextCursor` is an
+exclusive epoch number, not an offset. Before the cut-over, the list is empty.
+
+- `mintSupply` is Solana's finalized `getTokenSupply` amount, decimals and actual
+  `sampledAt`. A single in-flight request and a 60-second cache share the API's
+  existing paced Solana RPC budget.
+- `totals.baseFeeBurnBaseUnits` counts the relayer journal's finalized Solana
+  burns; `totals.buybackBurnBaseUnits` is the creator-fee burn total from
+  `/v1/buyback`. Both are decimal integer strings in the mint's base units.
+- Each epoch gives its Acrux slot interval, observed UTC boundaries, raw burned
+  base fees in native lamports, the certified `FeeBurn` amount in token base
+  units and its sub-unit remainder. `solanaBurn.state` is `not_yet_due`, `pending`
+  or `burned`; its signature comes from the relayer's signed transaction journal.
+- `buybackBurnBaseUnits` sums confirmed buyback `burn` rows with `createdAt` in
+  the epoch's half-open UTC interval. A running epoch has no end time or end
+  supply sample. Unknown historical intervals have a null buyback sum.
+- `mintSupplyAtEnd` is the finalized supply first observed by this API after the
+  epoch closes, with its actual observation time. It is saved once in Postgres
+  and stays unchanged as live supply moves. A late first read is an observation
+  made then, not a reconstructed historical supply quote.
+
+The gateway's additive `getFeeBurns { cursor?, limit? }` reads finalized
+accounting observations committed beside its hashed execution checkpoint in
+`state.redb`. It does not change consensus or follower re-execution. The prior
+node retained only the current fee counter and last closure, not full raw sums
+or UTC boundaries: unavailable historical fields are `null`, never fabricated
+zeroes. Complete observations are retained from this version onward; a closed
+archived proof can also recover its certified rounded amount.
+
+Use the existing `ACRUX_MINT`, `LAUNCH_WALLET`, `BRIDGE_PROGRAM_ID`,
+`GATEWAY_RPC_URL`, `SOLANA_RPC_URL` and `DATABASE_URL`; no new environment setting
+is needed. Apply the `burn_supply_samples` migration before starting the API
+(`npm.cmd run db:migrate` in `api/`). An unset mint gives null supply and an empty
+list. The contract's `burnNoEpochs`, `burnPending`, `burnBurned` and `burnRunning`
+exports, also selected with `fixture=burn-no-epochs`, `burn-pending`,
+`burn-burned` and `burn-running`, cover the Token page's states.
+
 ## Event catalogue
 
 Every event is `{ version: 1, sequence, streamId, type, slot, anchor, atUs, data, node? }`. `sequence` rises within a stream; a new `streamId` invalidates a cursor. `node` is the validator identity that observed the event. `slot` is null only for control and window messages. Each slot has one UTC `wallTime`. Amounts and stake are decimal strings, `priorityFeePerCu` is micro-lamports per CU, hub ECEF is integer metres in WGS84. Proposer and track indices start at 1, slice and fragment indices and merged positions at 0. A null entry of `pi` is the paper's bottom symbol, `agreedSet` is P.

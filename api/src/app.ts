@@ -10,7 +10,7 @@ import {
 import {
   facts, faucetGrant, faucetStatus, fixtureErrors, hubs, labRuns, labRunsByState,
   makeFixtureTransaction, makeLabReplay, makeSchedulePreview, registryConfig, scenarios,
-  specMap, transactionsByState, replayRange, replaySlot, bridgeFixture, bridgeWaitingFixture, bridgeTransfersFixture,
+  specMap, transactionsByState, replayRange, replaySlot, burnNoEpochs, burnPending, burnBurned, burnRunning, bridgeFixture, bridgeWaitingFixture, bridgeTransfersFixture,
 } from '@acrux/contract/fixtures'
 import { createApi } from './engines/server/app.js'
 import { emptyReplayRange } from './replay.js'
@@ -54,6 +54,14 @@ export function createFixtureApi() {
     if (!settings.mint) return c.json(emptyBuyback(settings))
     if (!database) fail('CONFIGURATION_REQUIRED', 'Configure DATABASE_URL before reading buyback history.', { stage: 'read' })
     return c.json(await readBuyback(database.db, settings))
+  })
+  app.get('/v1/burn', c => {
+    const scenario = c.get('scenario'), query = readQuery(c, PageQuery)
+    const source = scenario === 'empty' || scenario === 'burn-no-epochs' ? burnNoEpochs
+      : scenario === 'burn-pending' ? burnPending : scenario === 'burn-burned' ? burnBurned : burnRunning
+    const rows = source.epochs.items.filter(row => query.cursor === undefined || row.epoch < Number(query.cursor))
+    const items = rows.slice(0, query.limit), hasMore = rows.length > items.length
+    return c.json({ ...source, epochs: { ...source.epochs, items, page: { nextCursor: hasMore ? String(items.at(-1)!.epoch) : null, hasMore } } })
   })
   app.get('/v1/bridge', c => c.json(c.get('scenario') === 'empty' ? bridgeWaitingFixture : bridgeFixture))
   app.get('/v1/bridge/transfers', c => {

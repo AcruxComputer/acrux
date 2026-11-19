@@ -2,7 +2,7 @@ import { FAUCET_RETIRED_MESSAGE } from './bridge.js'
 import type { z } from 'zod'
 import { toBase58, toBase64 } from './encoding.js'
 import { PROTOCOL_PARAMETERS, errors } from './schemas.js'
-import type { Balance, Bridge, BridgeTransfer, DemoPool, Evidence, Facts, FaucetPolicy, FaucetStatus, FaucetGrant, LabScenario, RegistryConfig, SchedulePreview, SpecMap } from './schemas.js'
+import type { Balance, Bridge, BridgeTransfer, Burn, BurnEpoch, DemoPool, Evidence, Facts, FaucetPolicy, FaucetStatus, FaucetGrant, LabScenario, RegistryConfig, SchedulePreview, SpecMap } from './schemas.js'
 import type { Cblock, Certificate, ExecutionSchedule, Hub, LabRun, Member, MergedTransaction, NetSnapshot, Parameters, Proposer, Slot, Transaction, Window } from './schemas.js'
 import type { ApiErrorBody } from './errors.js'
 import type { LabReplay, ProtocolEvent } from './events.js'
@@ -506,3 +506,33 @@ export const bridgeTransfersFixture: z.infer<typeof BridgeTransfer>[] = [
   { kind: 'withdrawal', sequence: 0, status: 'released', solanaMint: bridgeSolanaMint, acruxMint: bridgeAcruxMint, amount: '1000000000', from: 'BanDYHQEj35pryGMkXM8Ka1WobTdZavgPG97fcgi9pay', to: 'B7N7vHRUyM6dFb34fFtYqEucL1cPu6gi4UWDfRfYGSST', solanaSlot: null, acruxSlot: 672, cblock: 168, releaseAccount: '9pz8cL3ALbkqF4QHBRewTWMSWX3PuGs4uPnNNSZvMETD', releaseError: null },
   { kind: 'deposit', sequence: 0, status: 'credited', solanaMint: bridgeSolanaMint, acruxMint: bridgeAcruxMint, amount: '2500000000', from: 'G9Hx9dH8tNCKdL1FogM2Qsy493Hp6SrG6re1hxkq5aD6', to: 'BanDYHQEj35pryGMkXM8Ka1WobTdZavgPG97fcgi9pay', solanaSlot: 43, acruxSlot: null, cblock: null, releaseAccount: null, releaseError: null },
 ]
+
+// Token-page states use six-hour bridge epochs and finalized Solana supply observations.
+const burnSupply = { amount: '999999000000000', decimals: 6, sampledAt: '2026-11-18T12:00:05.000Z' }
+const burnedEpoch: BurnEpoch = {
+  epoch: 42, firstSlot: 18144000, lastSlot: 18575999,
+  startedAt: '2026-11-18T00:00:00.000Z', endedAt: '2026-11-18T06:00:00.000Z', closed: true,
+  baseFeeBurnedLamports: '1000500', feeBurnAmountBaseUnits: '1000', remainderLamports: '500',
+  solanaBurn: { signature: fixtureSignature('epoch-42-burn'), state: 'burned' },
+  buybackBurnBaseUnits: '250000000', mintSupplyAtEnd: { ...burnSupply, amount: '999999500000000', sampledAt: '2026-11-18T06:00:04.000Z' },
+}
+const pendingEpoch: BurnEpoch = {
+  ...burnedEpoch, epoch: 43, firstSlot: 18576000, lastSlot: 19007999,
+  startedAt: '2026-11-18T06:00:00.000Z', endedAt: '2026-11-18T12:00:00.000Z',
+  baseFeeBurnedLamports: '2000250', feeBurnAmountBaseUnits: '2000', remainderLamports: '750',
+  solanaBurn: { signature: fixtureSignature('epoch-43-pending'), state: 'pending' },
+  buybackBurnBaseUnits: '500000000', mintSupplyAtEnd: burnSupply,
+}
+const runningEpoch: BurnEpoch = {
+  ...pendingEpoch, epoch: 44, firstSlot: 19008000, lastSlot: 19439999,
+  startedAt: '2026-11-18T12:00:00.000Z', endedAt: null, closed: false,
+  baseFeeBurnedLamports: '50000', feeBurnAmountBaseUnits: null, remainderLamports: null,
+  solanaBurn: { signature: null, state: 'not_yet_due' }, buybackBurnBaseUnits: '0', mintSupplyAtEnd: null,
+}
+export const burnNoEpochs: Burn = {
+  mint: bridgeSolanaMint, mintSupply: burnSupply, totals: { baseFeeBurnBaseUnits: '0', buybackBurnBaseUnits: '0' },
+  epochs: { items: [], page: { nextCursor: null, hasMore: false }, asOf: burnSupply.sampledAt },
+}
+export const burnBurned: Burn = { ...burnNoEpochs, totals: { baseFeeBurnBaseUnits: '1000', buybackBurnBaseUnits: '250000000' }, epochs: { ...burnNoEpochs.epochs, items: [burnedEpoch] } }
+export const burnPending: Burn = { ...burnBurned, totals: { baseFeeBurnBaseUnits: '1000', buybackBurnBaseUnits: '750000000' }, epochs: { ...burnNoEpochs.epochs, items: [pendingEpoch, burnedEpoch] } }
+export const burnRunning: Burn = { ...burnPending, epochs: { ...burnNoEpochs.epochs, items: [runningEpoch, pendingEpoch, burnedEpoch] } }

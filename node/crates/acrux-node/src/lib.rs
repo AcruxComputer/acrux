@@ -1,4 +1,5 @@
 pub mod bridge;
+pub mod fee_burns;
 pub mod facts;
 pub mod cli;
 pub mod gateway;

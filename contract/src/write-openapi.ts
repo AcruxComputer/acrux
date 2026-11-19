@@ -5,6 +5,7 @@ import { ProtocolEvent, LabReplay, StreamCommand } from './events.js'
 import { rpcMethods, RpcRequest, RpcFailure } from './rpc.js'
 import { openApiDocument, type Operation } from './openapi.js'
 const operations: Operation[] = [
+  { method:'get', path:'/v1/burn', operationId:'burn', summary:'ACRUX supply and epoch burns, newest first; cursor is an exclusive epoch number', response:'Burn', query:s.PageQuery },
   { method:'get', path:'/v1/bridge', operationId:'bridge',summary:'The Solana bridge: its program, vaults, totals and the light client\'s newest certified cblock',response:'Bridge' },
   { method:'get', path:'/v1/bridge/transfers', operationId:'bridgeTransfers',summary:'Deposits and withdrawals, newest first; address matches either end',response:'BridgeTransfers',query:s.BridgeTransfersQuery },
   { method:'get', path:'/v1/buyback', operationId:'buyback',summary:'Creator fee buyback totals and recent confirmed actions', response:'Buyback' },

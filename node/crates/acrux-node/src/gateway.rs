@@ -118,6 +118,7 @@ pub struct GatewayState {
     pub bridge_program: Option<String>,
     pub bridge_epoch_slots: Option<u64>,
     pub fee_burn_from_slot: Option<u64>,
+    pub fee_burns: Option<crate::fee_burns::FeeBurnStore>,
     /// Volatile acknowledgement of the relayer's durable Postgres save cursor.
     pub bridge_saved_cursor: Option<u64>,
     pub parameters: Value,
@@ -157,6 +158,7 @@ impl GatewayState {
             bridge_program: None,
             bridge_epoch_slots: None,
             fee_burn_from_slot: None,
+            fee_burns: None,
             bridge_saved_cursor: None,
             counters: json!({"slots":0,"finalizedCblocks":0,"skips":0,"averageCommitSpreadUs":0}),
             counter_base: (0, 0),
@@ -393,6 +395,7 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
                 }
             }
         },
+        "getFeeBurns" => fee_burn_page(&state,&params).await,
         "getCblockProof" => {
             let state = state.read().await;
             let selectors = [params.get("consensusSlot"), params.get("epoch"), params.get("latest"), params.get("feeBurnEpoch")].iter().filter(|selector| selector.is_some()).count();
@@ -659,6 +662,51 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
 }
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+async fn fee_burn_page(state: &SharedGateway, params: &Value) -> std::result::Result<Value, (&'static str, &'static str)> {
+    let cursor = match params.get("cursor") {
+        None => None,
+        Some(Value::String(cursor)) if !cursor.is_empty() && cursor.len() <= 16
+            && cursor.bytes().all(|b|b.is_ascii_digit()) && (cursor == "0" || !cursor.starts_with('0')) => {
+            Some(cursor.parse::<u64>().ok().filter(|n|*n <= MAX_SAFE_INTEGER).ok_or(("INVALID_INPUT","cursor must be an epoch's canonical decimal string."))?)
+        },
+        _ => return Err(("INVALID_INPUT","cursor must be an epoch's canonical decimal string.")),
+    };
+    let limit = match params.get("limit") {
+        None => 20,
+        Some(value) => safe_integer(value).filter(|limit|(1..=100).contains(limit)).ok_or(("INVALID_INPUT","limit must be an integer between 1 and 100."))?,
+    };
+    if params.as_object().unwrap().keys().any(|key|key != "cursor" && key != "limit") {
+        return Err(("INVALID_INPUT","getFeeBurns takes only cursor and limit."));
+    }
+    let (burns,archive,head,program,epoch_slots) = {
+        let gateway = state.read().await;
+        (gateway.fee_burns.clone(),gateway.bridge_archive.clone(),gateway.finalized_cblock,
+            gateway.bridge_program.clone(),gateway.bridge_epoch_slots.unwrap_or(432_000))
+    };
+    let Some(burns) = burns else {
+        return Ok(json!({"program":program,"mint":null,"nativeFromSlot":null,"epochSlots":epoch_slots,
+            "items":[],"nextCursor":null,"feeBurnedBaseUnits":"0"}));
+    };
+    tokio::task::spawn_blocking(move || -> Result<Value> {
+        use base64::{engine::general_purpose::STANDARD,Engine};
+        burns.page(head,cursor,limit,|epoch| {
+            let end = (epoch+1).checked_mul(burns.config.epoch_slots).ok_or_else(||anyhow::anyhow!("Burn epoch overflow"))? / 4 - 1;
+            let proof = archive.as_ref().map(|archive|archive.get(end)).transpose()?.flatten();
+            let Some(proof) = proof else { return Ok(None) };
+            let entries = proof["outbox"].as_array().ok_or_else(||anyhow::anyhow!("Archived proof is missing its outbox"))?;
+            for entry in entries {
+                let bytes = STANDARD.decode(entry.as_str().ok_or_else(||anyhow::anyhow!("Invalid archived outbox entry"))?)?;
+                if let crate::bridge::OutboxEntry::FeeBurn { epoch:burn_epoch,amount } = bincode::deserialize(&bytes)? {
+                    anyhow::ensure!(epoch == burn_epoch,"Archived fee burn epoch differs");
+                    return Ok(Some(amount));
+                }
+            }
+            Ok(Some(0))
+        })
+    }).await.map_err(|_|("INTERNAL_ERROR","The fee burn read failed."))?
+        .map_err(|_|("INTERNAL_ERROR","The fee burn history could not be read."))
+}
+
 fn safe_integer(value: &Value) -> Option<u64> {
     value.as_u64().filter(|value| *value <= MAX_SAFE_INTEGER)
 }

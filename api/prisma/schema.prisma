@@ -265,3 +265,16 @@ model BridgeSavedCblockProof {
   @@id([program, cblock])
   @@map("bridge_saved_cblock_proofs")
 }
+
+/// The first observed Solana supply quote for a closed Acrux epoch; never overwritten.
+model BurnSupplySample {
+  program   String   @db.VarChar(44)
+  mint      String   @db.VarChar(44)
+  epoch     BigInt
+  amount    Decimal  @db.Decimal(20, 0)
+  decimals  Int
+  sampledAt DateTime @map("sampled_at") @db.Timestamptz(3)
+
+  @@id([program, mint, epoch])
+  @@map("burn_supply_samples")
+}

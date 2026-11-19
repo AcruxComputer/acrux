@@ -49,6 +49,8 @@ struct LocalSlot {
     executed: bool,
     agreed: Option<Vec<usize>>,
     state_hash: Option<String>,
+    /// Node zero's observed execution fees/time, published only with a durable checkpoint.
+    burn: Option<crate::fee_burns::SlotBurn>,
 }
 impl LocalSlot {
     /// Retained block allocations, including shred/transaction structs in vectors. Map nodes,
@@ -382,6 +384,7 @@ pub struct Network {
     solana_sent: BTreeMap<String, Value>,
     /// Validator 0's actor writes each finalized state through this, when the net persists.
     state_writer: Option<std::sync::mpsc::Sender<crate::state::Pending>>,
+    burn_observed_from: u64,
     counter_base: (u64, u64),
     genesis_hash: String,
     /// The kept transactions, and validator 0's actor's writer to them: from `keep_from` on, the
@@ -659,6 +662,14 @@ impl Network {
             Some(store) => store.load()?,
             None => None,
         };
+        if let (Some(store),Some(bridge)) = (&state_store,genesis.as_ref().and_then(|g|g.bridge.as_ref())) {
+            if let Some(native) = bridge.native_cutover()? {
+                gateway.write().await.fee_burns = Some(store.fee_burns(crate::fee_burns::Config {
+                    program:bridge.program.to_string(),mint:native.solana_mint.to_string(),native_from_slot:native.slot,
+                    epoch_slots:bridge.epoch_slots,scale:native.lamports_per_base_unit,fee_burn_from_slot:bridge.fee_burn_from_slot,
+                }));
+            }
+        }
         let bridge_proof_path = Path::new(&config.store_path).join("bridge-proofs.redb");
         let bridge_proofs = genesis.as_ref().and_then(|g| g.bridge.as_ref())
             .map(|bridge| crate::bridge::ProofArchive::open(config.persist.then_some(bridge_proof_path.as_path()), bridge.epoch_slots, saved.as_ref().map(|state| state.meta.cblock)))
@@ -832,6 +843,9 @@ impl Network {
             .map(|k| k.pubkey().to_string())
             .chain(genesis.iter().map(|g| g.faucet.pubkey().to_string()))
             .collect::<BTreeSet<_>>();
+        if let (Some(block),Some(burns)) = (resumed,gateway.read().await.fee_burns.clone()) {
+            burns.observe_saved(block.slot,nodes[0].executor.as_ref().unwrap().fee_burn_snapshot_at(&nodes[0].genesis)?)?;
+        }
         let state_writer = match state_store {
             Some(store) => Some(crate::state::spawn_writer(store, saved.as_ref().map(|_| nodes[0].genesis.clone()), resumed.map_or(0, |block| block.slot))?),
             None => None,
@@ -936,6 +950,7 @@ impl Network {
             solana: Default::default(),
             solana_sent: BTreeMap::new(),
             state_writer,
+            burn_observed_from: resumed.map_or(0,|block|block.slot * 4 + 4),
             counter_base,
             genesis_hash,
             kept,
@@ -1282,6 +1297,7 @@ impl Network {
                     solana: Default::default(),
                     solana_sent: BTreeMap::new(),
                     state_writer: if id == 0 { self.state_writer.take() } else { None },
+                    burn_observed_from: self.burn_observed_from,
                     counter_base: self.counter_base,
                     genesis_hash: self.genesis_hash.clone(),
                     kept: self.kept.clone(),
@@ -3073,6 +3089,14 @@ impl Network {
                 local.executed = true;
                 local.agreed = Some(accepted.clone());
                 local.state_hash = Some(execution.state_hash.clone());
+                if id == 0 {
+                    local.burn = Some(crate::fee_burns::SlotBurn { slot:s,
+                        burned_lamports:execution.results.iter().try_fold(0u64,|sum,result| -> Result<u64> {
+                            let burned = u64::try_from(u128::from(result.base_fee) * u128::from(crate::execution::Fees::default().base_burn_bps) / 10_000)?;
+                            sum.checked_add(burned).context("Slot burn observation overflow")
+                        })?,
+                        at_ms:self.wall + base.saturating_duration_since(self.origin).as_millis() as u64 });
+                }
             }
             self.nodes[id].last_executed = Some(s);
             {
@@ -3846,7 +3870,23 @@ impl Network {
             genesis_hash: self.genesis_hash.clone(),
             saved_at_ms: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
         };
-        writer.send(crate::state::Pending { checkpoint: checkpoint.clone(), meta }).map_err(|_| anyhow::anyhow!("State checkpoint writer stopped"))?;
+        let mut burns = vec![];
+        if let Some(bridge) = self.genesis.as_ref().and_then(|g|g.bridge.as_ref()) {
+            if let Some(native) = bridge.native_cutover()?.filter(|native|cblock * 4 + 3 >= native.slot) {
+                let after = [self.proof_prepared_through,native.slot.checked_div(4).and_then(|c|c.checked_sub(1))].into_iter().flatten().max();
+                let observations = self.bridge_ancestors(0,cblock,after)?.into_iter().map(|c| -> Result<crate::fee_burns::Observation> {
+                    let counter = node.checkpoints.get(&c).map(|checkpoint|node.executor.as_ref().unwrap().fee_burn_snapshot_at(checkpoint)).transpose()?.flatten();
+                    let slots = (c * 4..c * 4 + 4).filter_map(|slot|node.slots.get(&slot).and_then(|local|local.burn.clone())).collect::<Vec<_>>();
+                    let complete = slots.len() == 4;
+                    Ok(crate::fee_burns::Observation { cblock:c,slots,counter,complete })
+                }).collect::<Result<Vec<_>>>()?;
+                burns.push(crate::fee_burns::Batch { config:crate::fee_burns::Config {
+                    program:bridge.program.to_string(),mint:native.solana_mint.to_string(),native_from_slot:native.slot,
+                    epoch_slots:bridge.epoch_slots,scale:native.lamports_per_base_unit,fee_burn_from_slot:bridge.fee_burn_from_slot,
+                },from_slot:self.burn_observed_from,observations });
+            }
+        }
+        writer.send(crate::state::Pending { checkpoint: checkpoint.clone(), meta,burns }).map_err(|_| anyhow::anyhow!("State checkpoint writer stopped"))?;
         Ok(())
     }
     /// Hands the transactions people sent in the finalized chain through `cblock` to the kept

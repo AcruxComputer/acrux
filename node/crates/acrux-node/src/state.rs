@@ -8,6 +8,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// The newest cblock whose state is committed to disk. Nothing reports a cblock final before it is
 /// here. `u64::MAX` while the net keeps no state (a Fault Lab sandbox): every cblock is reported at once.
@@ -54,7 +55,7 @@ pub struct Saved {
     pub state: ExecutorSnapshot,
 }
 
-pub struct StateStore(Database);
+pub struct StateStore(Arc<Database>);
 
 impl StateStore {
     pub fn open(path: &Path) -> Result<Self> {
@@ -65,9 +66,14 @@ impl StateStore {
             w.open_table(ACCOUNTS)?;
             w.open_table(EXECUTED)?;
             w.open_table(META)?;
+            crate::fee_burns::create_tables(&w)?;
         }
         w.commit()?;
-        Ok(Self(db))
+        Ok(Self(Arc::new(db)))
+    }
+
+    pub fn fee_burns(&self, config: crate::fee_burns::Config) -> crate::fee_burns::FeeBurnStore {
+        crate::fee_burns::FeeBurnStore { db:self.0.clone(),config }
     }
 
     pub fn load(&self) -> Result<Option<Saved>> {
@@ -92,6 +98,10 @@ impl StateStore {
 
     /// Writes `checkpoint` over `earlier`, the state this store holds, in one transaction.
     pub fn write(&self, checkpoint: &ExecutorCheckpoint, earlier: Option<&ExecutorCheckpoint>, meta: &Meta) -> Result<()> {
+        self.write_observed(checkpoint,earlier,meta,&[])
+    }
+
+    fn write_observed(&self, checkpoint: &ExecutorCheckpoint, earlier: Option<&ExecutorCheckpoint>, meta: &Meta, burns: &[crate::fee_burns::Batch]) -> Result<()> {
         let (accounts, gone) = checkpoint.account_changes(earlier);
         let (executed, expired) = checkpoint.executed_changes(earlier);
         let w = self.0.begin_write()?;
@@ -111,6 +121,7 @@ impl StateStore {
                 table.insert(id.as_str(), slot)?;
             }
             w.open_table(META)?.insert("state", serde_json::to_vec(meta)?.as_slice())?;
+            crate::fee_burns::write(&w,burns)?;
         }
         w.commit()?;
         Ok(())
@@ -120,6 +131,7 @@ impl StateStore {
 pub struct Pending {
     pub checkpoint: ExecutorCheckpoint,
     pub meta: Meta,
+    pub burns: Vec<crate::fee_burns::Batch>,
 }
 
 /// The writer thread: takes the newest finalized state queued and writes what changed since the
@@ -144,14 +156,16 @@ pub fn spawn_writer(store: StateStore, mut written: Option<ExecutorCheckpoint>, 
                 },
             };
             while let Ok(newer) = receiver.try_recv() {
-                pending = newer;
+                let mut burns = std::mem::take(&mut pending.burns);
+                burns.extend(newer.burns);
+                pending = Pending { checkpoint:newer.checkpoint,meta:newer.meta,burns };
             }
             if let Some(delay) = delay {
                 std::thread::sleep(delay);
             }
             let result = match refuse_until {
                 Some(until) if std::time::Instant::now() < until => Err(anyhow::anyhow!("the disk refused the write (ACRUX_STATE_WRITE_FAIL_MS)")),
-                _ => store.write(&pending.checkpoint, written.as_ref(), &pending.meta),
+                _ => store.write_observed(&pending.checkpoint, written.as_ref(), &pending.meta, &pending.burns),
             };
             match result {
                 Ok(()) => {

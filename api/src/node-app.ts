@@ -20,6 +20,7 @@ import { NodeLab } from './node-lab.js'
 import { RegistryIndexer, acruxStake, hubView, memberView, regionOf, solanaStake, type Chain } from './registry.js'
 import { schedulePreview } from './schedule.js'
 import { readBuyback } from './buyback/read.js'
+import { createBurnReader, mountBurnRoutes, readNodeFeeBurns } from './burn.js'
 import { BridgeReader, readBridgeRelayer, readBridgeTransfers } from './bridge.js'
 import { readReplayRange } from './replay.js'
 /** `?from=&to=`: the totals of one slot range, an epoch say. */
@@ -86,6 +87,8 @@ export function createNodeApi() {
   })
   app.route('/v1/solana-rpc', rpcRelay({ rpc: solanaRelay, methods: SOLANA_RELAY_METHODS, readsPerMinute: 300, writesPerMinute: 20 }))
   app.get('/v1/buyback', async c => c.json(await readBuyback(db, { mint: env.ACRUX_MINT, wallet: env.LAUNCH_WALLET })))
+  mountBurnRoutes(app, createBurnReader({ db, gateway: query => readNodeFeeBurns(env.GATEWAY_RPC_URL, query), solanaRpc: solanaRelay,
+    mint: env.ACRUX_MINT, wallet: env.LAUNCH_WALLET, program: env.BRIDGE_PROGRAM_ID }))
   // The bridge, read from both chains.
   const bridge = new BridgeReader(env.BRIDGE_PROGRAM_ID || undefined, env.BRIDGE_FROM_SLOT === '' ? null : env.BRIDGE_FROM_SLOT, env.SOLANA_RPC_URL, env.GATEWAY_RPC_URL, env.BRIDGE_POLL_SECONDS * 1000)
   bridge.start()

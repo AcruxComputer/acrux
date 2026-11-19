@@ -220,6 +220,17 @@ pub struct EpochFeeBurn {
     pub amount: u64,
 }
 
+/// A read-only view of the fee-burn counter committed by a particular cblock.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FeeBurnSnapshot {
+    pub epoch: u64,
+    pub raw_burned_lamports: u64,
+    pub epoch_burned_lamports: u64,
+    pub carried_lamports: u64,
+    pub last_closed_epoch: u64,
+    pub last_closed_amount: u64,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct FeeBurnState {
     from_slot: u64,
@@ -1058,6 +1069,16 @@ impl SvmExecutor {
         let state = self.decode_fee_burn_state(account)?;
         let gate = checkpoint.accounts.get(&bridge_native(&bridge)).context("Fee burn checkpoint is missing native ACRUX")?;
         self.fee_burn_entry(cblock,&state,gate)
+    }
+
+    pub fn fee_burn_snapshot_at(&self, checkpoint: &ExecutorCheckpoint) -> Result<Option<FeeBurnSnapshot>> {
+        let Some(bridge) = self.bridge else { return Ok(None) };
+        let Some(account) = checkpoint.accounts.get(&bridge_fee_burn(&bridge)) else { return Ok(None) };
+        if native_wallet(account) { return Ok(None) }
+        let state = self.decode_fee_burn_state(account)?;
+        Ok(Some(FeeBurnSnapshot { epoch:state.epoch,raw_burned_lamports:state.raw_burned_lamports,
+            epoch_burned_lamports:state.epoch_burned_lamports,carried_lamports:state.carried_lamports,
+            last_closed_epoch:state.last_closed_epoch,last_closed_amount:state.last_closed_amount }))
     }
 
     fn fee_burn_entry(&self, cblock: u64, state: &FeeBurnState, gate: &Account) -> Result<Option<EpochFeeBurn>> {

@@ -1,9 +1,17 @@
 import { z } from 'zod'
 import { ApiError, Balance, Count, Counters, DemoPool, Facts, FragmentSubmission, NetSnapshot, PlainSubmission, Quote, QuoteRequest, Slot, Submission, Transaction, TxId, Window, Address } from './schemas.js'
 import { LabReplay } from './events.js'
-import { Signature } from './primitives.js'
+import { Signature, U64, PageQuery } from './primitives.js'
 const empty = z.strictObject({})
 export const rpcMethods = {
+  /** Bridge epochs from the native cut-over. Times are Unix milliseconds; cursor is an exclusive epoch. */
+  getFeeBurns: { params: PageQuery, result: z.strictObject({
+    program: Address.nullable(), mint: Address.nullable(), nativeFromSlot: Count.nullable(), epochSlots: Count.min(1),
+    items: z.array(z.strictObject({
+      epoch: Count, firstSlot: Count, lastSlot: Count, startedAt: Count.nullable(), endedAt: Count.nullable(), closed: z.boolean(),
+      baseFeeBurnedLamports: U64.nullable(), feeBurnAmountBaseUnits: U64.nullable(), remainderLamports: U64.nullable(),
+    })), nextCursor: z.string().regex(/^[0-9]+$/).nullable(), feeBurnedBaseUnits: U64,
+  }) },
   getSnapshot: { params: empty, result: NetSnapshot },
   getSlot: { params: z.strictObject({ slot: Count }), result: Slot },
   getRecentSlots: { params: z.strictObject({ limit: Count.min(1).max(64).default(64) }), result: z.array(Slot) },
