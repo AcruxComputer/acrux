@@ -597,7 +597,7 @@ impl Network {
                         reserve_lamports: config.reserve,
                         inclusion_lamports: config.inclusion_fee,
                         base_fee_per_signature: config.base_fee,
-                        base_burn_bps: 5000,
+                        base_burn_bps: crate::execution::Fees::default().base_burn_bps,
                     })?;
                     executor.set_track_capacity(config.track_capacity_cu)?;
                     for (address, account) in genesis.iter().flat_map(|g| g.accounts.iter()) {
@@ -3028,6 +3028,15 @@ impl Network {
                             &self.window_json(w),
                             self.config.fragment_expiry_slots,
                         );
+                    }
+                    if let Some(result) = outcome {
+                        // What the payer paid, in lamports (native ACRUX from the cut-over): each copy or
+                        // fragment's inclusion fee when admitted, then the base and priority fees.
+                        let copies = fragment_info.get(&h.id).map_or(source[&h.id].len(), |(_, _, inclusions)| inclusions.len()) as u64;
+                        let inclusion = copies * self.config.inclusion_fee;
+                        let burned = result.base_fee * u64::from(crate::execution::Fees::default().base_burn_bps) / 10_000;
+                        tx["fees"] = json!({"base": result.base_fee.to_string(), "priority": result.priority_fee.to_string(), "inclusion": inclusion.to_string(),
+                            "burned": burned.to_string(), "total": (result.base_fee + result.priority_fee + inclusion).to_string()});
                     }
                     step.persist
                         .push((format!("transaction/{}", h.id), tx.clone()));
