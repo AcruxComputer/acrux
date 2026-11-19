@@ -29,6 +29,16 @@ pub fn vote_message(vote: &consensus::Vote, bridge: Option<&crate::genesis::Brid
     message.extend_from_slice(&bincode::serialize(vote)?);
     Ok(message)
 }
+/// The cblock commitment's formerly local preimage, carried beside the existing signed
+/// shreds/attestations/votes. Observers need no shared execution memory or slot clock.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CblockWitness {
+    pub block: consensus::BlockRef,
+    pub parent: Option<consensus::BlockRef>,
+    pub preimage: Vec<u8>,
+    pub state_hashes: Vec<String>,
+    pub outbox_root: Option<[u8; 32]>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Wire {
     Shreds(Vec<Shred>),
@@ -53,6 +63,8 @@ pub enum Wire {
         first: (Commitment, Vec<u8>),
         second: (Commitment, Vec<u8>),
     },
+    // Appended to keep all existing Wire discriminants and signed bytes unchanged.
+    Cblock(CblockWitness),
 }
 /// A Fault Lab scenario: the faulty behaviour of one proposer role in one window.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,6 +149,12 @@ pub struct Configuration {
     pub websocket_port: u16,
     pub metrics_port: u16,
     pub base_port: u16,
+    /// One external observer endpoint; local sandboxes do not open it.
+    #[serde(default)]
+    pub peer_port: Option<u16>,
+    /// Public DNS name or IP and UDP port advertised by getHubPeers.
+    #[serde(default)]
+    pub peer_address: Option<String>,
     pub store_path: String,
     pub genesis_programs: Vec<String>,
     /// Acrux Net's genesis accounts and programs (`backend/chain/genesis/acrux-net.json`).
@@ -170,6 +188,8 @@ impl Default for Configuration {
             websocket_port: 4931,
             metrics_port: 4989,
             base_port: 4950,
+            peer_port: None,
+            peer_address: None,
             store_path: "target/runs/net".into(),
             genesis_programs: vec![],
             genesis_path: None,

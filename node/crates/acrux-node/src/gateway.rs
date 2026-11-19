@@ -95,6 +95,8 @@ pub struct GatewayState {
     /// Solana signatures of executed transactions, to their ids, while the store keeps them.
     pub signatures: BTreeMap<String, String>,
     pub transactions_by_cblock: BTreeMap<u64, Vec<String>>,
+    /// Public addresses and pinned QUIC certificate, published only when the peer endpoint runs.
+    pub hub_peers: BTreeMap<String, Value>,
     pub current_window: Value,
     pub upcoming_windows: Vec<Value>,
     pub counters: Value,
@@ -144,6 +146,7 @@ impl GatewayState {
             transactions: BTreeMap::new(),
             signatures: BTreeMap::new(),
             transactions_by_cblock: BTreeMap::new(),
+            hub_peers: BTreeMap::new(),
             current_window: Value::Null,
             upcoming_windows: vec![],
             facts: Value::Null,
@@ -374,6 +377,13 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
     }
     let result: std::result::Result<Value, (&str, &str)> = match method {
         "getSnapshot" => Ok(state.read().await.snapshot()),
+        "getHubPeers" => {
+            match params.as_object().filter(|params|params.len()==1).and_then(|params|params.get("hub")).and_then(Value::as_str) {
+                Some(hub) if !hub.is_empty() && hub.len() <= 16 => state.read().await.hub_peers.get(hub).cloned()
+                    .ok_or(("NOT_FOUND","This hub has no public peer endpoint.")),
+                _ => Err(("INVALID_INPUT","Give the hub code as {hub: string}.")),
+            }
+        },
         "getCurrentWindow" => Ok(state.read().await.current_window.clone()),
         "getCounters" => Ok(state.read().await.counters.clone()),
         "getProposerEpoch" => {
@@ -672,7 +682,8 @@ async fn fee_burn_page(state: &SharedGateway, params: &Value) -> std::result::Re
         _ => return Err(("INVALID_INPUT","cursor must be an epoch's canonical decimal string.")),
     };
     let limit = match params.get("limit") {
-        None => 20,
+        // The contract's PageQuery default, so the gateway and /v1/burn page alike.
+        None => 24,
         Some(value) => safe_integer(value).filter(|limit|(1..=100).contains(limit)).ok_or(("INVALID_INPUT","limit must be an integer between 1 and 100."))?,
     };
     if params.as_object().unwrap().keys().any(|key|key != "cursor" && key != "limit") {

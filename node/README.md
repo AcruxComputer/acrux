@@ -367,6 +367,7 @@ A sandbox of twelve validators runs for 12 s with the scenario's fault in window
 | `acrux keygen --out key.json` | a Solana keypair file; prints the address |
 | `acrux send --keypair key.json --to <address> --lamports N [--n 3 --t 2]` | a plain or t-of-n transfer, followed to finality |
 | `acrux node follow <rpc-url>` | follows a net from its latest finalized cblock: loads that cblock's state and checks its hash, then for every finalized slot checks each attestation's signature and Agreed(s), decrypts the agreed blocks with the released keys, checks them against the attested commitments, re-executes them on its own SVM and compares the state hash with the net's and with the finalization certificate |
+| `acrux node propose --hub FRA --identity <keypair> [--net https://rpc.acrux.computer] [--genesis <file>]` | authenticates as an observer, receives its hub's existing signed protocol over public QUIC and re-executes finalized slots with matching state hashes; admission and block production follow in later steps |
 | `acrux replay --rpc <solana-rpc> --slot <n>` or `--block <file>` | one Solana mainnet block (transaction versions legacy, 0 and 1) through Acrux's merge and Algorithm 4: the leader's order beside the merged order, each transaction's Acrux slot, track and start, how many Acrux slots the block takes, and the sandwiches in it (a trader's buy, a victim's buy of the same asset on the same pool, the trader's sale of the same amount at a profit), with what the trader kept and each sandwich repriced for Acrux: sent 2-of-3 the front leg has nothing to read, so the victim's output is recomputed with it taken out of the pool (a Pump.fun curve's virtual reserves from its trade events; a concentrated-liquidity pool's liquidity and price from its swap events, Meteora DAMM v2, Orca Whirlpool and Raydium CLMM; else the pool vaults on the constant-product rule where it reproduces every trade the block made there), and sent plain the trader's take less the cost of outbidding the victim's priority fee; `--json <file>` writes all of it as one record, `--save <file>` keeps the block to replay again |
 | `acrux hub register <CODE> --latitude <deg> --longitude <deg>` | `register_hub` on the Hub Registry |
 | `acrux hub join <CODE>`, `leave <CODE>`, `move <FROM> <TO>`, `release <CODE>` | the membership instructions and the permissionless release |
@@ -375,7 +376,77 @@ A sandbox of twelve validators runs for 12 s with the scenario's fault in window
 
 Hub commands take `--identity key.json` (the validator identity that signs and pays), `--rpc` (an Acrux RPC such as https://rpc.acrux.computer for Acrux's registry, a Solana RPC for mainnet's; default the local Solana validator, http://127.0.0.1:4990) and `--program` (default `ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm`, the same on both chains).
 
+## Observe a hub over QUIC
+
+```text
+acrux node propose --hub FRA --identity validator.json --genesis chain/genesis/acrux-net.json
+```
+
+`--identity` is a Solana keypair JSON file. `--net` defaults to
+`https://rpc.acrux.computer`. The genesis, placement manifest and bridge rule
+must match the net, just as for `node follow`. A new identity is an observer;
+this step does not admit it to the registry, vote, submit transactions or propose.
+
+The command bootstraps from the gateway's finalized `getExecutionSnapshot` and
+`getHubPeers {hub}`. The latter returns `{hub,address,certificate,peers}`: the
+hub's logical co-proposer identities and IDs, one public `host:port` and a
+base64 DER QUIC certificate pinned from that gateway response. The host still
+runs all twelve identities, so they share one physical endpoint. The observer
+opens one authenticated connection, with the hub's logical links multiplexed on
+it. The net challenges it with a fresh nonce; its identity signs a domain-bound
+proof of the nonce, hub and public key. No observer consensus input is accepted.
+
+After bootstrap, encrypted shreds, commitments, signed attestations, votes and
+certificates arrive as the same `Envelope`/`Wire` messages used between validators.
+The observer receives the transcript addressed to its hub's first local member,
+which includes the data that member uses to re-execute other hubs' windows too.
+Mempool submissions are unnecessary: selected transactions and threshold
+fragments already ride inside encrypted blocks. It checks the signed data,
+reconstructs blocks, verifies agreement and finalization certificates, and uses
+the follower's merge/execution path. It does not fetch follower RPC pages.
+
+The prior in-process path shared its cblock preimage and local execution hashes.
+The appended `Wire::Cblock` witness puts those values on the same signed wire.
+Its preimage binds the accepted slots and end state to the certified cblock hash;
+when bridging, that hash also includes the outbox root. No monotonic `Instant`
+or local slot deadline crosses the wire. Existing message encodings, vote
+signatures, state hashes and the RPC follower stay unchanged.
+
+It prints the follower's `from cblock ... state ... matches` and
+`slot ... re-executed ... state ... matches ... checked N` lines, plus each
+logical co-proposer link and measured `RTT ... ms`. That RTT is the actual QUIC
+round trip; `LocalTransport::link_delay` is not applied to external packets.
+
+`acrux net up` listens on `ACRUX_PEER_PORT` / `--peer-port` (4940/udp by default),
+using `ACRUX_BIND` (loopback by default). A public bind requires
+`ACRUX_PEER_ADDRESS` / `--peer-address`, the public DNS name or IP with its UDP
+port. Local cluster and Fault Lab runs do not open a public endpoint. Only this
+single external port is published in compose; in-process validator ports remain
+private. Host firewall instructions are in
+[deploy/host/README.md](../deploy/host/README.md).
+
+There are at most 32 authenticated external identities, one connection per
+identity. TLS and the challenge must finish within five seconds. Control frames
+are limited to 128 bytes and ten pings per second; observers can open no protocol
+input streams. Recent history is bounded at 64 MiB or 8,192 frames, with each
+observer's outgoing queue bounded at 2 MiB or 128 frames and a two-second write
+deadline. The replay process also caps pending block material at 64 MiB. A slow
+observer is disconnected rather than making a validator wait for it. Recent
+signed-message history bridges the snapshot-to-subscription race. A lost link
+or expired history ends the command with an error; rerun it for a fresh snapshot.
+
+After a release build and the `propose-peer-probe` example build, run
+`node node/scripts/propose-observer-check.mjs` from `backend/`. It owns only
+loopback ports 5041?5043, validator QUIC 5062?5073 and external QUIC 5074. It
+checks at least 1,000 matching finalized slots, actual link RTT, rejection of a
+bad challenge signature and disconnection of a non-reading peer while finality
+keeps advancing. Its child processes and unique temporary store are cleaned.
+
 ## Measured
+
+`acrux node propose` from a desktop about 290 ms from the host (CLI 0.4.23, 2026-11-19 UTC):
+links to the four FRA co-proposers at a 291 to 296 ms round trip, 3,172 finalized slots
+re-executed in 180 s with every state hash matching, at the net's own pace.
 
 Acrux Net, 600 s fault-free at 50 transfers a second, twelve validators on one machine (`node scripts/summarize-run.mjs <store>` reads a run's `last-run.json`):
 

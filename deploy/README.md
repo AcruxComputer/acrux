@@ -13,7 +13,7 @@
 | `acrux-postgres` | faucet grants, lab runs and their events, hubs and members | default | volume `acrux-pg` |
 | `acrux-caddy` | TLS and the three public names on 80/443 | default | volume `acrux-caddy` (certificates) |
 
-Only 22, 80 and 443 are open (`install.sh` sets the firewall); the node's QUIC, metrics and the API are reachable only inside Docker.
+SSH (22/tcp), HTTP (80/tcp), HTTPS (443/tcp) and the outside peers' QUIC port (`ACRUX_PEER_PORT`, 4940/udp; `ACRUX_PEER_ADDRESS` is the address `getHubPeers` gives out) are open (`install.sh` sets the firewall). Only that one authenticated peer endpoint is published from `net`; the validators' own QUIC links, metrics and the API are reachable only inside Docker. On an existing host, also run `ufw allow 4940/udp` and allow the port in the provider's firewall.
 
 ### Public limits
 

@@ -118,6 +118,18 @@ enum ClusterCommand {
 }
 #[derive(Subcommand)]
 enum NodeCommand {
+    /// Connects to a hub over QUIC and independently re-executes its finalized wire stream.
+    /// Admission and block submission arrive in later build-5 steps.
+    Propose {
+        #[arg(long)]
+        hub: String,
+        #[arg(long)]
+        identity: String,
+        #[arg(long, default_value = "https://rpc.acrux.computer")]
+        net: String,
+        #[arg(long, default_value = "../chain/genesis/acrux-net.json")]
+        genesis: String,
+    },
     /// Follows a net from its latest finalized cblock: decrypts, merges and re-executes every
     /// finalized slot and checks the state hashes against the net's and its certificates.
     Follow {
@@ -171,6 +183,12 @@ enum NetCommand {
         base_port: u16,
         #[arg(long, env = "ACRUX_METRICS_PORT", default_value_t = 4989)]
         metrics_port: u16,
+        /// Public QUIC endpoint for authenticated external observer identities.
+        #[arg(long, env = "ACRUX_PEER_PORT", default_value_t = 4940)]
+        peer_port: u16,
+        /// Public DNS name or IP and UDP port; required when listening beyond loopback.
+        #[arg(long, env = "ACRUX_PEER_ADDRESS")]
+        peer_address: Option<String>,
         #[arg(long, env = "ACRUX_TRAFFIC_RATE", default_value_t = 50)]
         traffic_rate: u64,
         #[arg(long)]
@@ -236,6 +254,7 @@ async fn run() -> anyhow::Result<()> {
         Command::Replay { block, rpc, slot, save, rows, json } => return acrux_node::replay::run(block.as_deref(), rpc.as_deref(), slot, save.as_deref(), rows, json.as_deref()).await,
         Command::Send { rpc, keypair, to, lamports, n, t, priority } => return cli::send(&rpc, &keypair, &to, lamports, n, t, priority).await,
         Command::Node { command: NodeCommand::Follow { url, genesis } } => return cli::follow(&url, &genesis).await,
+        Command::Node { command: NodeCommand::Propose { hub, identity, net, genesis } } => return acrux_node::propose::run(&net, &hub, &identity, &genesis).await,
         Command::Net { command: NetCommand::Import { url, store, genesis } } => return cli::import(&url, &store, &genesis).await,
         Command::Hub { command, rpc, program, identity } => {
             let action = match command {
@@ -257,6 +276,8 @@ async fn run() -> anyhow::Result<()> {
                     ws_port,
                     base_port,
                     metrics_port,
+                    peer_port,
+                    peer_address,
                     traffic_rate,
                     crash_window,
                     crash_proposer,
@@ -278,6 +299,8 @@ async fn run() -> anyhow::Result<()> {
             websocket_port: ws_port,
             base_port,
             metrics_port,
+            peer_port: Some(peer_port),
+            peer_address: peer_address.filter(|address|!address.is_empty()),
             traffic_per_second: traffic_rate,
             crash_window,
             crash_proposer,

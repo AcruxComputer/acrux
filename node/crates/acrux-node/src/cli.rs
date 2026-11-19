@@ -266,7 +266,7 @@ fn validate_proposer_config(config: &crate::protocol::ProposerConfig, genesis: &
     Ok(())
 }
 
-fn load_follow_snapshot(mut snapshot: Value, genesis: &crate::genesis::Genesis, programs: &[crate::execution::GenesisProgram]) -> Result<(Replay, u64, String)> {
+pub(crate) fn load_follow_snapshot(mut snapshot: Value, genesis: &crate::genesis::Genesis, programs: &[crate::execution::GenesisProgram]) -> Result<(Replay, u64, String)> {
     let last = snapshot["consensusSlot"].as_u64().context("snapshot consensusSlot")?;
     ensure!(snapshot["anchor"]["consensusSlot"].as_u64() == Some(last), "snapshot anchor names another cblock");
     let state: crate::execution::ExecutorSnapshot = serde_json::from_value(snapshot["executor"].take())?;
@@ -297,16 +297,16 @@ fn load_follow_snapshot(mut snapshot: Value, genesis: &crate::genesis::Genesis, 
     Ok((Replay { executor, threshold: serde_json::from_value(snapshot["threshold"].take())?, window: None, proposers }, last, start_hash))
 }
 
-struct Replay {
-    executor: crate::execution::SvmExecutor,
+pub(crate) struct Replay {
+    pub(crate) executor: crate::execution::SvmExecutor,
     threshold: crate::threshold::ThresholdCache,
     window: Option<u64>,
-    proposers: Option<crate::protocol::ProposerSchedules>,
+    pub(crate) proposers: Option<crate::protocol::ProposerSchedules>,
 }
 
 impl Replay {
     /// One slot, the way Algorithm 2's TryExecute runs it on a validator.
-    fn apply(&mut self, s: u64, recipients: &[(u8, String)], blocks: &Value) -> Result<String> {
+    pub(crate) fn apply(&mut self, s: u64, recipients: &[(u8, String)], blocks: &Value) -> Result<String> {
         use crate::execution::ExecutionItem;
         use crate::threshold::AcceptOutcome;
         let w = s / 16;
@@ -400,7 +400,7 @@ impl Replay {
     }
 }
 
-fn check_slot(slot: &Value, signed_attestations: &Value) -> Result<()> {
+pub(crate) fn check_slot(slot: &Value, signed_attestations: &Value) -> Result<()> {
     let proposers = slot["window"]["proposers"].as_array().context("proposers")?;
     let mut attestations = vec![];
     for a in signed_attestations.as_array().context("attestations")? {

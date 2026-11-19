@@ -515,6 +515,23 @@ fn pack(
     }
     (txs, fragments)
 }
+/// This callback sees only our own signed envelopes before LocalTransport applies geography.
+/// Mempool submissions are not needed for replay: their transactions/fragments ride in blocks.
+fn observer_packet_slot(bytes: &[u8]) -> Option<u64> {
+    let envelope: Envelope = decode(bytes).ok()?;
+    match envelope.body {
+        Wire::Shreds(shreds) | Wire::Relay(shreds) => shreds.iter().map(|shred|shred.meta.slot).max(),
+        Wire::Commit(commitment) => Some(commitment.slot),
+        Wire::Attest(attestation) => Some(attestation.slot),
+        Wire::Vote(vote) => Some(vote.vote.slot * 4),
+        Wire::Certificate { certificate,.. } => Some(certificate.slot * 4),
+        Wire::Handover { shreds,.. } => shreds.iter().map(|shred|shred.meta.slot).max(),
+        Wire::Equivocation { first,.. } => Some(first.0.slot),
+        Wire::Cblock(witness) => Some(witness.block.slot * 4),
+        Wire::Submit(_) | Wire::SubmitFragment(_) => None,
+    }
+}
+
 fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>> {
     Ok(bincode::serialize(v)?)
 }
@@ -711,6 +728,28 @@ impl Network {
             profile.clone(),
         )
         .await?;
+        if let Some(port) = config.peer_port {
+            ensure!(port > 0,"The external peer port must be nonzero");
+            let ip: std::net::IpAddr = std::env::var("ACRUX_BIND").unwrap_or_else(|_|"127.0.0.1".into()).parse().context("Invalid ACRUX_BIND")?;
+            let address = match &config.peer_address {
+                Some(address) => address.clone(),
+                None if ip.is_loopback() => std::net::SocketAddr::new(ip,port).to_string(),
+                None => anyhow::bail!("ACRUX_PEER_ADDRESS is required when the peer endpoint listens beyond loopback"),
+            };
+            let (host,advertised_port) = address.rsplit_once(':').context("ACRUX_PEER_ADDRESS must name a host and UDP port")?;
+            ensure!(!host.is_empty() && !host.chars().any(char::is_whitespace) && advertised_port.parse::<u16>().is_ok_and(|port|port>0),"Invalid ACRUX_PEER_ADDRESS");
+            let hubs = ["FRA","NYC","TYO"].iter().map(|hub|((*hub).to_string(),peers.iter().filter(|peer|peer.hub==*hub).map(|peer|peer.id).collect::<Vec<_>>())).collect::<Vec<_>>();
+            let external = acrux_transport::external::ExternalServer::bind(std::net::SocketAddr::new(ip,port),hubs.clone(),32).await?;
+            let certificate = B64.encode(external.cert_der());
+            {
+                let mut gateway = gateway.write().await;
+                for (hub,members) in hubs {
+                    gateway.hub_peers.insert(hub.clone(),json!({"hub":hub,"address":address,"certificate":certificate,
+                        "peers":members.iter().map(|id|json!({"id":id,"identity":identities[*id]})).collect::<Vec<_>>()}));
+                }
+            }
+            transport.set_external(external,observer_packet_slot);
+        }
         let exchange = crate::exchange::ExchangeEngine::new(
             transport.clone(),
             keys.clone(),
@@ -2279,6 +2318,9 @@ impl Network {
         let id = packet.to;
         let mut step = Step::new();
         match e.body {
+            // A commitment witness shares the wire with votes; every existing validator already
+            // computed it locally. It is consumed by external replay, never as consensus input.
+            Wire::Cblock(_) => {}
             Wire::Submit(tx) => {
                 // Judged by the slot it targets: every actor, not only node zero's, admits submissions.
                 if self.native_cutover_slot().is_some_and(|cut| tx.header.target_slot >= cut) && self.built_in.contains(&tx.header.fee_payer) { return Ok(()) }
@@ -3312,6 +3354,7 @@ impl Network {
                 // From the bridge's first slot the hash also commits to the cblock's outbox root,
                 // which Solana's light client proves outbox entries against.
                 let preimage = encode(&(i, parent, accepted, &state))?;
+                let mut witness_outbox_root = None;
                 let hash = if self.bridge_open(i * 4) {
                     let mut outbox = self.outbox(i);
                     outbox.extend(self.nodes[id].executor.as_ref().unwrap().withdrawals(i).into_iter().map(|(sequence, solana_mint, recipient, amount)| {
@@ -3322,9 +3365,11 @@ impl Network {
                     if let Some(burn) = self.nodes[id].executor.as_ref().unwrap().fee_burn_at(self.nodes[id].checkpoints.get(&i).context("Bridge cblock checkpoint is missing")?, i)? {
                         outbox.push(crate::bridge::OutboxEntry::FeeBurn { epoch:burn.epoch,amount:burn.amount });
                     }
-                    let hash = crypto::hash(&[preimage.as_slice(), &crate::bridge::outbox_root(&outbox)].concat());
+                    let root = crate::bridge::outbox_root(&outbox);
+                    witness_outbox_root = Some(root);
+                    let hash = crypto::hash(&[preimage.as_slice(), &root].concat());
                     if id == 0 {
-                        self.cblock_preimages.insert(i, (preimage, outbox));
+                        self.cblock_preimages.insert(i, (preimage.clone(), outbox));
                         ensure!(self.cblock_preimages.len() <= 4096, "Bridge proof material reached its pending cblock limit before finalization");
                     }
                     hash
@@ -3336,6 +3381,13 @@ impl Network {
                     parent,
                 };
                 self.nodes[id].executed_blocks.insert(i, block.id);
+                if id == 0 && self.config.peer_port.is_some() {
+                    step.out.push(Outbox { from:id,to:(0..12).collect(),body:Wire::Cblock(crate::types::CblockWitness {
+                        block:block.id,parent,preimage,
+                        state_hashes:(i*4..i*4+4).map(|slot|self.nodes[id].slots[&slot].state_hash.clone().unwrap()).collect(),
+                        outbox_root:witness_outbox_root,
+                    }) });
+                }
                 if i % 4 == 3 && self.schedule_ready(w + 1) && self.proposer_ids(w)?.contains(&id) {
                     let next = self.proposer_ids(w + 1)?;
                     // 32 shreds rebuild a slice, so no more go; the rest is split into messages
@@ -3649,6 +3701,7 @@ impl Network {
                         "executor": executor,
                         "threshold": threshold,
                         "proposerConfig": self.proposers.read().unwrap().config,
+                        "consensusStakes": self.stakes,
                     }))
                 })();
                 let _ = reply.send(result.map_err(|e| e.to_string()));

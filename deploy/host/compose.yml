@@ -25,6 +25,8 @@ services:
     cpu_shares: 4096
     environment:
       ACRUX_BIND: 0.0.0.0
+      ACRUX_PEER_PORT: "${ACRUX_PEER_PORT:-4940}"
+      ACRUX_PEER_ADDRESS: "${ACRUX_PEER_ADDRESS:-}"
       ACRUX_TRUST_PROXY: "1"
       ACRUX_CORS_ORIGINS: "${RPC_ORIGINS:-*}"
       ACRUX_RPC_RATE: "${ACRUX_RPC_RATE:-50}"
@@ -40,6 +42,8 @@ services:
       ACRUX_BRIDGE_RPC: "${ACRUX_BRIDGE_RPC:-}"
       ACRUX_BRIDGE_PROOF_MAX: "${ACRUX_BRIDGE_PROOF_MAX:-100000}"
       ACRUX_BRIDGE_PROOF_GRACE_SLOTS: "${ACRUX_BRIDGE_PROOF_GRACE_SLOTS:-1728000}"
+    # One public authenticated QUIC endpoint; validator-to-validator ports stay private.
+    ports: ["${ACRUX_PEER_PORT:-4940}:${ACRUX_PEER_PORT:-4940}/udp"]
     # The chain's saved state and kept transactions: a start continues from the last finalized cblock.
     volumes:
       - acrux-net:/var/lib/acrux

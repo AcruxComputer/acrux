@@ -46,6 +46,7 @@ pub struct LocalTransport {
     serial: Vec<Vec<AtomicU64>>,
     base_port: u16,
     profile:Arc<Profiling>,
+    external: std::sync::RwLock<Option<(Arc<crate::external::ExternalServer>, fn(&[u8]) -> Option<u64>)>>,
 }
 
 impl LocalTransport {
@@ -106,6 +107,7 @@ impl LocalTransport {
             serial,
             base_port,
             profile,
+            external: std::sync::RwLock::new(None),
         });
         for to in 0..local.peers.len() {
             let endpoint = local.endpoints[to].clone();
@@ -178,6 +180,11 @@ impl LocalTransport {
         Ok((local, receiver))
     }
 
+    /// The node owns its Wire type; the transport keeps those same signed bytes opaque.
+    pub fn set_external(&self, server: Arc<crate::external::ExternalServer>, slot_of: fn(&[u8]) -> Option<u64>) {
+        *self.external.write().unwrap() = Some((server,slot_of));
+    }
+
     pub fn peers(&self) -> &[Peer] {
         &self.peers
     }
@@ -198,6 +205,13 @@ impl LocalTransport {
             payload.len() <= MAX_MESSAGE_BYTES,
             "network message exceeds size limit"
         );
+        // An outside link carries only its real delay. Publishing cannot wait for a peer's
+        // socket or queue; the boundary drops an observer that does not keep up.
+        if let Some((server,slot_of)) = self.external.read().unwrap().clone() {
+            if server.observes(to) {
+                if let Some(slot) = slot_of(&payload) { server.publish(from,to,slot,Arc::new(payload.clone())); }
+            }
+        }
         let serial = self.serial[from][to].fetch_add(1, Ordering::Relaxed);
         let delay=self.link_delay(from,to,serial);
         let delay_started=Instant::now();
@@ -270,6 +284,8 @@ impl LocalTransport {
     }
 
     pub async fn close(&self) {
+        let external = self.external.write().unwrap().take();
+        if let Some((server,_)) = external { server.close().await; }
         for endpoint in &self.endpoints {
             endpoint.close(0_u32.into(), b"cluster stopped");
         }

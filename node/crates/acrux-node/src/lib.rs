@@ -2,6 +2,7 @@ pub mod bridge;
 pub mod fee_burns;
 pub mod facts;
 pub mod cli;
+pub mod propose;
 pub mod gateway;
 pub mod genesis;
 pub mod lab;
@@ -56,7 +57,7 @@ pub use acrux_consensus as consensus;
 pub use acrux_crypto as crypto;
 pub use acrux_execution::{execution, selection, threshold};
 pub use acrux_schedule as schedule;
-pub use acrux_transport::{profiling, transport};
+pub use acrux_transport::{external, profiling, transport};
 
 #[cfg(test)]
 mod identity_tests {
