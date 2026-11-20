@@ -48,6 +48,8 @@ struct LocalSlot {
     invalid_reason: Option<String>,
     executed: bool,
     agreed: Option<Vec<usize>>,
+    /// The lab's control-plane decision, retained while Rotor supplies the selected data/keys.
+    agreement: Option<crate::agreement::Agreement>,
     state_hash: Option<String>,
     /// Node zero's observed execution fees/time, published only with a durable checkpoint.
     burn: Option<crate::fee_burns::SlotBurn>,
@@ -1318,9 +1320,11 @@ impl Network {
         })?[8..12]
             .to_vec();
         let receipt_tag=encode(&Envelope {from:0,body:Wire::CommitReceipt(CommitReceipt {slot:0,proposer:1,hash:[0;32]}),signature:vec![]})?[8..12].to_vec();
+        let attest_tag=if self.uses_local_agreement() {Some(encode(&Envelope{from:0,body:Wire::Attest(Attestation{slot:0,proposer:1,pi:vec![None;3],key:[0;32]}),signature:vec![]})?[8..12].to_vec())}else{None};
         tokio::spawn(async move {
             while let Some(packet) = incoming.recv().await {
-                if packet.payload.get(8..12) != Some(commit_tag.as_slice()) && packet.payload.get(8..12)!=Some(receipt_tag.as_slice()) {
+                if packet.payload.get(8..12) != Some(commit_tag.as_slice()) && packet.payload.get(8..12)!=Some(receipt_tag.as_slice())
+                    && !attest_tag.as_ref().is_some_and(|tag|packet.payload.get(8..12)==Some(tag.as_slice())) {
                     if data_txs[packet.to].send(packet).is_err() {
                         return;
                     }
@@ -1345,6 +1349,18 @@ impl Network {
                 };
                 if let Wire::CommitReceipt(receipt)=&envelope.body {
                     ingress_exchange.receive_receipt(packet.to,envelope.from,receipt.clone(),packet.received_at);
+                    continue;
+                }
+                if let Wire::Attest(attestation)=&envelope.body {
+                    let valid={
+                        let schedules=schedule_ids.read().unwrap();
+                        (1..=3).contains(&attestation.proposer)&&attestation.pi.len()==3
+                            &&schedules.ids(attestation.slot/16).is_ok_and(|ids|ids[attestation.proposer-1]==envelope.from)
+                    };
+                    if !valid {tracing::warn!("Rejected agreement attester");continue}
+                    ingress_exchange.receive_attestation(packet.to,attestation.clone(),envelope.signature.clone(),packet.received_at);
+                    let destination=senders[packet.to].clone();
+                    tokio::spawn(async move {let _=destination.send((packet,envelope)).await;});
                     continue;
                 }
                 let exchange = ingress_exchange.clone();
@@ -1709,17 +1725,27 @@ impl Network {
             Some(id) => self.store.get(&format!("transaction/{id}"))?,
             None => None,
         };
+        let continued=if fault.protocol=="agreement" && (w*4..w*4+4).all(|c|self.final_cblocks.contains_key(&c)&&!self.skipped.contains(&c)) {
+            self.nodes[0].slots.get(&(w*16)).and_then(|slot|slot.agreed.as_ref()).map(|agreed|json!({
+                "kind":"window_continued","slot":w*16,"attackSlot":w*16,"proposer":fault.attacker,"txId":null,
+                "description":format!("The signed 2-of-3 agreement selected proposer blocks {agreed:?}; every cblock of the attacker's window finalized."),
+                "hashes":[],"signatures":[],"observedFragments":null,"threshold":null,"agreedSet":agreed,"finalized":true}))
+        }else{None};
         match fault.scenario.as_str() {
             "last-look" => {
                 if let Some(late) = self.exchange.omitted_commitments().into_iter().find(|o| o["slot"].as_u64().is_some_and(|s| s / 16 == w) && o["omittedProposers"].as_array().is_some_and(|p| p.contains(&json!(fault.attacker)))) {
                     evidence.push(json!({"kind":"late_block_dropped","slot":late["slot"],"proposer":fault.attacker,"txId":null,"description":format!("Proposer {} committed 28 ms late; its co-proposers attested it as late (deadline {} us after start), so its block can only be dropped.", fault.attacker, 20_000),"hashes":[],"signatures":[],"observedFragments":null,"threshold":null}));
                 }
-                if let Some(i) = skipped.first() {
+                if fault.protocol=="agreement" {
+                    if let Some(continued)=continued.clone() {evidence.push(continued);}
+                } else if let Some(i) = skipped.first() {
                     evidence.push(skip(i * 4, "The late proposer's own attestation disagrees with its co-proposers' vectors, so no set is agreed and the cblock is skip-certified."));
                 }
             }
             "split-commitments" => {
-                if let Some(i) = skipped.first() {
+                if fault.protocol=="agreement" {
+                    if let Some(continued)=continued {evidence.push(continued);}
+                } else if let Some(i) = skipped.first() {
                     evidence.push(skip(i * 4, "Co-proposer 1 attested the attacker's commitment and co-proposer 2 never received it: the vectors differ, no set is agreed, and the cblock is skip-certified."));
                 }
             }
@@ -1751,10 +1777,12 @@ impl Network {
             other => anyhow::bail!("Unknown Fault Lab scenario {other}"),
         }
         let expected: &[&str] = match fault.scenario.as_str() {
+            "last-look" if fault.protocol=="agreement" => &["late_block_dropped", "window_continued"],
             "last-look" => &["late_block_dropped", "skip_certificate"],
             "censorship" => &["transaction_included"],
             "crash" => &["two_proposers_continue"],
             "equivocation" => &["slashing_proof", "skip_certificate"],
+            "split-commitments" if fault.protocol=="agreement" => &["window_continued"],
             "split-commitments" => &["skip_certificate"],
             _ => &["unreadable_fragment"],
         };
@@ -1788,9 +1816,9 @@ impl Network {
             json!({"attackerWindow":w,"slotsSkipped":skipped.len() * 4,"cblocks":cblocks})
         };
         let outcome = if missing.is_empty() {
-            json!({"status":"done","outcome":evidence.iter().map(|e| e["description"].as_str().unwrap_or_default()).collect::<Vec<_>>().join(" "),"evidence":evidence,"yardstick":yardstick,"failure":null})
+            json!({"status":"done","protocol":fault.protocol,"outcome":evidence.iter().map(|e| e["description"].as_str().unwrap_or_default()).collect::<Vec<_>>().join(" "),"evidence":evidence,"yardstick":yardstick,"failure":null})
         } else {
-            json!({"status":"failed","outcome":null,"evidence":evidence,"yardstick":yardstick,"failure":format!("The run ended without the expected evidence: {}", missing.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(", "))})
+            json!({"status":"failed","protocol":fault.protocol,"outcome":null,"evidence":evidence,"yardstick":yardstick,"failure":format!("The run ended without the expected evidence: {}", missing.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(", "))})
         };
         {
             let mut g = self.gateway.write().await;
@@ -2661,7 +2689,9 @@ impl Network {
         }
         self.dispatch(id, step).await
     }
+    fn uses_local_agreement(&self)->bool {self.config.fault.as_ref().is_some_and(|fault|fault.protocol=="agreement")}
     async fn try_execute(&mut self, id: usize, w: u64) -> Result<()> {
+        let local_agreement=self.uses_local_agreement();
         let _phase = self.profile.measure(Some(id), "validator.scan");
         let certified_skip = self.nodes[id]
             .seen_certificates
@@ -2698,6 +2728,12 @@ impl Network {
             {
                 break;
             }
+            if local_agreement {
+                let Some(snapshot)=self.exchange.agreement_snapshot(id,s) else {break};
+                let local=self.nodes[id].slots.entry(s).or_default();
+                local.equivocation|=snapshot.equivocation;
+                local.agreement=snapshot.decision;
+            }
             let Some(local) = self.nodes[id].slots.get(&s) else {
                 break;
             };
@@ -2707,13 +2743,18 @@ impl Network {
                 .map(|(a, _)| a.clone())
                 .collect::<Vec<_>>();
             let agree_start = Instant::now();
-            let agreed = crate::agreement::agreed(&attestations, local.equivocation);
+            let equivocation=local.equivocation;
+            let agreed = if local_agreement {
+                local.agreement.as_ref().filter(|_|!local.equivocation).map(|decision|(decision.proposers.clone(),decision.pi.clone()))
+            } else {
+                crate::agreement::agreed(&attestations, equivocation).map(|accepted|(accepted,attestations[0].pi.clone()))
+            };
             self.profile
                 .record(Some(id), "validator.agree", agree_start.elapsed());
-            let Some(accepted) = agreed else {
+            let Some((accepted,pi)) = agreed else {
                 break;
             };
-            let pi = attestations[0].pi.clone();
+            let local=&self.nodes[id].slots[&s];
             if s % 16 != 0 && self.nodes[id].slots[&(s - 1)].agreed.as_ref() != Some(&accepted) {
                 break;
             }
@@ -2745,7 +2786,7 @@ impl Network {
                         break;
                     };
                     let meta = &local.meta[&key];
-                    let att = &local.attest[q].0;
+                    let Some((att,_))=local.attest.get(q) else {complete=false;break};
                     if crypto::hash(&att.key) != meta.key_hash {
                         invalid_reason =
                             Some("Released key does not match block key commitment".to_owned());
@@ -3248,6 +3289,7 @@ impl Network {
         Ok(())
     }
     async fn try_vote(&mut self, id: usize, w: u64) -> Result<()> {
+        let local_agreement=self.uses_local_agreement();
         let _phase = self.profile.measure(Some(id), "validator.vote");
         for i in w * 4..w * 4 + 4 {
             // Timeouts insert their Skip vote immediately too, so they need the same
@@ -3261,6 +3303,11 @@ impl Network {
             let run = self.nodes[id].windows[&w];
             let expired = elapsed(run.start) >= 750000 + (i - w * 4 + 1) * 200000 + 50000;
             let slots = (i * 4..i * 4 + 4).collect::<Vec<_>>();
+            if local_agreement {for slot in &slots {
+                if self.exchange.agreement_snapshot(id,*slot).is_some_and(|snapshot|snapshot.equivocation) {
+                    self.nodes[id].slots.entry(*slot).or_default().equivocation=true;
+                }
+            }}
             let all = slots
                 .iter()
                 .all(|s| self.nodes[id].slots.get(s).map_or(false, |x| x.executed));
@@ -3272,12 +3319,12 @@ impl Network {
                 self.nodes[id].slots.get(s).map_or(false, |x| {
                     x.equivocation
                         || x.invalid_reason.is_some()
-                        || x.attest
+                        || (!local_agreement && x.attest
                             .values()
                             .map(|(a, _)| &a.pi)
                             .collect::<BTreeSet<_>>()
                             .len()
-                            > 1
+                            > 1)
                 })
             });
             let mut step = Step::new();
@@ -3319,14 +3366,14 @@ impl Network {
                         (
                             *s,
                             self.nodes[id].slots[s].agreed.clone(),
-                            self.nodes[id].slots[s]
+                            if local_agreement {self.nodes[id].slots[s].agreement.as_ref().unwrap().pi.clone()} else {self.nodes[id].slots[s]
                                 .attest
                                 .values()
                                 .next()
                                 .unwrap()
                                 .0
                                 .pi
-                                .clone(),
+                                .clone()},
                         )
                     })
                     .collect::<Vec<_>>();

@@ -4,7 +4,7 @@
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
-import type { Evidence, LabRun, LabScenario, ProtocolEvent } from '@acrux/contract'
+import type { Evidence, LabProtocol, LabRun, LabScenario, ProtocolEvent } from '@acrux/contract'
 import { ProtocolEvent as ProtocolEventSchema } from '@acrux/contract'
 import { scenarios } from '@acrux/contract/fixtures'
 import type { PrismaClient } from '@prisma/client'
@@ -26,13 +26,14 @@ export class NodeLab {
 
   view(row: RunRow): LabRun {
     const result = row.outcome as { outcome: string | null; evidence: Evidence[]; yardstick?: LabRun['yardstick'] } | null
-    return { id: row.id, scenario: this.scenario(row.scenario), seed: row.seed, status: row.status,
+    const { protocol } = row.parameters as { protocol?: LabProtocol }
+    return { id: row.id, scenario: this.scenario(row.scenario), seed: row.seed, ...(protocol ? { protocol } : {}), status: row.status,
       createdAt: row.createdAt.toISOString(), startedAt: row.startedAt?.toISOString() ?? null, endedAt: row.finishedAt?.toISOString() ?? null,
       outcome: result?.outcome ?? null, evidence: result?.evidence ?? [], yardstick: result?.yardstick ?? null, failure: (row.failure as string | null) ?? null }
   }
 
-  async start(scenario: string, seed: string) {
-    const row = await this.db.labRun.create({ data: { scenario, seed, parameters: this.scenario(scenario).parameters } })
+  async start(scenario: string, seed: string, protocol: LabProtocol = 'today') {
+    const row = await this.db.labRun.create({ data: { scenario, seed, parameters: { ...this.scenario(scenario).parameters, protocol } } })
     await this.record(row.id, this.updated(this.view(row)))
     this.queue.push(row.id)
     void this.drain()
@@ -77,7 +78,8 @@ export class NodeLab {
     mkdirSync(dir, { recursive: true })
     let row = await this.db.labRun.update({ where: { id }, data: { status: 'running', startedAt: new Date() } })
     await this.record(id, this.updated(this.view(row)))
-    const child = spawn(env.ACRUX_BIN, ['lab', 'run', '--scenario', row.scenario, '--seed', row.seed, '--base-port', String(env.LAB_BASE_PORT), '--out', dir, '--genesis', env.ACRUX_GENESIS],
+    const protocol = (row.parameters as { protocol?: LabProtocol }).protocol ?? 'today'
+    const child = spawn(env.ACRUX_BIN, ['lab', 'run', '--scenario', row.scenario, '--seed', row.seed, '--protocol', protocol, '--base-port', String(env.LAB_BASE_PORT), '--out', dir, '--genesis', env.ACRUX_GENESIS],
       { cwd: env.ACRUX_NODE_DIR, stdio: ['ignore', 'ignore', 'pipe'] })
     let stderr = ''
     child.stderr.on('data', d => { stderr = (stderr + d).slice(-2000) })

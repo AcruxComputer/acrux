@@ -289,7 +289,7 @@ export function createNodeApi() {
     const retryAfterSeconds = labWindows(clientIp(c), 'lab', env.LAB_RUNS_PER_IP_HOUR)
     if (retryAfterSeconds !== null) fail('RATE_LIMITED', 'This address has started its lab runs for the hour.', { retryable: true, retryAfterSeconds, stage: 'validation' })
     if (lab.pending >= env.LAB_QUEUE_MAX) fail('RATE_LIMITED', 'The Fault Lab queue is full; try again in a minute.', { retryable: true, retryAfterSeconds: 60, stage: 'validation' })
-    return c.json(await lab.start(input.scenario, input.seed ?? lab.scenario(input.scenario).seed), 201)
+    return c.json(await lab.start(input.scenario, input.seed ?? lab.scenario(input.scenario).seed, input.protocol), 201)
   })
   const readRun = async (id: string) => {
     const row = await db.labRun.findUnique({ where: { id } })

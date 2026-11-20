@@ -173,6 +173,9 @@ enum LabCommand {
     Run {
         #[arg(long, value_parser = ["last-look", "censorship", "crash", "equivocation", "split-commitments", "private-front-run"])]
         scenario: String,
+        /// Fault Lab protocol only; public nets and followers always use today's protocol.
+        #[arg(long, value_parser = ["today", "agreement", "lanes"], default_value = "today")]
+        protocol: String,
         #[arg(long)]
         seed: String,
         /// First of the twelve sandbox QUIC ports.
@@ -331,7 +334,7 @@ async fn run() -> anyhow::Result<()> {
         }
         Command::Net { command: NetCommand::Import { .. } } => unreachable!("handled above"),
         Command::Schedule | Command::Identities { .. } | Command::Keygen { .. } | Command::Send { .. } | Command::Replay { .. } | Command::Node { .. } | Command::Hub { .. } => unreachable!("handled above"),
-        Command::Lab { command: LabCommand::Run { scenario, seed, base_port, out, genesis } } => {
+        Command::Lab { command: LabCommand::Run { scenario, protocol, seed, base_port, out, genesis } } => {
             // The faulty window is the fifth, after the net has settled; its attacker is the
             // scenario's proposer role (for censorship, the honest proposer that carries the transaction).
             let window = 4;
@@ -344,7 +347,7 @@ async fn run() -> anyhow::Result<()> {
                 run_seconds: Some(12),
                 store_path: format!("{out}/store"),
                 genesis_path: Some(genesis),
-                fault: Some(acrux_node::types::Fault { scenario, window, attacker, out }),
+                fault: Some(acrux_node::types::Fault { scenario, protocol, window, attacker, out }),
                 ..Default::default()
             }
         }

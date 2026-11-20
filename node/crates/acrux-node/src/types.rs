@@ -86,11 +86,14 @@ pub struct CommitReceipt {
 #[serde(rename_all = "camelCase")]
 pub struct Fault {
     pub scenario: String,
+    #[serde(default="today_protocol")]
+    pub protocol: String,
     pub window: u64,
     pub attacker: usize,
     /// Where the runner writes `outcome.json`.
     pub out: String,
 }
+fn today_protocol()->String {"today".into()}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Envelope {
     pub from: usize,

@@ -3,7 +3,7 @@ import type { z } from 'zod'
 import { toBase58, toBase64 } from './encoding.js'
 import { PROTOCOL_PARAMETERS, errors } from './schemas.js'
 import type { Balance, GenesisShare, HubEarnings, Bridge, BridgeTransfer, Burn, BurnEpoch, DemoPool, Evidence, Facts, FaucetPolicy, FaucetStatus, FaucetGrant, LabScenario, RegistryConfig, SchedulePreview, SpecMap } from './schemas.js'
-import type { HashExchangePair, HashExchange as HashExchangeView, HubHashExchange, Cblock, Certificate, ExecutionSchedule, Hub, LabRun, Member, MergedTransaction, NetSnapshot, Parameters, Proposer, Slot, Transaction, Window } from './schemas.js'
+import type { HashExchangePair, HashExchange as HashExchangeView, HubHashExchange, Cblock, Certificate, ExecutionSchedule, Hub, LabProtocol, LabRun, Member, MergedTransaction, NetSnapshot, Parameters, Proposer, Slot, Transaction, Window } from './schemas.js'
 import type { ApiErrorBody } from './errors.js'
 import type { LabReplay, ProtocolEvent } from './events.js'
 
@@ -360,7 +360,7 @@ function labYardstick(skipped: boolean): NonNullable<LabRun['yardstick']> {
 export const labRuns: LabRun[] = scenarios.map(scenario => {
   const skipped = ['last-look', 'equivocation', 'split-commitments'].includes(scenario.id)
   const slot = makeFixtureSlot(64, skipped ? 'skipped' : 'finalized', { crashedProposer: scenario.id === 'crash' ? 3 : undefined, skipReason: scenario.id === 'equivocation' ? 'equivocation' : 'disagreeing_vectors' })
-  return { id: `run-${scenario.id}`, scenario, seed: scenario.seed, status: 'done', createdAt: FIXTURE_TIME,
+  return { id: `run-${scenario.id}`, scenario, seed: scenario.seed, protocol: 'today', status: 'done', createdAt: FIXTURE_TIME,
     startedAt: FIXTURE_TIME, endedAt: '2026-11-16T00:00:02.000Z', outcome: scenario.expectedOutcome,
     evidence: [scenarioEvidence(scenario, slot)], yardstick: labYardstick(skipped), failure: null }
 })
@@ -369,11 +369,24 @@ export const labRunsByState: Record<LabRun['status'], LabRun> = {
   running: { ...labRuns[0]!, id: 'run-running', status: 'running', endedAt: null, outcome: null, evidence: [], yardstick: null },
   done: labRuns[0]!, failed_to_start: { ...labRuns[0]!, id: 'run-failed', status: 'failed_to_start', startedAt: null, endedAt: FIXTURE_TIME, outcome: null, evidence: [], yardstick: null, failure: 'The fixture sandbox could not acquire a runner.' },
 }
+/** Local agreement continues the split-commitment window; the lanes branch is not built yet. */
+export const windowContinuedEvidence: Evidence = { kind: 'window_continued', slot: 64, attackSlot: 64, proposer: 3,
+  txId: null, description: 'The split commitment was resolved by local agreement; the window continued and finalized.',
+  hashes: [], signatures: [], observedFragments: null, threshold: null, agreedSet: [1, 2, 3], finalized: true }
+const splitCommitmentRun = labRuns.find(run => run.scenario.id === 'split-commitments')!
+export const labRunsByProtocol: Record<LabProtocol, LabRun> = {
+  today: splitCommitmentRun,
+  agreement: { ...splitCommitmentRun, id: 'run-split-commitments-agreement', protocol: 'agreement',
+    outcome: windowContinuedEvidence.description, evidence: [windowContinuedEvidence], yardstick: labYardstick(false) },
+  lanes: { ...splitCommitmentRun, id: 'run-split-commitments-lanes', protocol: 'lanes', status: 'failed_to_start',
+    startedAt: null, outcome: null, evidence: [], yardstick: null, failure: 'The lanes protocol is not built yet.' },
+}
 /** Every envelope keeps its own anchor; sequence orders a replay across overlapping slots. */
 export function makeLabReplay(run: LabRun): LabReplay {
-  const skipped = ['last-look', 'equivocation', 'split-commitments'].includes(run.scenario.id)
+  const continues = run.protocol === 'agreement' && run.scenario.id === 'split-commitments'
+  const skipped = !continues && ['last-look', 'equivocation', 'split-commitments'].includes(run.scenario.id)
   const crash = run.scenario.id === 'crash'
-  const count = crash ? 16 : 4
+  const count = crash || continues ? 16 : 4
   const slots = Array.from({ length: count }, (_, i) => makeFixtureSlot(64 + i, skipped ? 'skipped' : 'finalized', {
     crashedProposer: crash ? 3 : undefined,
     skipReason: run.scenario.id === 'equivocation' ? 'equivocation' : 'disagreeing_vectors',
@@ -387,21 +400,21 @@ export function makeLabReplay(run: LabRun): LabReplay {
   add('window.started', slots[0]!.window, 0, null, 'window')
   for (const slot of slots) {
     if (run.scenario.id === 'censorship') { slot.mergedOrder[0]!.sourceProposers = [3]; slot.mergedOrder[0]!.kind = 'plain'; slot.mergedOrder[0]!.n = 3; slot.mergedOrder[0]!.t = 1; slot.mergedOrder[0]!.fragmentIndices = [] }
-    if (run.scenario.id === 'equivocation' || run.scenario.id === 'split-commitments') {
+    if (skipped && (run.scenario.id === 'equivocation' || run.scenario.id === 'split-commitments')) {
       const healthy = makeFixtureSlot(slot.slot)
       slot.blocks = healthy.blocks.map(block => ({ ...block, status: 'dropped' }))
       slot.attestations = healthy.attestations
       slot.window = healthy.window
       slot.skip!.disagreeingVectors = slot.attestations
     }
-    if (run.scenario.id === 'split-commitments') {
+    if (run.scenario.id === 'split-commitments' && (!continues || slot.slot === 64)) {
       const third = slot.blocks[2]!
       third.commitment!.sentUs = 54400
       third.commitment!.arrivals = third.commitment!.arrivals.filter(a => a.receiver === 1).map(a => ({ ...a, arrivedUs: 56400, relativeToStartUs: 6400, onTime: true }))
       slot.attestations[0]!.pi[2] = third.commitment!.hash
       slot.attestations[1]!.pi[2] = null
       slot.attestations[2]!.pi[2] = third.commitment!.hash
-      slot.skip!.detail = 'Proposer 3 sent its commitment only to proposer 1; vectors disagree.'
+      if (slot.skip) slot.skip.detail = 'Proposer 3 sent its commitment only to proposer 1; vectors disagree.'
     }
     if (run.scenario.id === 'equivocation') {
       slot.attestations[2]!.pi[2] = fixtureHash('conflict-two')
@@ -471,7 +484,7 @@ export function replayOffsetUs(event: ProtocolEvent, firstSlot = 64): number {
   if (event.anchor === 'consensus') return (Math.floor((event.slot ?? firstSlot) / 4) * 4 - firstSlot) * 50000 + event.atUs
   return event.atUs
 }
-export const labReplays = Object.fromEntries(labRuns.map(run => [run.id, makeLabReplay(run)]))
+export const labReplays = Object.fromEntries([...labRuns, labRunsByProtocol.agreement].map(run => [run.id, makeLabReplay(run)]))
 export const specMap: z.infer<typeof SpecMap> = {
   paper: 'New Constellation v1.0 — Kniep and Wattenhofer, 2026-11-14', parameters: fixtureParameters,
   entries: [

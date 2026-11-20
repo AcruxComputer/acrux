@@ -16,6 +16,8 @@ pub async fn run(
     state: Arc<RwLock<GatewayState>>,
     commands: mpsc::Receiver<GatewayCommand>,
 ) -> Result<()> {
+    anyhow::ensure!(fault.protocol!="lanes","lanes is not built yet");
+    anyhow::ensure!(matches!(fault.protocol.as_str(),"today"|"agreement"),"Unknown Fault Lab protocol");
     let out = Path::new(&fault.out);
     std::fs::create_dir_all(out)?;
     let mut events = state.read().await.events.subscribe();

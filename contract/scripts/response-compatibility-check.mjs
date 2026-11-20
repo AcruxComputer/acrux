@@ -91,7 +91,10 @@ for (const [name, schema] of objectResponses) acceptsAdditions(name, schema, res
 for (const [name, schema, fixture] of [
   ['PageInfo', PageInfo, paged([]).page], ['page', page(s.Hub), paged([f.outsideFormedHub])],
   ['ProgramError', ProgramError, error.error.programError], ['baseErrors.ApiError', baseErrors.ApiError, error],
-  ['LabReplay', LabReplay, replay], ['LabScenarios', z.array(s.LabScenario), f.scenarios],
+  ['LabReplay', LabReplay, replay], ['LabReplay:agreement', LabReplay, f.labReplays[f.labRunsByProtocol.agreement.id]],
+  ['Evidence:window_continued', s.Evidence, f.windowContinuedEvidence],
+  ['LabRun:agreement', s.LabRun, f.labRunsByProtocol.agreement], ['LabRun:lanes', s.LabRun, f.labRunsByProtocol.lanes],
+  ['LabScenarios', z.array(s.LabScenario), f.scenarios],
   ['RpcFailure', RpcFailure, { jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'Refused', data: error } }],
 ]) acceptsAdditions(name, schema, fixture)
 
@@ -136,6 +139,11 @@ const oldFacts = olderFacts.parse(withAdditions(s.Facts, f.factsWithOutside))
 assert.equal(Object.hasOwn(oldFacts, 'hashExchange'), false)
 assert.equal(Object.hasOwn(oldFacts, 'commitSpreadByLinkUs'), false)
 acceptsAdditions('older-shaped Facts fixture', s.Facts, oldFacts)
+// Old stored runs predate the optional protocol label; new requests default to today's branch.
+const { protocol: _protocol, ...olderRun } = f.labRuns[0]
+acceptsAdditions('older-shaped LabRun', s.LabRun, olderRun)
+assert.equal(s.LabRunRequest.parse({ scenario: 'crash' }).protocol, 'today')
+assert.equal(s.LabRunRequest.safeParse({ scenario: 'crash', protocol: 'unknown' }).success, false)
 assert.equal(s.Hub.safeParse({ ...f.outsideFormedHub, formedOutside: 'yes' }).success, false, 'Known field types still validate')
 assert.equal(s.Slot.safeParse({ ...slot, slot: -1 }).success, false, 'Known field bounds still validate')
 
@@ -147,6 +155,7 @@ const requests = [
   ['TxHeaderRequest', s.TxHeaderRequest, transaction.header], ['QuoteRequest', s.QuoteRequest, quoteRequest],
   ['PlainSubmission', s.PlainSubmission, plain], ['FragmentSubmission', s.FragmentSubmission, fragment],
   ['FaucetRequest', s.FaucetRequest, { address }], ['LabRunRequest', s.LabRunRequest, { scenario: 'crash' }],
+  ...['today', 'agreement', 'lanes'].map(protocol => [`LabRunRequest:${protocol}`, s.LabRunRequest, { scenario: 'split-commitments', protocol }]),
   ['PageQuery', s.PageQuery, {}], ['BridgeTransfersQuery', s.BridgeTransfersQuery, { address, kind: 'withdrawal' }],
   ['RpcRequest', RpcRequest, { jsonrpc: '2.0', id: 1, method: 'getSlot', params: { slot: 64 } }],
   ...[{ kind: 'all' }, { kind: 'slots', from: 64, to: 67 }, { kind: 'transaction', id: transaction.header.id }]
@@ -173,6 +182,6 @@ for (const [name, schema, fixture] of [['PlainSubmission', s.PlainSubmission, pl
 }
 assert.equal(StreamCommand.safeParse({ version: 1, type: 'subscribe', filter: { kind: 'all', [extra]: 'rejected' } }).success, false,
   'StreamCommand rejects unknown nested filter fields')
-console.log(JSON.stringify({ check: 'response-compatibility', responseObjects: objectResponses.length, auxiliaryResponses: 7,
+console.log(JSON.stringify({ check: 'response-compatibility', responseObjects: objectResponses.length, auxiliaryResponses: 11,
   eventVariants: events.size, rpcResults: Object.keys(rpcMethods).length, nestedResponseObjects: objectSites,
-  strictRequestCases: requests.length, strictNestedRequests: 3, olderShapes: 3, result: 'passed' }))
+  strictRequestCases: requests.length, strictNestedRequests: 3, olderShapes: 4, result: 'passed' }))

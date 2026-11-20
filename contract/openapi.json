@@ -3,7 +3,7 @@
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "info": {
     "title": "Acrux API",
-    "version": "0.1.31",
+    "version": "0.1.32",
     "description": "Round 1 fixture contract. Amounts are decimal integer strings. Times are relative microseconds with UTC slot wallTime."
   },
   "servers": [
@@ -4743,7 +4743,7 @@
       },
       "post": {
         "operationId": "startLabRun",
-        "summary": "Start a fixture lab run",
+        "summary": "Start a lab run with today, agreement or lanes (default today)",
         "parameters": [
           {
             "in": "header",
@@ -7923,7 +7923,8 @@
               "two_proposers_continue",
               "slashing_proof",
               "skip_certificate",
-              "unreadable_fragment"
+              "unreadable_fragment",
+              "window_continued"
             ]
           },
           "slot": {
@@ -7995,6 +7996,22 @@
                 "type": "null"
               }
             ]
+          },
+          "attackSlot": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "agreedSet": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3
+            }
+          },
+          "finalized": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -11031,6 +11048,14 @@
         ],
         "additionalProperties": false
       },
+      "LabProtocol": {
+        "type": "string",
+        "enum": [
+          "today",
+          "agreement",
+          "lanes"
+        ]
+      },
       "LabRun": {
         "type": "object",
         "properties": {
@@ -11094,6 +11119,14 @@
           "seed": {
             "type": "string"
           },
+          "protocol": {
+            "type": "string",
+            "enum": [
+              "today",
+              "agreement",
+              "lanes"
+            ]
+          },
           "status": {
             "type": "string",
             "enum": [
@@ -11151,7 +11184,8 @@
                     "two_proposers_continue",
                     "slashing_proof",
                     "skip_certificate",
-                    "unreadable_fragment"
+                    "unreadable_fragment",
+                    "window_continued"
                   ]
                 },
                 "slot": {
@@ -11223,6 +11257,22 @@
                       "type": "null"
                     }
                   ]
+                },
+                "attackSlot": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "agreedSet": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 3
+                  }
+                },
+                "finalized": {
+                  "type": "boolean"
                 }
               },
               "required": [
@@ -11370,6 +11420,15 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 128
+          },
+          "protocol": {
+            "default": "today",
+            "type": "string",
+            "enum": [
+              "today",
+              "agreement",
+              "lanes"
+            ]
           }
         },
         "required": [
@@ -11445,6 +11504,14 @@
                 "seed": {
                   "type": "string"
                 },
+                "protocol": {
+                  "type": "string",
+                  "enum": [
+                    "today",
+                    "agreement",
+                    "lanes"
+                  ]
+                },
                 "status": {
                   "type": "string",
                   "enum": [
@@ -11502,7 +11569,8 @@
                           "two_proposers_continue",
                           "slashing_proof",
                           "skip_certificate",
-                          "unreadable_fragment"
+                          "unreadable_fragment",
+                          "window_continued"
                         ]
                       },
                       "slot": {
@@ -11574,6 +11642,22 @@
                             "type": "null"
                           }
                         ]
+                      },
+                      "attackSlot": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "agreedSet": {
+                        "type": "array",
+                        "items": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 3
+                        }
+                      },
+                      "finalized": {
+                        "type": "boolean"
                       }
                     },
                     "required": [
@@ -26920,6 +27004,14 @@
                   "seed": {
                     "type": "string"
                   },
+                  "protocol": {
+                    "type": "string",
+                    "enum": [
+                      "today",
+                      "agreement",
+                      "lanes"
+                    ]
+                  },
                   "status": {
                     "type": "string",
                     "enum": [
@@ -26977,7 +27069,8 @@
                             "two_proposers_continue",
                             "slashing_proof",
                             "skip_certificate",
-                            "unreadable_fragment"
+                            "unreadable_fragment",
+                            "window_continued"
                           ]
                         },
                         "slot": {
@@ -27049,6 +27142,22 @@
                               "type": "null"
                             }
                           ]
+                        },
+                        "attackSlot": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "agreedSet": {
+                          "type": "array",
+                          "items": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 3
+                          }
+                        },
+                        "finalized": {
+                          "type": "boolean"
                         }
                       },
                       "required": [
@@ -27250,7 +27359,8 @@
                       "two_proposers_continue",
                       "slashing_proof",
                       "skip_certificate",
-                      "unreadable_fragment"
+                      "unreadable_fragment",
+                      "window_continued"
                     ]
                   },
                   "slot": {
@@ -27322,6 +27432,22 @@
                         "type": "null"
                       }
                     ]
+                  },
+                  "attackSlot": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "agreedSet": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 3
+                    }
+                  },
+                  "finalized": {
+                    "type": "boolean"
                   }
                 },
                 "required": [
@@ -27418,6 +27544,14 @@
               "seed": {
                 "type": "string"
               },
+              "protocol": {
+                "type": "string",
+                "enum": [
+                  "today",
+                  "agreement",
+                  "lanes"
+                ]
+              },
               "status": {
                 "type": "string",
                 "enum": [
@@ -27475,7 +27609,8 @@
                         "two_proposers_continue",
                         "slashing_proof",
                         "skip_certificate",
-                        "unreadable_fragment"
+                        "unreadable_fragment",
+                        "window_continued"
                       ]
                     },
                     "slot": {
@@ -27547,6 +27682,22 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "attackSlot": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "agreedSet": {
+                      "type": "array",
+                      "items": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 3
+                      }
+                    },
+                    "finalized": {
+                      "type": "boolean"
                     }
                   },
                   "required": [
@@ -36593,6 +36744,14 @@
                         "seed": {
                           "type": "string"
                         },
+                        "protocol": {
+                          "type": "string",
+                          "enum": [
+                            "today",
+                            "agreement",
+                            "lanes"
+                          ]
+                        },
                         "status": {
                           "type": "string",
                           "enum": [
@@ -36650,7 +36809,8 @@
                                   "two_proposers_continue",
                                   "slashing_proof",
                                   "skip_certificate",
-                                  "unreadable_fragment"
+                                  "unreadable_fragment",
+                                  "window_continued"
                                 ]
                               },
                               "slot": {
@@ -36722,6 +36882,22 @@
                                     "type": "null"
                                   }
                                 ]
+                              },
+                              "attackSlot": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "agreedSet": {
+                                "type": "array",
+                                "items": {
+                                  "type": "integer",
+                                  "minimum": 1,
+                                  "maximum": 3
+                                }
+                              },
+                              "finalized": {
+                                "type": "boolean"
                               }
                             },
                             "required": [
@@ -36923,7 +37099,8 @@
                             "two_proposers_continue",
                             "slashing_proof",
                             "skip_certificate",
-                            "unreadable_fragment"
+                            "unreadable_fragment",
+                            "window_continued"
                           ]
                         },
                         "slot": {
@@ -36995,6 +37172,22 @@
                               "type": "null"
                             }
                           ]
+                        },
+                        "attackSlot": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "agreedSet": {
+                          "type": "array",
+                          "items": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 3
+                          }
+                        },
+                        "finalized": {
+                          "type": "boolean"
                         }
                       },
                       "required": [
@@ -43263,6 +43456,14 @@
                 "seed": {
                   "type": "string"
                 },
+                "protocol": {
+                  "type": "string",
+                  "enum": [
+                    "today",
+                    "agreement",
+                    "lanes"
+                  ]
+                },
                 "status": {
                   "type": "string",
                   "enum": [
@@ -43320,7 +43521,8 @@
                           "two_proposers_continue",
                           "slashing_proof",
                           "skip_certificate",
-                          "unreadable_fragment"
+                          "unreadable_fragment",
+                          "window_continued"
                         ]
                       },
                       "slot": {
@@ -43392,6 +43594,22 @@
                             "type": "null"
                           }
                         ]
+                      },
+                      "attackSlot": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "agreedSet": {
+                        "type": "array",
+                        "items": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 3
+                        }
+                      },
+                      "finalized": {
+                        "type": "boolean"
                       }
                     },
                     "required": [
@@ -52421,6 +52639,14 @@
                           "seed": {
                             "type": "string"
                           },
+                          "protocol": {
+                            "type": "string",
+                            "enum": [
+                              "today",
+                              "agreement",
+                              "lanes"
+                            ]
+                          },
                           "status": {
                             "type": "string",
                             "enum": [
@@ -52478,7 +52704,8 @@
                                     "two_proposers_continue",
                                     "slashing_proof",
                                     "skip_certificate",
-                                    "unreadable_fragment"
+                                    "unreadable_fragment",
+                                    "window_continued"
                                   ]
                                 },
                                 "slot": {
@@ -52550,6 +52777,22 @@
                                       "type": "null"
                                     }
                                   ]
+                                },
+                                "attackSlot": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                "agreedSet": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": 3
+                                  }
+                                },
+                                "finalized": {
+                                  "type": "boolean"
                                 }
                               },
                               "required": [
@@ -52751,7 +52994,8 @@
                               "two_proposers_continue",
                               "slashing_proof",
                               "skip_certificate",
-                              "unreadable_fragment"
+                              "unreadable_fragment",
+                              "window_continued"
                             ]
                           },
                           "slot": {
@@ -52823,6 +53067,22 @@
                                 "type": "null"
                               }
                             ]
+                          },
+                          "attackSlot": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "agreedSet": {
+                            "type": "array",
+                            "items": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "maximum": 3
+                            }
+                          },
+                          "finalized": {
+                            "type": "boolean"
                           }
                         },
                         "required": [

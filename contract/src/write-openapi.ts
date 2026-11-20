@@ -26,7 +26,7 @@ const operations: Operation[] = [
   { method:'post',path:'/v1/faucet',operationId:'faucet',summary:'Local funding grant; node mode returns the real transaction ID and signature',request:'FaucetRequest',response:'FaucetGrant' },
   { method:'get',path:'/v1/lab/scenarios',operationId:'labScenarios',summary:'Six reproducible fault scenarios',response:'LabScenarios' },
   { method:'get',path:'/v1/lab/runs',operationId:'labRuns',summary:'Recorded lab runs',response:'LabRuns',query:s.PageQuery },
-  { method:'post',path:'/v1/lab/runs',operationId:'startLabRun',summary:'Start a fixture lab run',response:'LabRun',request:'LabRunRequest',created:true },
+  { method:'post',path:'/v1/lab/runs',operationId:'startLabRun',summary:'Start a lab run with today, agreement or lanes (default today)',response:'LabRun',request:'LabRunRequest',created:true },
   { method:'get',path:'/v1/lab/runs/{id}',operationId:'labRun',summary:'Lab run progress and evidence',response:'LabRun' },
   { method:'get',path:'/v1/lab/runs/{id}/events',operationId:'labReplay',summary:'Recorded protocol event replay',response:'LabReplay' },
 ]

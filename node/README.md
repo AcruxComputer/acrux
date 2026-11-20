@@ -365,9 +365,27 @@ A validator that falls more than two windows behind catches up: it executes and 
 
 ```bash
 ./target/release/acrux lab run --scenario last-look --seed acrux-last-look-1 --base-port 5016 --out <dir>
+./target/release/acrux lab run --scenario split-commitments --protocol agreement --seed acrux-agreement-1 --base-port 5016 --out <dir>
 ```
 
-A sandbox of twelve validators runs for 12 s with the scenario's fault in window 4 and writes `events.jsonl` (every protocol event of windows 3 to 5, appended live) and `outcome.json` (status, outcome, evidence). The API runs it per lab run and keeps both in Postgres.
+A sandbox of twelve validators runs for 12 s with the scenario's fault in window 4 and writes `events.jsonl` (every protocol event of windows 3 to 5, appended live) and `outcome.json` (protocol, status, outcome, evidence and yardstick). The yardstick keeps node zero's status, votes, certificate kinds and finalization time for every cblock of those three windows. The API runs it per lab run and keeps both in Postgres.
+
+`--protocol today|agreement|lanes` belongs only to `lab run`; it defaults to
+`today`. `lanes` is accepted but stops with "lanes is not built yet". Public
+`net up`, RPC followers and outside proposers keep the existing unanimous rule.
+There is no activation slot or public-net protocol setting.
+
+`agreement` uses one signed 2-of-3 quorum per block hash. Null entries do not
+contradict a hash; conflicting hashes still prevent agreement. The local view
+collects authenticated attestations on the control ingress, independently of
+validator block-data queues. It closes with all three signed attestations, or two identical vectors whose set a
+third non-conflicting row cannot enlarge. Other partial views wait two global
+message flights (2 * 250 ms) from the first signed arrival. A delayed local
+window timer or a partly drained actor queue cannot close an empty view permanently. Once a quorum exists, its
+canonical hashes are fixed before waiting for data and enter the cblock hash
+too. A node missing a chosen block or key waits for the existing
+Rotor slices and key-release attestations. Validators execute and vote through
+the same merge and Votor paths.
 
 | Scenario | Fault | Evidence | Lemma |
 |---|---|---|---|
@@ -377,6 +395,14 @@ A sandbox of twelve validators runs for 12 s with the scenario's fault in window
 | `equivocation` | proposer 3 signs two commitments for one slot | `slashing_proof` (both signatures), `skip_certificate` | Lemma 2.4 |
 | `split-commitments` | proposer 3's commitment reaches only proposer 1 | `skip_certificate` | Lemma 2.2 |
 | `private-front-run` | receiver 1 holds one fragment of a 2-of-3 transaction | `unreadable_fragment` (1 of 2), then the transaction executes | Section 3.2, Lemma 2.3 |
+
+The table describes `today`. Under `agreement`, `split-commitments` instead
+requires `window_continued`, naming the attack slot, `agreedSet` and
+`finalized: true`. `last-look` keeps `late_block_dropped` and expects
+`window_continued` in place of a skip. Crash, censorship, equivocation and
+private-fragment evidence retain their meanings. Run the six paired cases with
+`node node/scripts/lab-agreement-check.mjs` from `backend/`; it prints each
+run's yardstick summary and removes its own temporary stores.
 
 ## CLI
 

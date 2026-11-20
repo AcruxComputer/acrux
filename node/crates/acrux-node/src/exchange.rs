@@ -94,6 +94,8 @@ pub struct ExchangeEngine {
     targets: Vec<usize>,
     gateway: Arc<RwLock<GatewayState>>,
     slots: Mutex<BTreeMap<(usize, u64), Exchange>>,
+    /// Lab-only signed agreement views, collected independently of SVM actor queues.
+    agreement: Mutex<BTreeMap<(usize,u64),crate::agreement::Round>>,
     spreads: Mutex<SpreadMeasurements>,
     omitted: Mutex<Vec<serde_json::Value>>,
     commit_times: Mutex<BTreeMap<u64, Instant>>,
@@ -124,6 +126,7 @@ impl ExchangeEngine {
             keys: keys.into_iter().enumerate().collect(),
             gateway,
             slots: Mutex::new(BTreeMap::new()),
+            agreement: Mutex::new(BTreeMap::new()),
             spreads: Mutex::new(SpreadMeasurements::default()),
             omitted: Mutex::new(Vec::new()),
             commit_times: Mutex::new(BTreeMap::new()),
@@ -149,6 +152,7 @@ impl ExchangeEngine {
             targets: (0..12).collect(),
             gateway,
             slots: Mutex::new(BTreeMap::new()),
+            agreement: Mutex::new(BTreeMap::new()),
             spreads: Mutex::new(SpreadMeasurements::default()),
             omitted: Mutex::new(Vec::new()),
             commit_times: Mutex::new(BTreeMap::new()),
@@ -167,6 +171,14 @@ impl ExchangeEngine {
     /// The caller has authenticated this signer and checked the scheduled receipt route.
     pub fn receive_receipt(&self, owner:usize, from:usize, receipt:CommitReceipt, received_at:Instant) {
         self.metrics.received(owner,from,receipt.slot,receipt.proposer,receipt.hash,received_at);
+    }
+
+    /// Only the fixed-duration lab agreement runner routes authenticated rows here.
+    pub(crate) fn receive_attestation(&self,owner:usize,attestation:Attestation,signature:Vec<u8>,at:Instant) {
+        self.agreement.lock().unwrap().entry((owner,attestation.slot)).or_default().record(attestation,signature,at);
+    }
+    pub(crate) fn agreement_snapshot(&self,owner:usize,slot:u64)->Option<crate::agreement::Snapshot> {
+        self.agreement.lock().unwrap().get_mut(&(owner,slot)).map(|round|round.snapshot(Instant::now()))
     }
 
     pub fn metrics_json(&self)->serde_json::Value { self.metrics.json() }
