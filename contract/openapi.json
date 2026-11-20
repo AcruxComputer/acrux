@@ -3,7 +3,7 @@
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "info": {
     "title": "Acrux API",
-    "version": "0.1.27",
+    "version": "0.1.28",
     "description": "Round 1 fixture contract. Amounts are decimal integer strings. Times are relative microseconds with UTC slot wallTime."
   },
   "servers": [
@@ -9648,6 +9648,21 @@
               "commitSpreadUs"
             ],
             "additionalProperties": false
+          },
+          "formedOutside": {
+            "type": "boolean"
+          },
+          "activatedAtEpoch": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -10235,6 +10250,21 @@
                     "commitSpreadUs"
                   ],
                   "additionalProperties": false
+                },
+                "formedOutside": {
+                  "type": "boolean"
+                },
+                "activatedAtEpoch": {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
@@ -16692,6 +16722,53 @@
         "additionalProperties": false
       },
       "TxHeader": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "feePayer": {
+            "type": "string",
+            "minLength": 32,
+            "maxLength": 44
+          },
+          "priorityFeePerCu": {
+            "type": "string",
+            "maxLength": 78,
+            "pattern": "^(0|[1-9][0-9]*)$",
+            "description": "Micro-lamports per compute unit, encoded as an unsigned decimal string."
+          },
+          "computeLimit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "writableAccounts": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 32,
+              "maxLength": 44
+            }
+          },
+          "targetSlot": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "id",
+          "feePayer",
+          "priorityFeePerCu",
+          "computeLimit",
+          "writableAccounts",
+          "targetSlot"
+        ],
+        "additionalProperties": false
+      },
+      "TxHeaderRequest": {
         "type": "object",
         "properties": {
           "id": {

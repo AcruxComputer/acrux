@@ -1,5 +1,6 @@
 //! Bounded observations of actual Algorithm 1 commitments, separate from consensus timing.
 use serde_json::{json, Value};
+use serde::{Serialize,Deserialize};
 use std::{collections::{BTreeMap,VecDeque},sync::{Arc,RwLock,mpsc::{sync_channel,Receiver,RecvTimeoutError,SyncSender}},time::{Duration,Instant,SystemTime,UNIX_EPOCH}};
 
 const WINDOW: Duration = Duration::from_secs(10 * 60);
@@ -11,18 +12,19 @@ impl Kind {
     fn name(self)->&'static str {match self {Self::Applied=>"applied",Self::Real=>"real"}}
     fn pair(a:usize,b:usize)->Self {if a<12&&b<12 {Self::Applied} else {Self::Real}}
 }
+struct Sample {at:Instant,sequence:u64,value:u64}
 #[derive(Default)]
-struct Samples(VecDeque<(Instant,u64)>);
+struct Samples(VecDeque<Sample>);
 impl Samples {
-    fn prune(&mut self,now:Instant) {
-        self.0.retain(|(at,_)|now.saturating_duration_since(*at)<=WINDOW);
-    }
-    fn push(&mut self,at:Instant,value:u64) {
-        self.0.push_back((at,value));
+    fn prune(&mut self,now:Instant) {self.0.retain(|sample|now.saturating_duration_since(sample.at)<=WINDOW);}
+    fn push(&mut self,at:Instant,value:u64,sequence:u64) {
+        self.0.push_back(Sample{at,value,sequence});
         if self.0.len()>MAX_SAMPLES {self.0.pop_front();}
     }
-    fn values(&self)->Vec<u64> {self.0.iter().map(|(_,value)|*value).collect()}
-
+    fn values(&self)->Vec<u64> {self.0.iter().map(|sample|sample.value).collect()}
+    fn report(&self)->Vec<(u64,u64)> {
+        self.0.iter().skip(self.0.len().saturating_sub(128)).map(|sample|(sample.sequence,sample.value)).collect()
+    }
 }
 struct WindowMetadata {hub:String,catalog:Vec<String>,co_ids:Vec<usize>}
 struct Pending {sent:Instant,proposer:usize,hub:String,members:[String;2],kind:Kind}
@@ -35,6 +37,25 @@ pub struct Snapshot {
     spreads:Vec<((String,Kind),Vec<u64>)>,
     total_spreads:BTreeMap<Kind,Vec<u64>>,
 }
+#[derive(Clone,Default,Serialize,Deserialize)]
+pub(crate) struct ExchangeReport {
+    pub session:u64,
+    pub pairs:Vec<ReportedPair>,
+    pub spreads:Vec<ReportedSpread>,
+    pub arrivals:Vec<ReportedArrival>,
+}
+#[derive(Clone,Serialize,Deserialize)]
+pub(crate) struct ReportedArrival {
+    pub slot:u64,pub hash:[u8;32],pub proposer:usize,pub receiver:usize,pub start_us:u64,pub arrived_us:u64,
+    pub relative_to_start_us:i64,pub on_time:bool,
+}
+impl ReportedArrival {
+    pub fn json(&self)->Value {json!({"proposer":self.proposer,"hash":hex::encode(self.hash),"arrival":{"receiver":self.receiver,"startUs":self.start_us,"arrivedUs":self.arrived_us,"relativeToStartUs":self.relative_to_start_us,"deadlineUs":20000,"onTime":self.on_time}})}
+}
+#[derive(Clone,Serialize,Deserialize)]
+pub(crate) struct ReportedPair {pub hub:String,pub members:[String;2],pub values:Vec<(u64,u64)>}
+#[derive(Clone,Serialize,Deserialize)]
+pub(crate) struct ReportedSpread {pub hub:String,pub values:Vec<(u64,u64)>}
 fn stats(mut values:Vec<u64>)->Value {
     if values.is_empty(){return Value::Null}
     values.sort_unstable();
@@ -64,6 +85,7 @@ impl Snapshot {
 
 #[derive(Default)]
 pub struct ExchangeMetrics {
+    sequence:u64,
     windows:BTreeMap<u64,WindowMetadata>,
     pending:BTreeMap<PendingKey,Pending>,
     pairs:BTreeMap<(String,[String;2],Kind),Samples>,
@@ -72,6 +94,12 @@ pub struct ExchangeMetrics {
     recorded_spreads:BTreeMap<(usize,u64,Kind),Instant>,
 }
 impl ExchangeMetrics {
+    fn report(&self,session:u64)->ExchangeReport {
+        ExchangeReport {session,arrivals:vec![],
+            pairs:self.pairs.iter().filter(|((_,_,kind),_)|*kind==Kind::Real).map(|((hub,members,_),values)|ReportedPair{hub:hub.clone(),members:members.clone(),values:values.report()}).collect(),
+            spreads:self.spreads.iter().filter(|((_,kind),_)|*kind==Kind::Real).map(|((hub,_),values)|ReportedSpread{hub:hub.clone(),values:values.report()}).collect(),
+        }
+    }
     pub fn set_window(&mut self,number:u64,hub:String,catalog:Vec<String>,co_ids:Vec<usize>) {
         self.windows.insert(number,WindowMetadata{hub,catalog,co_ids});
         let newest=*self.windows.keys().next_back().unwrap();
@@ -97,13 +125,15 @@ impl ExchangeMetrics {
         let pending=self.pending.remove(&key).unwrap();
         if at.saturating_duration_since(pending.sent)>WINDOW {return}
         let elapsed=at.saturating_duration_since(pending.sent).as_micros().min(u128::from(u64::MAX))as u64;
-        self.pairs.entry((pending.hub,pending.members,pending.kind)).or_default().push(at,elapsed);
+        self.sequence+=1;
+        self.pairs.entry((pending.hub,pending.members,pending.kind)).or_default().push(at,elapsed,self.sequence);
     }
     /// One hosted observer per slot. Only complete groups become samples: a missing peer never
     /// becomes zero, and a commitment received after the attestation deadline retains its real time.
     pub fn spreads(&mut self,owner:usize,slot:u64,received:&BTreeMap<usize,(Instant,crate::types::Commitment)>,at:Instant) {
         let Some(window)=self.windows.get(&(slot/16)) else{return};
-        if window.co_ids.iter().copied().filter(|id|*id<12).min()!=Some(owner) {return}
+        let observer=window.co_ids.iter().copied().filter(|id|*id<12).min().or_else(||window.co_ids.iter().copied().min());
+        if observer!=Some(owner) {return}
         let Some(own_role)=window.co_ids.iter().position(|id|*id==owner).map(|role|role+1) else{return};
         let Some((own_at,_))=received.get(&own_role) else{return};
         for kind in [Kind::Applied,Kind::Real] {
@@ -116,8 +146,9 @@ impl ExchangeMetrics {
             }
             if times.len()!=peers.len()+1 {continue}
             let value=times.iter().max().unwrap().saturating_duration_since(*times.iter().min().unwrap()).as_micros().min(u128::from(u64::MAX))as u64;
-            self.spreads.entry((window.hub.clone(),kind)).or_default().push(at,value);
-            self.total_spreads.entry(kind).or_default().push(at,value);
+            self.sequence+=1;
+            self.spreads.entry((window.hub.clone(),kind)).or_default().push(at,value,self.sequence);
+            self.total_spreads.entry(kind).or_default().push(at,value,self.sequence);
             self.recorded_spreads.insert((owner,slot,kind),at);
         }
     }
@@ -149,18 +180,27 @@ enum Event {
     Sent{owner:usize,slot:u64,hash:[u8;32],at:Instant},
     Receipt{owner:usize,peer:usize,slot:u64,proposer:usize,hash:[u8;32],at:Instant},
     Spreads{owner:usize,slot:u64,received:BTreeMap<usize,(Instant,crate::types::Commitment)>,at:Instant},
+    Report{identity:String,report:ExchangeReport},
+    Arrival(ReportedArrival),
 }
+struct Published {json:Value,report:ExchangeReport}
 
 /// Protocol hooks never wait for aggregation or readers. Overload loses telemetry only.
 /// The worker owns the receiver and published pointer, never this sender.
 pub(crate) struct Recorder {
     sender:SyncSender<Event>,
-    published:Arc<RwLock<Arc<Value>>>,
+    published:Arc<RwLock<Arc<Published>>>,
 }
 impl Recorder {
+    pub fn arrival(&self,slot:u64,data:&Value) {
+        let arrival=&data["arrival"];
+        self.send(Event::Arrival(ReportedArrival{slot,hash:hex::decode(data["hash"].as_str().unwrap()).unwrap().try_into().unwrap(),proposer:data["proposer"].as_u64().unwrap()as usize,
+            receiver:arrival["receiver"].as_u64().unwrap()as usize,start_us:arrival["startUs"].as_u64().unwrap(),
+            arrived_us:arrival["arrivedUs"].as_u64().unwrap(),relative_to_start_us:arrival["relativeToStartUs"].as_i64().unwrap(),on_time:arrival["onTime"].as_bool().unwrap()}));
+    }
     pub fn new()->Self {
         let (sender,receiver)=sync_channel(EVENT_CAPACITY);
-        let published=Arc::new(RwLock::new(Arc::new(empty_json())));
+        let published=Arc::new(RwLock::new(Arc::new(Published{json:empty_json(),report:ExchangeReport::default()})));
         let output=published.clone();
         std::thread::Builder::new().name("acrux-exchange-metrics".into()).spawn(move||collect(receiver,output)).expect("Cannot start exchange metrics worker");
         Self{sender,published}
@@ -182,11 +222,21 @@ impl Recorder {
     }
     pub fn json(&self)->Value {
         let cached={self.published.read().unwrap().clone()};
-        cached.as_ref().clone()
+        cached.json.clone()
+    }
+    pub fn report(&self)->ExchangeReport {
+        let cached={self.published.read().unwrap().clone()};
+        cached.report.clone()
+    }
+    pub fn include_report(&self,identity:String,report:ExchangeReport) {
+        self.send(Event::Report{identity,report});
     }
 }
-fn collect(receiver:Receiver<Event>,published:Arc<RwLock<Arc<Value>>>) {
+fn collect(receiver:Receiver<Event>,published:Arc<RwLock<Arc<Published>>>) {
     let mut metrics=ExchangeMetrics::default();
+    let session=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()as u64;
+    let mut reports:BTreeMap<String,(u64,BTreeMap<(String,[String;2]),u64>,BTreeMap<String,u64>,Instant)>=BTreeMap::new();
+    let mut arrivals=BTreeMap::new();
     let mut last_publish=Instant::now();
     loop {
         let wait=PUBLISH_INTERVAL.saturating_sub(last_publish.elapsed());
@@ -196,13 +246,43 @@ fn collect(receiver:Receiver<Event>,published:Arc<RwLock<Arc<Value>>>) {
                 Event::Sent{owner,slot,hash,at}=>metrics.sent(owner,slot,hash,at),
                 Event::Receipt{owner,peer,slot,proposer,hash,at}=>metrics.received(owner,peer,slot,proposer,hash,at),
                 Event::Spreads{owner,slot,received,at}=>metrics.spreads(owner,slot,&received,at),
+                Event::Arrival(row)=>{
+                    let slot=row.slot;
+                    arrivals.insert((row.slot,row.proposer,row.receiver),row);
+                    arrivals.retain(|(old,_,_),_|old.saturating_add(64)>=slot);
+                },
+                Event::Report{identity,report}=>{
+                    let progress=reports.entry(identity).or_insert_with(||(report.session,BTreeMap::new(),BTreeMap::new(),Instant::now()));
+                    if progress.0!=report.session {*progress=(report.session,BTreeMap::new(),BTreeMap::new(),Instant::now());}
+                    let now=Instant::now();progress.3=now;
+                    for row in report.pairs {
+                        let last=progress.1.entry((row.hub.clone(),row.members.clone())).or_default();
+                        for (number,value) in row.values {
+                            if number>*last {metrics.sequence+=1;metrics.pairs.entry((row.hub.clone(),row.members.clone(),Kind::Real)).or_default().push(now,value,metrics.sequence);*last=number;}
+                        }
+                    }
+                    for row in report.spreads {
+                        let last=progress.2.entry(row.hub.clone()).or_default();
+                        for (number,value) in row.values {
+                            if number>*last {
+                                metrics.sequence+=1;
+                                metrics.spreads.entry((row.hub.clone(),Kind::Real)).or_default().push(now,value,metrics.sequence);
+                                metrics.total_spreads.entry(Kind::Real).or_default().push(now,value,metrics.sequence);*last=number;
+                            }
+                        }
+                    }
+                },
             },
             Err(RecvTimeoutError::Timeout)=>{},
             Err(RecvTimeoutError::Disconnected)=>return,
         }
         // Check after every event too: a busy queue cannot postpone publication indefinitely.
         if last_publish.elapsed()>=PUBLISH_INTERVAL {
-            let rendered=Arc::new(metrics.snapshot(Instant::now()).json(measured_at()));
+            reports.retain(|_,progress|progress.3.elapsed()<=WINDOW);
+            let snapshot=metrics.snapshot(Instant::now());
+            let mut report=metrics.report(session);
+            report.arrivals=arrivals.values().cloned().collect();
+            let rendered=Arc::new(Published{json:snapshot.json(measured_at()),report});
             let previous={let mut pointer=published.write().unwrap();std::mem::replace(&mut *pointer,rendered)};
             drop(previous);
             last_publish=Instant::now();

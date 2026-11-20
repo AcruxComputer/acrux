@@ -106,10 +106,8 @@ fn hash32(text: &str) -> Result<[u8; 32]> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HubPeers { hub: String, address: String, certificate: String, peers: Vec<HubPeer> }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HubPeer { id: usize, identity: String }
+#[serde(rename_all="camelCase")]
+struct HubPeers { hub:String,address:String,certificate:String,peers:Vec<crate::member_link::HubPeer>,relay_peers:Vec<crate::member_link::HubPeer> }
 
 struct Slice {
     meta: crypto::ShredMeta,
@@ -142,7 +140,7 @@ struct Observer {
     outgoing: Vec<Vec<u8>>,
     epoch_updates: BTreeMap<u64, (crate::execution::AdmissionSnapshot, Vec<solana_sdk::pubkey::Pubkey>)>,
     reported_epoch: Option<u64>,
-    control: Option<std::sync::Arc<crate::external::ExternalControl>>,
+    control: Option<std::sync::Arc<crate::member_link::MemberLink>>,
     member: Option<crate::external_proposer::MemberProposer>,
     fast_lane: crate::external_proposer::FastLane,
     member_metrics: crate::external_proposer::MemberMetrics,
@@ -231,6 +229,9 @@ impl Observer {
                 self.votor.install_stakes(from,own,stakes)?;
             }
         }
+        if let Some(server)=self.control.as_ref().and_then(|link|link.server.as_ref()) {
+            server.set_catalog(self.keys.iter().enumerate().map(|(id,key)|(id,key.to_bytes())).collect())?;
+        }
         if self.member.is_none() {
             if let (Some(control),Some(id)) = (&self.control,proposers.catalog.iter().position(|identity|identity==&self.identity)) {
                 if id>=proposers.config.identities.len() {
@@ -242,7 +243,9 @@ impl Observer {
             member.finalized(&self.replay.executor);
             self.member_metrics.set(member.metrics_engine());
         }
-        self.fast_lane.update(proposers.clone(),self.keys.clone(),self.member.as_ref().map(|member|member.inbox()),self.identity.clone(),self.hub.clone());
+        let effective=self.bridge.as_ref().and_then(|bridge|bridge.admission_from_slot).is_some_and(|from|self.anchor.slot*4>=from)
+            &&self.replay.executor.effective_memberships(self.epoch(self.anchor.slot))?.iter().any(|member|member.identity.to_string()==self.identity&&member.hub==self.hub);
+        self.fast_lane.update(proposers.clone(),self.keys.clone(),self.member.as_ref().map(|member|member.inbox()),self.identity.clone(),self.hub.clone(),effective);
         for checkpoint in self.checkpoints.values_mut() { checkpoint.proposers = self.replay.proposers.clone(); }
         let ready = self.epoch_updates.iter().filter(|(epoch,_)|proposers.admissions.contains_key(epoch)).map(|(epoch,_)|*epoch).collect::<Vec<_>>();
         for epoch in ready {
@@ -466,7 +469,7 @@ impl Observer {
             Wire::Equivocation {first,second} => known(first.0.slot / 4) && known(second.0.slot / 4),
             Wire::Cblock(witness) => known(witness.block.slot),
             Wire::WindowStart {number,..} => known(number*4),
-            Wire::ValidatorEpoch {..} | Wire::Submit(_) | Wire::SubmitFragment(_) => true,
+            Wire::ValidatorEpoch {..} | Wire::Submit(_) | Wire::SubmitFragment(_) | Wire::ExchangeMetrics {..} => true,
         })
     }
     fn drain_pending(&mut self) -> Result<bool> {
@@ -532,13 +535,13 @@ impl Observer {
             Wire::WindowStart {number,parent,started_at_unix_us} => {
                 let proposers=self.replay.proposers.as_ref().context("Missing proposer configuration")?;
                 let window=proposers.window(number)?;
-                let hub=proposers.config.hubs.iter().find(|hub|hub.code==window.hub_code).context("Window hub")?;
-                ensure!(proposers.catalog.get(envelope.from)==hub.members.first().map(|member|&member.identity),"Window notice is not from the fixed hub representative");
+                ensure!(envelope.from==proposers.window_representative(number)?,"Window notice is not from the fixed hub representative");
                 if window.hub_code==self.hub && window.proposers.contains(&self.identity) && self.votor.own_at(number*4).is_some() {
                     if let Some(known)=self.window_notices.get(&number) {ensure!(*known==(parent,started_at_unix_us),"Conflicting window notice");}
                     self.window_notices.insert(number,(parent,started_at_unix_us));
                 }
             },
+            Wire::ExchangeMetrics {..} => {},
             Wire::Submit(transaction) => {
                 let own=self.replay.proposers.as_ref().and_then(|proposers|proposers.catalog.iter().position(|identity|identity==&self.identity));
                 if own==Some(to) {if let Some(member)=&mut self.member {member.transaction(&self.replay.executor,transaction)?;}}
@@ -678,11 +681,13 @@ impl Observer {
 
 }
 
-pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_port:Option<u16>, metrics_port:Option<u16>) -> Result<()> {
+pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_port:Option<u16>, metrics_port:Option<u16>, peer_port:Option<u16>, peer_address:Option<String>) -> Result<()> {
+    ensure!(peer_port.is_some()||peer_address.is_none(),"--peer-address requires --peer-port");
     let genesis = crate::genesis::Genesis::load(std::path::Path::new(genesis_path))?;
     let programs = genesis.programs.iter().map(|(address,path)|crate::execution::GenesisProgram {address:address.clone(),path:path.clone()}).collect::<Vec<_>>();
     let snapshot = cli::rpc(url,"getExecutionSnapshot",json!({})).await?;
     let config: crate::protocol::ProposerConfig = serde_json::from_value(snapshot["proposerConfig"].clone()).context("Missing public proposer configuration")?;
+    ensure!(config.hubs.iter().any(|known|known.code==hub)||peer_port.is_some(),"An outside-only hub requires --peer-port and its public --peer-address");
     let stakes: Vec<u64> = serde_json::from_value(snapshot["consensusStakes"].clone()).context("Missing consensus stakes")?;
     ensure!(!stakes.is_empty() && stakes.len() <= 32 && stakes.iter().all(|stake|*stake>0), "Invalid consensus stake set");
     stakes.iter().try_fold(0u128,|total,stake|total.checked_add(*stake as u128)).context("Consensus stake overflow")?;
@@ -694,14 +699,23 @@ pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_p
     let anchor_hash = hash32(snapshot["anchor"]["hash"].as_str().context("Missing snapshot anchor hash")?)?;
     let (replay,last,start_hash) = cli::load_follow_snapshot(snapshot,&genesis,&programs)?;
     ensure!(replay.proposers.as_ref().context("Missing proposer configuration")?.voting_set(last)?.1 == stakes, "Snapshot consensus stakes differ from the replayed epoch set");
-    let peers: HubPeers = serde_json::from_value(cli::rpc(url,"getHubPeers",json!({"hub":hub})).await?)?;
-    ensure!(peers.hub == hub && peers.peers.len() == 4, "The endpoint returned another hub");
-    let expected = config.hubs.iter().find(|candidate|candidate.code==hub).context("Unknown hub")?;
-    let mut recipients = BTreeSet::new();
+    let mut peers: HubPeers = serde_json::from_value(cli::rpc(url,"getHubPeers",json!({"hub":hub,"direct":true})).await?)?;
+    ensure!(peers.hub==hub,"The endpoint returned another hub");
+    let catalog=&replay.proposers.as_ref().context("Missing proposer configuration")?.catalog;
+    let mut known=BTreeSet::new();
     for peer in &peers.peers {
-        ensure!(config.identities.get(peer.id) == Some(&peer.identity) && expected.members.iter().any(|member|member.identity==peer.identity) && recipients.insert(peer.id), "Invalid logical hub peer");
+        if let Some(identity)=catalog.get(peer.id) {
+            ensure!(identity==&peer.identity&&known.insert(peer.id),"Invalid logical hub peer");
+        }
     }
-    ensure!(expected.members.len() == peers.peers.len(), "Incomplete logical hub peer set");
+    // Discovery can advance after the execution snapshot. Future identities become usable only
+    // when finalized wire replay has learned their committed catalog and membership.
+    peers.peers.retain(|peer|known.contains(&peer.id));
+    let mut recipients=BTreeSet::new();
+    ensure!(peers.relay_peers.len()==config.identities.len(),"Incomplete hosted relay set");
+    for peer in &peers.relay_peers {
+        ensure!(config.identities.get(peer.id)==Some(&peer.identity)&&recipients.insert(peer.id),"Invalid hosted relay peer");
+    }
     let cert = B64.decode(&peers.certificate).context("Invalid QUIC certificate")?;
     let address = tokio::net::lookup_host(&peers.address).await?.next().context("The hub address did not resolve")?;
     let keypair = read_keypair_file(identity).map_err(|error|anyhow::anyhow!("Read observer identity: {error}"))?;
@@ -710,6 +724,10 @@ pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_p
     let chain = match &genesis.bridge { Some(bridge) => bridge.chain_tag(), None => crypto::hash(&bincode::serialize(&(&config.seed,&config.identities))?) };
     let journal = VoteJournal::open(identity,hex::encode(chain),anchor)?;
     let from_slot = last.checked_mul(4).and_then(|slot|slot.checked_add(4)).context("Snapshot slot overflow")?;
+    let (peer_server,peer_ingress,advertised)=match peer_port {
+        Some(port)=>{let (server,input,advertised)=crate::member_link::bind_peer(port,peer_address,hub).await?;(Some(server),Some(input),Some(advertised))},
+        None=>(None,None,None),
+    };
     let mut client = crate::external::ExternalClient::connect(address,&cert,hub,&signer,from_slot).await?;
     let control = std::sync::Arc::new(client.control.clone());
     let connection = client.connection.clone();
@@ -719,28 +737,49 @@ pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_p
     let mut votor = Votor::new(0,legacy_stakes.clone())?;
     votor.install_stakes(0,None,legacy_stakes)?;
     let fast_lane=crate::external_proposer::FastLane::default();
+    fast_lane.host_slot(last*4+3);
     let member_metrics=crate::external_proposer::MemberMetrics::default();
-    let mut observer = Observer {checkpoints:BTreeMap::from([(anchor,replay.checkpoint())]),replay,anchor,keys,votor,signer,journal,identity,hub:hub.to_owned(),outgoing:vec![],epoch_updates:BTreeMap::new(),reported_epoch:None,control:Some(control.clone()),member:None,fast_lane:fast_lane.clone(),member_metrics:member_metrics.clone(),certified:BTreeSet::from([anchor]),window_notices:BTreeMap::new(),bridge:genesis.bridge.clone(),slots:BTreeMap::new(),witnesses:BTreeMap::new(),finalized:BTreeMap::new(),seen:BTreeMap::new(),pending:BTreeMap::new(),checked:0,buffered_bytes:0};
+    let link=crate::member_link::MemberLink::new(control.clone(),peer_server);
+    if let Some(input)=peer_ingress {link.receive(input,fast_lane.clone());}
+    let mut observer = Observer {checkpoints:BTreeMap::from([(anchor,replay.checkpoint())]),replay,anchor,keys,votor,signer,journal,identity,hub:hub.to_owned(),outgoing:vec![],epoch_updates:BTreeMap::new(),reported_epoch:None,control:Some(link.clone()),member:None,fast_lane:fast_lane.clone(),member_metrics:member_metrics.clone(),certified:BTreeSet::from([anchor]),window_notices:BTreeMap::new(),bridge:genesis.bridge.clone(),slots:BTreeMap::new(),witnesses:BTreeMap::new(),finalized:BTreeMap::new(),seen:BTreeMap::new(),pending:BTreeMap::new(),checked:0,buffered_bytes:0};
     observer.learn_finalized()?;
     observer.votor.resume(anchor);
     observer.status(last);
     let (sender,mut packets) = tokio::sync::mpsc::channel(256);
     // A dedicated reader owns frame decoding. Cancelling read_exact in select would lose framing.
+    let reader_fast=fast_lane.clone();
     let reader = tokio::spawn(async move {
         loop {
             let packet = client.next_packet().await;
             let received_at=std::time::Instant::now();
-            let packet=match packet {Ok(packet)=>match fast_lane.receive(&packet,received_at).await{Ok(())=>Ok((received_at,packet)),Err(error)=>Err(error)},Err(error)=>Err(error)};
+            let packet=match packet {Ok(packet)=>{
+                reader_fast.host_slot(packet.slot);
+                match reader_fast.receive(&packet,received_at).await{Ok(())=>Ok((received_at,packet)),Err(error)=>Err(error)}
+            },Err(error)=>Err(error)};
             let failed=packet.is_err();
             if sender.send(packet).await.is_err() || failed {break}
         }
     });
 
     let (mut rpc_requests,rpc_task)=match rpc_port {Some(port)=>{let (receiver,task)=crate::external_proposer::bind_rpc(port).await?;(Some(receiver),Some(task))},None=>(None,None)};
-    let metrics_task=match metrics_port {Some(port)=>Some(crate::external_proposer::bind_metrics(port,member_metrics).await?),None=>None};
+    let metrics_task=match metrics_port {Some(port)=>Some(crate::external_proposer::bind_metrics(port,member_metrics.clone()).await?),None=>None};
     let mut member_tick=tokio::time::interval(Duration::from_millis(1));
     member_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    let mut maintenance=tokio::spawn(crate::member_link::maintain(url.to_owned(),hub.to_owned(),observer.signer.clone(),link.clone(),fast_lane,member_metrics,advertised));
+    let heartbeat_control=control.clone();let heartbeat_hub=hub.to_owned();
+    let mut heartbeat=tokio::spawn(async move {
+        let mut interval=tokio::time::interval(Duration::from_secs(10));interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            for peer in &peers.peers {
+                let rtt=heartbeat_control.ping(peer.id).await?;
+                println!("hub {} link {} RTT {:.3} ms",heartbeat_hub,peer.identity,rtt.as_secs_f64()*1000.0);
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+        #[allow(unreachable_code)] Ok::<(),anyhow::Error>(())
+    });
+    let mut heartbeat_consumed=false;let mut maintenance_consumed=false;
     let outcome = async {
         loop {
             tokio::select! {
@@ -756,15 +795,16 @@ pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_p
                         crate::external_proposer::rpc(request,observer.member.as_mut(),&mut observer.replay.executor,slot);
                     }
                 },
-                _ = heartbeat.tick() => for peer in &peers.peers {
-                    let rtt = control.ping(peer.id).await?;
-                    println!("hub {hub} link {} RTT {:.3} ms",peer.identity,rtt.as_secs_f64()*1000.0);
-                },
+                result=&mut heartbeat=>{heartbeat_consumed=true;return result.context("Host heartbeat task stopped")?;},
+                result=&mut maintenance=>{maintenance_consumed=true;return result.context("Peer maintenance task stopped")?;},
                 result = tokio::signal::ctrl_c() => { result?; return Ok(()); },
             }
         }
     }.await;
     connection.close(0u32.into(),b"observer stopped");
+    if !heartbeat_consumed {heartbeat.abort();let _=heartbeat.await;}
+    if !maintenance_consumed {maintenance.abort();let _=maintenance.await;}
+    link.close().await;
     reader.abort();
     let _ = reader.await;
     if let Some(task)=rpc_task {task.abort();let _=task.await;}

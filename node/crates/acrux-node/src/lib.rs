@@ -6,6 +6,7 @@ pub mod carry;
 pub mod propose;
 pub mod proposer;
 pub mod external_proposer;
+mod member_link;
 pub mod gateway;
 pub mod genesis;
 pub mod lab;
@@ -43,6 +44,7 @@ pub fn raise_thread_priority() {
 }
 pub mod projection;
 pub mod protocol;
+mod epoch_voting;
 pub mod replay;
 pub mod state;
 pub mod history;

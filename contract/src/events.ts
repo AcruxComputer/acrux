@@ -4,23 +4,23 @@ import { ApiError, Attestation, Certificate, Commitment, CommitmentArrival, Coun
 // One version per envelope. Null slot is reserved for stream/window control messages.
 // atUs is relative to the named anchor, never an epoch timestamp. Slot.wallTime is UTC.
 const common = { node: z.string().optional(), version: z.literal(1), sequence: Count, streamId: z.string(), slot: Count.nullable(), anchor: z.enum(['slot', 'window', 'consensus', 'stream']), atUs: Count }
-const event = <T extends string, S extends z.ZodType>(type: T, data: S) => z.strictObject({ ...common, type: z.literal(type), data })
+const event = <T extends string, S extends z.ZodType>(type: T, data: S) => z.object({ ...common, type: z.literal(type), data })
 export const ProtocolEvent = z.discriminatedUnion('type', [
   event('stream.snapshot', NetSnapshot),
-  event('stream.resync', z.strictObject({ reason: z.enum(['connected', 'cursor_expired', 'restarted', 'filter_changed']), snapshot: NetSnapshot })),
-  event('stream.heartbeat', z.strictObject({ latestSlot: Count, status: z.enum(['live', 'stalled', 'unavailable']) })),
+  event('stream.resync', z.object({ reason: z.enum(['connected', 'cursor_expired', 'restarted', 'filter_changed']), snapshot: NetSnapshot })),
+  event('stream.heartbeat', z.object({ latestSlot: Count, status: z.enum(['live', 'stalled', 'unavailable']) })),
   event('stream.error', ApiError),
   event('window.started', Window),
   event('slot.started', Slot),
-  event('block.slice', z.strictObject({ proposer: ProposerIndex, slice: Slice })),
+  event('block.slice', z.object({ proposer: ProposerIndex, slice: Slice })),
   event('commitment.sent', Commitment),
-  event('commitment.arrived', z.strictObject({ proposer: ProposerIndex, hash: z.string(), arrival: CommitmentArrival })),
+  event('commitment.arrived', z.object({ proposer: ProposerIndex, hash: z.string(), arrival: CommitmentArrival })),
   event('attestation.sent', Attestation),
-  event('attestation.arrived', z.strictObject({ attestation: Attestation, validator: z.string(), arrivedUs: Count })),
-  event('slot.agreed', z.strictObject({ agreedSet: z.array(ProposerIndex) })),
+  event('attestation.arrived', z.object({ attestation: Attestation, validator: z.string(), arrivedUs: Count })),
+  event('slot.agreed', z.object({ agreedSet: z.array(ProposerIndex) })),
   event('slot.skipped', Skip),
-  event('block.decrypted', z.strictObject({ proposer: ProposerIndex, transactionIds: z.array(TxId) })),
-  event('slot.merged', z.strictObject({ transactions: z.array(MergedTransaction) })),
+  event('block.decrypted', z.object({ proposer: ProposerIndex, transactionIds: z.array(TxId) })),
+  event('slot.merged', z.object({ transactions: z.array(MergedTransaction) })),
   event('slot.scheduled', ExecutionSchedule),
   event('slot.executed', Slot),
   event('cblock.assembled', Cblock),
@@ -45,7 +45,7 @@ export const StreamCommand = z.discriminatedUnion('type', [
   z.strictObject({ version: z.literal(1), type: z.literal('subscribe'), filter: SubscribeFilter, afterSequence: Count.optional(), streamId: z.string().optional() }),
   z.strictObject({ version: z.literal(1), type: z.literal('unsubscribe') }),
 ])
-export const LabReplay = z.strictObject({ run: LabRun, events: z.array(ProtocolEvent) })
+export const LabReplay = z.object({ run: LabRun, events: z.array(ProtocolEvent) })
 export type LabReplay = z.infer<typeof LabReplay>
 export function matchesFilter(event: ProtocolEvent, filter: SubscribeFilter): boolean {
   if (event.type.startsWith('stream.')) return true

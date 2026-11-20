@@ -177,7 +177,7 @@ impl Observer {
                                     persist.push((format!("slot/{s}"), view.clone()));
                                 }
                             }
-                        } else if matches!(event.kind, "slot.executed" | "slot.skipped") {
+                        } else if matches!(event.kind, "slot.executed" | "slot.skipped" | "commitment.arrived") {
                             if let Some(view) = g.slots.get(&slot) {
                                 persist.push((format!("slot/{slot}"), view.clone()));
                             }
@@ -208,7 +208,10 @@ impl Observer {
                     );
                 }
                 g.counters = json!({"slots":g.slots.keys().next_back().map_or(0,|s|s+1),"finalizedCblocks":g.counter_base.0+finalized.len() as u64,"skips":g.counter_base.1+skipped.len() as u64,"averageCommitSpreadUs":exchange.average_spread()});
-                while g.slots.len() > 64 {
+                // Member arrival reports can follow finalization by a few seconds.
+                // Keep their views through the reporting interval, then retain the updated disk copy.
+                let retained=if g.admission_from_slot.is_some(){256}else{64};
+                while g.slots.len() > retained {
                     let first = *g.slots.keys().next().unwrap();
                     g.slots.remove(&first);
                 }

@@ -61,7 +61,7 @@ struct Exchange {
 #[derive(Clone)]
 enum ExchangeLink {
     Local(Arc<LocalTransport>),
-    Member(Arc<crate::external::ExternalControl>),
+    Member(Arc<crate::member_link::MemberLink>),
 }
 impl ExchangeLink {
     async fn send(&self, from: usize, to: usize, bytes: Vec<u8>) -> anyhow::Result<()> {
@@ -82,7 +82,7 @@ impl ExchangeLink {
                 }
                 transport.send(from,to,bytes).await
             }
-            Self::Member(control) => control.send_to(&[to],&bytes).await,
+            Self::Member(control) => control.send(from,to,bytes).await,
         }
     }
 }
@@ -135,10 +135,10 @@ impl ExchangeEngine {
     }
 
     /// Runs the identical commitment/key-release engine on an admitted outside validator.
-    pub fn new_member(
+    pub(crate) fn new_member(
         id: usize,
         key: SigningKey,
-        control: Arc<crate::external::ExternalControl>,
+        control: Arc<crate::member_link::MemberLink>,
         gateway: Arc<RwLock<GatewayState>>,
         profile: Arc<Profiling>,
     ) -> Arc<Self> {
@@ -170,6 +170,8 @@ impl ExchangeEngine {
     }
 
     pub fn metrics_json(&self)->serde_json::Value { self.metrics.json() }
+    pub(crate) fn metrics_report(&self)->crate::exchange_metrics::ExchangeReport {self.metrics.report()}
+    pub(crate) fn include_report(&self,identity:String,report:crate::exchange_metrics::ExchangeReport) {self.metrics.include_report(identity,report);}
 
     pub fn launch(
         self: &Arc<Self>,
@@ -481,6 +483,7 @@ impl ExchangeEngine {
     }
 
     async fn event(&self, id: usize, slot: u64, at: u64, kind: &str, data: serde_json::Value) {
+        if matches!(&self.transport,ExchangeLink::Member(_)) && kind=="commitment.arrived" {self.metrics.arrival(slot,&data);}
         let lock_started = Instant::now();
         let mut gateway = self.gateway.write().await;
         self.profile.record(

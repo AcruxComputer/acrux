@@ -278,6 +278,8 @@ struct State {
     catalog: BTreeMap<usize,[u8;32]>,
     /// (oldest available slot, last evicted sequence) for private identity traffic.
     targeted_evicted: BTreeMap<[u8;32],(u64,u64)>,
+    /// Registry hubs may use a hosted replay representative while their own peers link directly.
+    registry_hubs: BTreeMap<String,Vec<usize>>,
 }
 pub struct ExternalServer {
     endpoint: Endpoint,
@@ -324,7 +326,7 @@ impl ExternalServer {
         let count = hubs.len();
         let server = Arc::new(Self {
             endpoint, certificate: certificate_bytes, hubs, representatives,
-            state: Mutex::new(State { identities, observers: BTreeMap::new(), history: BTreeMap::new(), history_bytes: 0, next_sequence: 0, oldest_slot: vec![0; count], evicted_sequence: vec![None; count], catalog:BTreeMap::new(),targeted_evicted:BTreeMap::new() }),
+            state: Mutex::new(State { identities, observers: BTreeMap::new(), history: BTreeMap::new(), history_bytes: 0, next_sequence: 0, oldest_slot: vec![0; count], evicted_sequence: vec![None; count], catalog:BTreeMap::new(),targeted_evicted:BTreeMap::new(),registry_hubs:BTreeMap::new() }),
             published: Notify::new(), pending: Arc::new(Semaphore::new(cap)), accept_task: Mutex::new(None), ingress: Mutex::new(None),
         });
         let endpoint = server.endpoint.clone();
@@ -351,6 +353,15 @@ impl ExternalServer {
     }
     pub fn cert_der(&self) -> Vec<u8> { self.certificate.clone() }
     pub fn local_addr(&self) -> Result<SocketAddr> { Ok(self.endpoint.local_addr()?) }
+    pub fn set_registry_hubs(&self,hubs:Vec<(String,Vec<usize>)>)->Result<()> {
+        ensure!(hubs.iter().all(|(hub,peers)|valid_hub(hub)&&peers.iter().all(|peer|u32::try_from(*peer).is_ok())),"invalid registry peer hubs");
+        self.state.lock().unwrap().registry_hubs=hubs.into_iter().collect();
+        Ok(())
+    }
+    pub fn connected(&self,to:usize)->bool {
+        let state=self.state.lock().unwrap();
+        state.catalog.get(&to).is_some_and(|identity|state.observers.contains_key(identity))
+    }
     /// Catalog IDs never change identity. Only hashed finalized membership learns this mapping.
     pub fn set_catalog(&self, catalog: Vec<(usize,[u8;32])>) -> Result<()> {
         let count = catalog.len();
@@ -500,14 +511,19 @@ async fn serve(server: Weak<ExternalServer>, incoming: quinn::Incoming, permit: 
     };
     let register = (|| {
         let server = server.upgrade().context("observer endpoint stopped")?;
-        let hub = server.hubs.iter().position(|(name, _)| *name == auth.hub).context("unknown observer hub")?;
         let mut state = server.state.lock().unwrap();
+        let configured=server.hubs.iter().position(|(name,_)|*name==auth.hub);
+        let peers=state.registry_hubs.get(&auth.hub).cloned()
+            .or_else(||configured.map(|index|server.hubs[index].1.clone())).context("unknown observer hub")?;
+        // Node zero already receives the whole finalized wire. A newly registered hub
+        // bootstraps from that same held stream; its local commitments use its own endpoints.
+        let hub=configured.unwrap_or(0);
         ensure!(auth.from_slot >= state.oldest_slot[hub]
             && state.targeted_evicted.get(&auth.identity).is_none_or(|(oldest,_)|auth.from_slot >= *oldest), "observer requested history is no longer held");
         state.identities.reserve(auth.identity)?;
         let cursor = state.history.iter().find(|(_, packet)| !packet.needs_receipts && packet.audience.includes(hub,&auth.identity) && packet.slot >= auth.from_slot).map_or(state.next_sequence, |(sequence, _)| *sequence);
         state.observers.insert(auth.identity, Observer { connection: connection.clone(), receipts: false });
-        Ok::<_, anyhow::Error>((hub, cursor, server.hubs[hub].1.clone()))
+        Ok::<_, anyhow::Error>((hub, cursor, peers))
     })();
     let (hub, mut cursor, peers) = match register {
         Ok(registered) => registered,

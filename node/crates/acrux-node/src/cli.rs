@@ -344,7 +344,10 @@ impl Replay {
             let checkpoint = self.executor.checkpoint();
             for (epoch, weights) in self.executor.stake_schedule_snapshots(&checkpoint)? { proposers.learn(epoch, weights)?; }
             let catalog = self.executor.validator_catalog(&checkpoint)?;
-            for snapshot in self.executor.admission_snapshots(&checkpoint)? { proposers.learn_admission(snapshot, catalog.clone())?; }
+            for snapshot in self.executor.admission_snapshots(&checkpoint)? {
+                proposers.learn_hubs(snapshot.epoch,self.executor.admission_hubs(&checkpoint,snapshot.epoch)?)?;
+                proposers.learn_admission(snapshot, catalog.clone())?;
+            }
         }
         Ok(())
     }

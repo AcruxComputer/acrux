@@ -33,8 +33,8 @@ export const PageQuery = z.strictObject({
 })
 export type PageQuery = z.output<typeof PageQuery>
 
-export const PageInfo = z.strictObject({ nextCursor: z.string().nullable(), hasMore: z.boolean() })
-export const page = <T extends z.ZodType>(item: T) => z.strictObject({ items: z.array(item), page: PageInfo, asOf: Timestamp })
+export const PageInfo = z.object({ nextCursor: z.string().nullable(), hasMore: z.boolean() })
+export const page = <T extends z.ZodType>(item: T) => z.object({ items: z.array(item), page: PageInfo, asOf: Timestamp })
 
 /** One page of an in-memory list, in the shape `page(item)` describes. */
 export function paginate<T>(rows: readonly T[], q: PageQuery, asOf = new Date().toISOString()) {

@@ -33,8 +33,10 @@ class Reader {
 type ChainRegistry = { depositLamports: bigint; registrationFeeBps: number; cooldownEpochs: bigint; inactivityEpochs: bigint; minMembers: number; codeMinLen: number; codeMaxLen: number }
 type ChainHub = { address: string; code: string; x: number; y: number; z: number; registrant: string; depositLamports: bigint; createdEpoch: bigint; lastActiveEpoch: bigint }
 type ChainMembership = { address: string; identity: string; hub: string; joinedEpoch: bigint; effectiveEpoch: bigint; pending: 'none' | 'leave' | 'move'; pendingHub: string; pendingEpoch: bigint; cooldownUntilEpoch: bigint }
+const HubActivation = z.object({ hubCode: z.string().min(1), formedOutside: z.boolean(), activatedAtEpoch: Count.nullable(), active: z.boolean() })
+type HubActivation = z.infer<typeof HubActivation>
 const ValidatorSet = z.object({ epoch: Count, cutoffSlot: Count.nullable(), catalog: z.array(Address), genesisIdentities: z.array(Address),
-  members: z.array(z.object({ identity: Address, hub: z.string().min(1), stake: U64, validatorKind: z.enum(['genesis', 'external']), admittedAtEpoch: Count })) })
+  members: z.array(z.object({ identity: Address, hub: z.string().min(1), stake: U64, validatorKind: z.enum(['genesis', 'external']), admittedAtEpoch: Count })), hubs: z.array(HubActivation).optional() })
 
 function decodeRegistry(b: Uint8Array): ChainRegistry {
   const r = new Reader(b); r.key(); r.key(); r.key()
@@ -110,11 +112,13 @@ export class RegistryIndexer {
   private timer?: NodeJS.Timeout
   private seen = ''
   private exchangeMembers: ReadonlyMap<string, ReadonlySet<string>> = new Map()
+  private hubActivations = new Map<string, HubActivation>()
   constructor(private db: PrismaClient, readonly chain: Chain, private rpcUrl: string, private programId: string, private pollMs: number, readonly stake: StakeSource, private cluster: 'localnet' | 'mainnet-beta' | 'acrux') {}
 
   start() { const tick = () => this.refresh().catch(e => { this.state.error = String(e?.message ?? e) }).finally(() => { this.timer = setTimeout(tick, this.pollMs) }); tick() }
   stop() { clearTimeout(this.timer) }
   effectiveHubMembers() { return this.exchangeMembers }
+  hubActivation(code: string) { return this.hubActivations.get(code) }
 
   private async rpc<T>(method: string, params: unknown): Promise<T> {
     const response = await fetch(this.rpcUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal: AbortSignal.timeout(5000) })
@@ -140,7 +144,9 @@ export class RegistryIndexer {
     // Legacy and bootstrap epochs retain Round 9's proposer draw, independently of vote weights.
     const frozen = validatorSet !== null && validatorSet.cutoffSlot !== null
     const genesis = new Set(validatorSet?.genesisIdentities ?? [])
+    const activations = new Map(validatorSet?.hubs?.map(hub => [hub.hubCode, hub]) ?? [])
     if (validatorSet && (admitted.size !== validatorSet.members.length || validatorSet.members.some(member => member.validatorKind !== (genesis.has(member.identity) ? 'genesis' : 'external')))) throw new Error('The node returned inconsistent validator identities.')
+    if (validatorSet?.hubs && activations.size !== validatorSet.hubs.length) throw new Error('The node returned duplicate hub activation records.')
     const stakeOf = (identity: string) => this.stake.of(identity), totalStake = this.stake.total()
     const accounts = await this.rpc<{ pubkey: string; account: { data: [string, string] } }[]>('getProgramAccounts', [this.programId, { encoding: 'base64', commitment: 'confirmed' }])
     const epoch = BigInt(epochInfo.epoch)
@@ -171,7 +177,7 @@ export class RegistryIndexer {
         const capped = caps.get(h.code)
         const members = effective.find(e => e.code === h.code)!.members
         const proposerStake = capped ? BigInt(capped.stake) * UNIT : members.reduce((s, m) => s + BigInt(m.stake) * UNIT, 0n)
-        const active = members.length >= minMembers && proposerStake >= minimumStake
+        const active = validatorSet?.hubs !== undefined ? activations.get(h.code)?.active ?? false : members.length >= minMembers && proposerStake >= minimumStake
         const lastActive = active ? epoch : h.lastActiveEpoch > h.createdEpoch ? h.lastActiveEpoch : null
         const releasableEpoch = (lastActive ?? h.createdEpoch) + (config?.inactivityEpochs ?? 4n)
         await tx.hub.create({ data: { chain: this.chain, code: h.code, registryAddress: h.address, registrant: h.registrant, ecefX: h.x, ecefY: h.y, ecefZ: h.z, latitude, longitude,
@@ -204,6 +210,7 @@ export class RegistryIndexer {
       if (hub && effectiveEpoch <= epoch) exchangeMembers.get(hub.code)!.add(member.identity)
     }
     this.exchangeMembers = exchangeMembers
+    this.hubActivations = activations
     this.state = { config, epoch: epochInfo.epoch, slot: epochInfo.absoluteSlot, readAt: Date.now(), error: null }
     this.seen = seen
   }
@@ -223,7 +230,7 @@ export class RegistryIndexer {
 type HubRow = Awaited<ReturnType<PrismaClient['hub']['findFirstOrThrow']>> & { members: Awaited<ReturnType<PrismaClient['member']['findFirstOrThrow']>>[] }
 
 /** Rebuilds the contract's Hub from its rows. */
-export function hubView(row: HubRow, config: RegistryConfig): Hub {
+export function hubView(row: HubRow, config: RegistryConfig, activation?: HubActivation): Hub {
   const effective = row.members.filter(m => BigInt(m.proposerStakeLamports.toString()) > 0n)
   const stake = effective.reduce((s, m) => s + BigInt(m.stakeLamports.toString()), 0n)
   const proposerStake = effective.reduce((s, m) => s + BigInt(m.proposerStakeLamports.toString()), 0n)
@@ -240,6 +247,7 @@ export function hubView(row: HubRow, config: RegistryConfig): Hub {
     createdEpoch: Number(row.createdEpoch), lastActiveEpoch: row.lastActiveEpoch === null ? null : Number(row.lastActiveEpoch),
     releasableEpoch: row.releasableEpoch === null ? null : Number(row.releasableEpoch),
     releasable: row.status !== 'active' && row.releasableEpoch !== null && epoch >= row.releasableEpoch,
+    ...(row.chain === 'acrux' && activation ? { formedOutside: activation.formedOutside, activatedAtEpoch: activation.activatedAtEpoch } : {}),
   }
 }
 

@@ -55,7 +55,8 @@ function makeHub(code: string, name: string, region: string, latitude: number, l
     stake: stakes.reduce((sum, n) => sum + n, 0n).toString(),
     proposerStake: members.reduce((sum, m) => sum + BigInt(m.proposerStake), 0n).toString(),
     proposerStakeCap: cap.toString(), status: 'active', needs: { members: 0, stake: '0' },
-    createdEpoch: 40, lastActiveEpoch: 42, releasableEpoch: null, releasable: false }
+    createdEpoch: 40, lastActiveEpoch: 42, releasableEpoch: null, releasable: false,
+    formedOutside: members.every(member => member.validatorKind === 'external'), activatedAtEpoch: 41 }
 }
 const frankfurt = makeHub('FRA', 'Frankfurt', 'Europe', 50.0379, 8.5622)
 const newYork = makeHub('NYC', 'New York', 'North America', 40.6413, -73.7781, 0.75)
@@ -63,10 +64,10 @@ const tokyo = makeHub('TYO', 'Tokyo', 'Asia Pacific', 35.5494, 139.7798, 0.5)
 const london = makeHub('LHR', 'London', 'Europe', 51.47, -0.4543, 0.1)
 london.status = 'pending'; london.members = london.members.slice(2)
 london.stake = '200000000'; london.proposerStake = '0'; london.proposerStakeCap = '0'
-london.needs = { members: 1, stake: '1000000000' }; london.lastActiveEpoch = null
+london.needs = { members: 1, stake: '1000000000' }; london.lastActiveEpoch = null; london.activatedAtEpoch = null
 const singapore = makeHub('SIN', 'Singapore', 'Asia Pacific', 1.3644, 103.9915)
 singapore.status = 'inactive'; singapore.members = []; singapore.stake = '0'; singapore.proposerStake = '0'; singapore.proposerStakeCap = '0'
-singapore.needs = { members: 3, stake: '1000000000' }; singapore.lastActiveEpoch = 35; singapore.releasableEpoch = 40; singapore.releasable = true
+singapore.needs = { members: 3, stake: '1000000000' }; singapore.lastActiveEpoch = 35; singapore.releasableEpoch = 40; singapore.releasable = true; singapore.activatedAtEpoch = undefined
 export const hubs: Hub[] = [frankfurt, newYork, tokyo, london, singapore]
 export const registryConfig: z.infer<typeof RegistryConfig> = {
   status: 'fixture', chain: 'solana', programId: null, cluster: 'localnet', depositLamports: null,
@@ -143,6 +144,17 @@ const hubExchange = (hub: HashExchangeView['hubs'][number]): HubHashExchange => 
 for (const hub of hubs.slice(0, 3)) hub.hashExchange = hubExchange(hashExchangeGenesisOnly.hubs.find(measured => measured.hubCode === hub.code)!)
 export const hubHashExchangeGenesisOnly: Hub = { ...frankfurt, hashExchange: hubExchange(hashExchangeGenesisOnly.hubs[0]!) }
 export const hubHashExchangeWithOutside: Hub = { ...frankfurt, members: outsideFixtureMembers, hashExchange: hubExchange(hashExchangeWithOutside.hubs[0]!) }
+/** Four outside members meet the hub's membership and stake thresholds at epoch 43. */
+export const outsideFormedHub: Hub = { ...makeHub('SIN', 'Singapore', 'Asia Pacific', 1.3644, 103.9915, 1.5),
+  createdEpoch: 42, lastActiveEpoch: 43, formedOutside: true, activatedAtEpoch: 43 }
+outsideFormedHub.members = outsideFormedHub.members.map(member => ({ ...member, validatorKind: 'external', joinedEpoch: 42, effectiveEpoch: 43, admittedAtEpoch: 43, cooldownUntilEpoch: 43 }))
+outsideFormedHub.hashExchange = { measuredAt: FIXTURE_TIME, measurement: 'roundTrip', pairs: pairFixtures(outsideFormedHub.members),
+  commitSpreadUs: { applied: null, real: { p50: 3400, p99: 6800, count: 256 } } }
+const outsideFormedFirstSlot = 43 * 432000
+export const outsideFormedWindow: Window = { number: outsideFormedFirstSlot / 16, hubCode: 'SIN', firstSlot: outsideFormedFirstSlot, lastSlot: outsideFormedFirstSlot + 15,
+  consensusSlots: Array.from({ length: 4 }, (_, index) => outsideFormedFirstSlot / 4 + index), proposers: proposers(outsideFormedHub, 'outside-formed-SIN') }
+export const outsideFormedFixture = { hub: outsideFormedHub, window: outsideFormedWindow }
+
 export const facts: z.infer<typeof Facts> = {
   source: 'fixture', measuredAt: FIXTURE_TIME, sampleSize: 4096,
   hashExchange: hashExchangeGenesisOnly, commitSpreadByLinkUs: { applied: appliedSpread, real: null },
@@ -489,7 +501,7 @@ export function makeNetSnapshot(status: NetSnapshot['status'] = 'live'): NetSnap
 export const FIXTURE_IDS = {
   slot: 64, skippedSlot: 70, crashedWindowSlot: 80, externalSlot: 96, externalTransaction: fixtureHash('tx-96-0'),
   transaction: fixtureHash('tx-64-0'), sender: fixtureAddress('sender'),
-  hub: 'FRA', pendingHub: 'LHR', inactiveHub: 'SIN', run: 'run-last-look',
+  hub: 'FRA', pendingHub: 'LHR', inactiveHub: 'SIN', outsideFormedHub: 'SIN', outsideFormedWindow: outsideFormedWindow.number, run: 'run-last-look',
 } as const
 const exampleCertificate = slotsByState.finalized.cblock.certificates[0]!
 export const certificateFixtures: Record<Certificate['kind'], Certificate> = {

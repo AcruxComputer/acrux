@@ -1,6 +1,6 @@
 //! The outside validator's adapter to the same packing, sealing and hash exchange as local nodes.
 use crate::{consensus::BlockRef, crypto, exchange::ExchangeEngine, execution::{SvmExecutor,ValidatedTx},
-    external::{ExternalControl,Packet}, gateway::{GatewayState,SharedGateway}, profiling::Profiling,
+    external::Packet, member_link::MemberLink, gateway::{GatewayState,SharedGateway}, profiling::Profiling,
     protocol::ProposerSchedules, proposer::{self,BuiltBlock,ProposalLink}, threshold::VerifiedFragment,
     types::{BlockPayload,Commitment,CommitReceipt,Envelope,Wire}};
 use anyhow::{ensure,Context,Result};
@@ -45,13 +45,43 @@ impl CommitInbox {
     }
 }
 #[derive(Clone)]
-struct FastContext {schedules:Arc<ProposerSchedules>,keys:Arc<Vec<VerifyingKey>>,member:Option<CommitInbox>,identity:String,hub:String}
+struct FastContext {schedules:Arc<ProposerSchedules>,keys:Arc<Vec<VerifyingKey>>,member:Option<CommitInbox>,identity:String,hub:String,effective:bool}
 /// This reader-side lane stays independent of expensive SVM replay and its event loop.
 #[derive(Clone,Default)]
-pub(crate) struct FastLane {context:Arc<RwLock<Option<FastContext>>>}
+pub(crate) struct FastLane {context:Arc<RwLock<Option<FastContext>>>,live_slot:Arc<std::sync::atomic::AtomicU64>}
 impl FastLane {
-    pub(crate) fn update(&self,schedules:ProposerSchedules,keys:Vec<VerifyingKey>,member:Option<CommitInbox>,identity:String,hub:String) {
-        *self.context.write().unwrap()=Some(FastContext{schedules:Arc::new(schedules),keys:Arc::new(keys),member,identity,hub});
+    pub(crate) fn host_slot(&self,slot:u64) {self.live_slot.fetch_max(slot,std::sync::atomic::Ordering::Relaxed);}
+    pub(crate) fn effective(&self)->bool {self.context.read().unwrap().as_ref().is_some_and(|context|context.effective)}
+    pub(crate) fn active_members(&self,epoch:u64)->std::collections::BTreeSet<String> {
+        self.context.read().unwrap().as_ref().and_then(|context|context.schedules.admissions.get(&epoch).map(|set|set.members.iter().filter(|member|member.hub==context.hub).map(|member|member.identity.to_string()).collect())).unwrap_or_default()
+    }
+    pub(crate) fn admitted(&self,epoch:u64)->bool {
+        let context=self.context.read().unwrap().clone();
+        context.is_some_and(|context|context.schedules.admissions.get(&epoch).is_some_and(|set|set.members.iter().any(|member|member.identity.to_string()==context.identity&&member.hub==context.hub)))
+    }
+    pub(crate) fn peer_context(&self)->Option<(usize,u64,Vec<(usize,[u8;32])>)> {
+        let context=self.context.read().unwrap().clone()?;
+        let own=context.schedules.catalog.iter().position(|identity|identity==&context.identity)?;
+        Some((own,context.schedules.config.epoch_slots,context.keys.iter().enumerate().map(|(id,key)|(id,*key.as_bytes())).collect()))
+    }
+    pub(crate) async fn receive_direct(&self,packet:&Packet,identity:&[u8;32],at:Instant)->Result<()> {
+        let context=self.context.read().unwrap().clone().context("Direct peer has no finalized context")?;
+        let member=context.member.as_ref().context("Direct peer is not a registered member")?;
+        let envelope:Envelope=crate::propose::decode(&packet.payload)?;
+        ensure!(packet.to==member.id && envelope.from==packet.from && context.keys.get(packet.from).is_some_and(|key|key.as_bytes()==identity),"Wrong direct peer identity or recipient");
+        let slot=match &envelope.body {Wire::Commit(commit)=>commit.slot,Wire::CommitReceipt(receipt)=>receipt.slot,_=>anyhow::bail!("Invalid direct peer message")};
+        let live=self.live_slot.load(std::sync::atomic::Ordering::Relaxed);
+        ensure!(slot.saturating_add(64)>=live&&slot<=live.saturating_add(32),"Direct peer frame is outside the live window");
+        ensure!(slot==packet.slot,"Direct packet slot differs");
+        let epoch=slot/context.schedules.config.epoch_slots;
+        let set=context.schedules.admissions.get(&epoch).context("Direct epoch is not finalized")?;
+        ensure!(set.members.iter().any(|item|item.identity.to_bytes()==*identity && item.hub==context.hub),"Direct peer is not admitted to this hub");
+        let ids=context.schedules.ids(slot/16)?;
+        ensure!(ids.contains(&packet.from)&&ids.contains(&packet.to),"Direct peers are not drawn co-proposers");
+        self.receive(packet,at).await
+    }
+    pub(crate) fn update(&self,schedules:ProposerSchedules,keys:Vec<VerifyingKey>,member:Option<CommitInbox>,identity:String,hub:String,effective:bool) {
+        *self.context.write().unwrap()=Some(FastContext{schedules:Arc::new(schedules),keys:Arc::new(keys),member,identity,hub,effective});
     }
     pub(crate) async fn receive(&self,packet:&Packet,received_at:Instant)->Result<()> {
         // Envelope starts with a fixed-width usize; Wire's appended discriminants stay stable.
@@ -75,8 +105,8 @@ impl FastLane {
         member.set_window(window,draw.hub_code.clone(),context.schedules.catalog.clone(),co_ids.clone());
         match envelope.body {
             Wire::WindowStart{number,started_at_unix_us,..}=>{
-                let hub=context.schedules.config.hubs.iter().find(|hub|hub.code==context.hub).context("Missing configured hub")?;
-                ensure!(context.schedules.catalog.get(envelope.from)==hub.members.first().map(|member|&member.identity),"Window notice is not from the fixed hub representative");
+                let representative=context.schedules.window_representative(window)?;
+                ensure!(envelope.from==representative,"Window notice is not from its execution representative");
                 member.start(number,started_at_unix_us)?;
             }
             Wire::Commit(commitment)=>{
@@ -101,14 +131,14 @@ impl FastLane {
 struct Window {number:u64,parent:Option<BlockRef>,start:Instant,co_ids:Vec<usize>,role:usize,next:u64,view:Value}
 struct Building {slot:u64,base:Instant,role:usize,co_ids:Vec<usize>,task:JoinHandle<Result<BuiltBlock>>}
 pub(crate) struct MemberProposer {
-    id:usize,key:SigningKey,identity:String,control:Arc<ExternalControl>,seed:u64,
+    id:usize,key:SigningKey,identity:String,control:Arc<MemberLink>,seed:u64,
     gateway:SharedGateway,exchange:Arc<ExchangeEngine>,inbox:CommitInbox,
     windows:BTreeMap<u64,Window>,building:Option<Building>,
     mempool:BTreeMap<String,ValidatedTx>,fragments:BTreeMap<(String,u8),VerifiedFragment>,
     in_flight:BTreeMap<String,(u64,usize,ValidatedTx)>,
 }
 impl MemberProposer {
-    pub(crate) fn new(id:usize,key:SigningKey,identity:String,control:Arc<ExternalControl>,seed:u64)->Self {
+    pub(crate) fn new(id:usize,key:SigningKey,identity:String,control:Arc<MemberLink>,seed:u64)->Self {
         let (commands,receiver)=mpsc::channel(128);drop(receiver);
         let gateway=Arc::new(tokio::sync::RwLock::new(GatewayState::new(commands)));
         let exchange=ExchangeEngine::new_member(id,key.clone(),control.clone(),gateway.clone(),Profiling::new());
@@ -280,8 +310,12 @@ pub(crate) fn rpc(request:RpcRequest,member:Option<&mut MemberProposer>,executor
 #[derive(Clone,Default)]
 pub(crate) struct MemberMetrics {engine:Arc<RwLock<Option<Arc<ExchangeEngine>>>>}
 impl MemberMetrics {
+    pub(crate) fn report(&self)->crate::exchange_metrics::ExchangeReport {
+        let engine=self.engine.read().unwrap().clone();
+        engine.map_or_else(Default::default,|engine|engine.metrics_report())
+    }
     pub(crate) fn set(&self,engine:Arc<ExchangeEngine>) {*self.engine.write().unwrap()=Some(engine);}
-    fn snapshot(&self)->Value {
+    pub(crate) fn snapshot(&self)->Value {
         let engine=self.engine.read().unwrap().clone();
         engine.map_or_else(crate::exchange_metrics::empty_json,|engine|engine.metrics_json())
     }

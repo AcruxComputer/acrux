@@ -26,7 +26,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::Path,
     sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, RwLock};
 
@@ -83,6 +83,7 @@ struct Node {
     key: SigningKey,
     executor: Option<SvmExecutor>,
     votor: Votor,
+    epoch_voting: crate::epoch_voting::EpochVoting,
     mempool: BTreeMap<String, ValidatedTx>,
     /// Transactions this node carried, by id: the slot, its role and the copy, until they execute.
     in_flight: BTreeMap<String, (u64, usize, ValidatedTx)>,
@@ -174,13 +175,14 @@ pub(crate) struct ProposerSchedules {
     pub catalog: Vec<String>,
     pub admissions: BTreeMap<u64,crate::execution::AdmissionSnapshot>,
     admission_draws: BTreeMap<u64,schedule::Schedule>,
+    pub hub_places: BTreeMap<u64,Vec<crate::execution::AdmissionHub>>,
     epochs: BTreeMap<u64, (Vec<u64>, schedule::Schedule)>,
 }
 impl ProposerSchedules {
     pub fn new(config: ProposerConfig) -> Result<Self> {
         ensure!(config.windows_per_epoch > 0 && config.epoch_slots > 0 && (config.stake_from_slot.is_none() || config.epoch_slots % 16 == 0), "Invalid proposer schedule lengths");
         let legacy = schedule::build_schedule(0, &config.seed, &config.hubs, config.identities.len() as u64 * 100_000_000, config.windows_per_epoch)?;
-        let mut this = Self { catalog:config.identities.clone(),config,legacy,epochs:BTreeMap::new(),admissions:BTreeMap::new(),admission_draws:BTreeMap::new() };
+        let mut this = Self { catalog:config.identities.clone(),config,legacy,epochs:BTreeMap::new(),admissions:BTreeMap::new(),admission_draws:BTreeMap::new(),hub_places:BTreeMap::new() };
         if let (Some(slot), Some(weight)) = (this.config.stake_from_slot, this.config.genesis_stake_lamports) {
             let epoch = slot / this.config.epoch_slots;
             let weights = vec![weight; this.config.identities.len()];
@@ -188,6 +190,11 @@ impl ProposerSchedules {
             this.learn(epoch + 1, weights)?;
         }
         Ok(this)
+    }
+    pub fn learn_hubs(&mut self,epoch:u64,hubs:Vec<crate::execution::AdmissionHub>)->Result<()> {
+        ensure!(hubs.windows(2).all(|pair|pair[0].code<pair[1].code),"Finalized hub places are not unique and ordered");
+        if let Some(known)=self.hub_places.get(&epoch) {ensure!(known==&hubs,"Finalized hub places disagree");return Ok(())}
+        self.hub_places.insert(epoch,hubs);Ok(())
     }
     pub fn learn_admission(&mut self, snapshot: crate::execution::AdmissionSnapshot, catalog: Vec<solana_sdk::pubkey::Pubkey>) -> Result<()> {
         let catalog = catalog.iter().map(ToString::to_string).collect::<Vec<_>>();
@@ -199,12 +206,16 @@ impl ProposerSchedules {
             let mut hubs:BTreeMap<String,schedule::Hub> = BTreeMap::new();
             for member in &snapshot.members {
                 let hub=hubs.entry(member.hub.clone()).or_insert_with(||schedule::Hub {code:member.hub.clone(),
-                    region:self.config.hubs.iter().find(|hub|hub.code==member.hub).map_or_else(||member.hub.clone(),|hub|hub.region.clone()),members:vec![]});
+                    region:String::new(),members:vec![]});
                 hub.members.push(schedule::Member {identity:member.identity.to_string(),stake:member.stake});
             }
-            // k=3 requires three distinct co-proposers; this is not the later n_min/rho hub rule.
-            let hubs=hubs.into_values().filter(|hub|hub.members.len()>=3).collect::<Vec<_>>();
-            let total=hubs.iter().flat_map(|hub|&hub.members).try_fold(0u64,|sum,member|sum.checked_add(member.stake)).context("Admission stake overflow")?;
+            for hub in hubs.values_mut() {
+                hub.region=if let Some(place)=self.hub_places.get(&snapshot.epoch).and_then(|places|places.iter().find(|place|place.code==hub.code)) {
+                    let (latitude,longitude)=place.latitude_longitude();crate::genesis::region_of(latitude,longitude).into()
+                } else {self.config.hubs.iter().find(|known|known.code==hub.code).context("Admission hub has no finalized registry place")?.region.clone()};
+            }
+            let hubs=hubs.into_values().collect::<Vec<_>>();
+            let total=snapshot.members.iter().try_fold(0u64,|sum,member|sum.checked_add(member.stake)).context("Admission stake overflow")?;
             let draw=schedule::build_schedule(snapshot.epoch,&self.config.seed,&hubs,total,self.config.windows_per_epoch)?;
             self.admission_draws.insert(snapshot.epoch,draw);
         }
@@ -487,7 +498,7 @@ fn pack(node:&mut Node,s:u64,q:usize,censored:Option<&String>)->(Vec<ValidatedTx
 }
 /// This callback sees only our own signed envelopes before LocalTransport applies geography.
 /// Mempool submissions are not needed for replay: their transactions/fragments ride in blocks.
-fn observer_packet_slot(bytes: &[u8]) -> Option<u64> {
+pub(crate) fn observer_packet_slot(bytes: &[u8]) -> Option<u64> {
     let envelope: Envelope = decode(bytes).ok()?;
     match envelope.body {
         Wire::Shreds(shreds) | Wire::Relay(shreds) => shreds.iter().map(|shred|shred.meta.slot).max(),
@@ -502,7 +513,7 @@ fn observer_packet_slot(bytes: &[u8]) -> Option<u64> {
         Wire::WindowStart {number,..} => Some(number*16),
         // Receipt telemetry stays out of hub mirrors so older observing CLIs keep
         // decoding their original wire. Capable members receive only their own receipts.
-        Wire::CommitReceipt(_) => None,
+        Wire::CommitReceipt(_) | Wire::ExchangeMetrics{..} => None,
         Wire::Submit(tx) => Some(tx.header.target_slot),
         Wire::SubmitFragment(fragment) => Some(fragment.header.target_slot),
     }
@@ -724,6 +735,9 @@ impl Network {
                 for (hub,members) in hubs {
                     gateway.hub_peers.insert(hub.clone(),json!({"hub":hub,"address":address,"certificate":certificate,
                         "peers":members.iter().map(|id|json!({"id":id,"identity":identities[*id]})).collect::<Vec<_>>()}));
+                    gateway.hub_member_peers.insert(hub.clone(),json!({"hub":hub,"address":address,"certificate":certificate,
+                        "peers":members.iter().map(|id|json!({"id":id,"identity":identities[*id],"address":address,"certificate":certificate})).collect::<Vec<_>>(),
+                        "relayPeers":identities.iter().enumerate().map(|(id,identity)|json!({"id":id,"identity":identity})).collect::<Vec<_>>()}));
                 }
             }
             transport.set_external(external,observer_packet_slot);
@@ -808,6 +822,7 @@ impl Network {
                 key: keys[id].clone(),
                 executor: Some(executor),
                 votor,
+                epoch_voting: Default::default(),
                 mempool: BTreeMap::new(),
                 in_flight: BTreeMap::new(),
                 fragment_mempool: BTreeMap::new(),
@@ -861,16 +876,19 @@ impl Network {
                 "admissionFromSlot is behind saved state without an admission marker; configure a future boundary");
         }
         let catalog=nodes[0].executor.as_ref().unwrap().validator_catalog(&nodes[0].genesis)?;
-        for snapshot in nodes[0].executor.as_ref().unwrap().admission_snapshots(&nodes[0].genesis)? {proposer_schedules.learn_admission(snapshot,catalog.clone())?;}
+        for snapshot in nodes[0].executor.as_ref().unwrap().admission_snapshots(&nodes[0].genesis)? {proposer_schedules.learn_hubs(snapshot.epoch,nodes[0].executor.as_ref().unwrap().admission_hubs(&nodes[0].genesis,snapshot.epoch)?)?;proposer_schedules.learn_admission(snapshot,catalog.clone())?;}
+        for node in &mut nodes {
+            node.epoch_voting.install(&mut node.votor,&proposer_schedules,&identities[node.id])?;
+        }
         let proposers = Arc::new(std::sync::RwLock::new(proposer_schedules));
-        if let Some(server)=transport.external_server() {
+        let external_ingress=if let Some(server)=transport.external_server() {
             server.set_catalog(proposers.read().unwrap().catalog.iter().enumerate().map(|(id,identity)| {
                 let bytes:[u8;32]=bs58::decode(identity).into_vec().expect("committed identity").try_into().expect("identity size");(id,bytes)
             }).collect())?;
             let (sender,receiver)=mpsc::channel(256);
             server.set_ingress(sender);
-            tokio::spawn(member_votes(receiver,transport.clone(),proposers.clone(),gateway.clone(),genesis.as_ref().and_then(|g|g.bridge.as_ref()).map(|rule|rule.chain_tag())));
-        }
+            Some(receiver)
+        }else{None};
         let kept_writer = kept.clone().map(crate::history::spawn_writer).transpose()?;
         let keep_from = resumed.map_or(0, |block| block.slot * 4 + 4);
         let built_in = senders
@@ -920,6 +938,9 @@ impl Network {
         let observer = crate::observer::Observer::start(
             gateway.clone(), persistence.clone(), identities.clone(), exchange.clone(), profile.clone(),
         );
+        if let Some(receiver)=external_ingress {
+            tokio::spawn(member_votes(receiver,transport.clone(),proposers.clone(),gateway.clone(),observer.clone(),genesis.as_ref().and_then(|g|g.bridge.as_ref()).map(|rule|rule.chain_tag())));
+        }
         let bridge_deposits = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
         let bridge_prunes = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
         if let (Some(bridge), Some(urls)) = (genesis.as_ref().and_then(|g| g.bridge.clone()), bridge_rpc_urls) {
@@ -1001,16 +1022,11 @@ impl Network {
         let bytes:[u8;32]=bs58::decode(identity).into_vec()?.try_into().map_err(|_|anyhow::anyhow!("Invalid validator key"))?;
         Ok(ed25519_dalek::VerifyingKey::from_bytes(&bytes)?)
     }
-    fn sync_voting(&mut self,id:usize,cblock:u64)->Result<()> {
+    fn sync_voting(&mut self,id:usize,cblock:u64)->Result<bool> {
         let schedules=self.proposers.read().unwrap();
-        if !schedules.config.admission_from_slot.is_some_and(|from|cblock*4>=from) {return Ok(())}
-        let (identities,stakes)=schedules.voting_set(cblock)?;
-        let own=identities.iter().position(|identity|identity==&self.identities[id]);
-        let from=(cblock*4/schedules.config.epoch_slots)*(schedules.config.epoch_slots/4);
-        if self.nodes[id].votor.stakes_at(from)!=stakes || self.nodes[id].votor.own_at(from)!=own {
-            self.nodes[id].votor.install_stakes(from,own,stakes)?;
-        }
-        Ok(())
+        let node=&mut self.nodes[id];
+        node.epoch_voting.install(&mut node.votor,&schedules,&self.identities[id])?;
+        Ok(node.epoch_voting.ready(&schedules,cblock))
     }
     fn validator_set_json(&self,epoch:u64)->Result<Value> {
         let schedules=self.proposers.read().unwrap();
@@ -1021,7 +1037,55 @@ impl Network {
             let hub=entry.map(|member|member.hub.clone()).or_else(||schedules.config.hubs.iter().find(|hub|hub.members.iter().any(|member|member.identity==*identity)).map(|hub|hub.code.clone())).unwrap();
             json!({"identity":identity,"hub":hub,"stake":stake.to_string(),"validatorKind":if schedules.config.identities.contains(identity){"genesis"}else{"external"},"admittedAtEpoch":entry.map_or(0,|member|member.admitted_at_epoch)})
         }).collect::<Vec<_>>();
-        Ok(json!({"epoch":epoch,"cutoffSlot":frozen.filter(|_|schedules.admission_active(epoch)).map(|set|set.cutoff_slot),"members":members,"catalog":schedules.catalog,"genesisIdentities":schedules.config.identities}))
+        let executor=self.nodes[0].executor.as_ref().unwrap();
+        let checkpoint=executor.checkpoint();
+        let registered=executor.registered_hubs(&checkpoint)?;
+        let mut codes=schedules.config.hubs.iter().map(|hub|hub.code.clone()).collect::<BTreeSet<_>>();
+        codes.extend(registered.iter().map(|hub|hub.code.clone()));
+        let hubs=codes.into_iter().map(|code| {
+            let entries=members.iter().filter(|member|member["hub"]==code).collect::<Vec<_>>();
+            let formed_outside=if entries.is_empty(){!schedules.config.hubs.iter().any(|hub|hub.code==code)}else{entries.iter().all(|member|member["validatorKind"]=="external")};
+            let active=if schedules.admission_active(epoch) {schedules.admission_draws.get(&epoch).is_some_and(|draw|draw.shares.iter().any(|share|share.hub_code==code))}
+                else{schedules.config.hubs.iter().any(|hub|hub.code==code)};
+            let first=if schedules.config.hubs.iter().any(|hub|hub.code==code){Some(0)}else{registered.iter().find(|hub|hub.code==code).and_then(|hub|hub.activated_at_epoch)};
+            json!({"hubCode":code,"formedOutside":formed_outside,"activatedAtEpoch":first,"active":active})
+        }).collect::<Vec<_>>();
+        Ok(json!({"epoch":epoch,"cutoffSlot":frozen.filter(|_|schedules.admission_active(epoch)).map(|set|set.cutoff_slot),"members":members,"catalog":schedules.catalog,"genesisIdentities":schedules.config.identities,"hubs":hubs}))
+    }
+    async fn refresh_member_peers(&mut self,cblock:u64)->Result<()> {
+        let Some(server)=self.transport.external_server() else{return Ok(())};
+        let Some(rule)=self.genesis.as_ref().and_then(|genesis|genesis.bridge.as_ref()).filter(|rule|rule.admission_from_slot.is_some_and(|from|cblock*4>=from)) else{return Ok(())};
+        let executor=self.nodes[0].executor.as_ref().unwrap();
+        let Some(checkpoint)=self.nodes[0].checkpoints.get(&cblock) else{return Ok(())};
+        let registered=executor.registered_hubs(checkpoint)?;
+        let announcements=executor.peer_announcements(checkpoint)?;
+        let (catalog,memberships)={
+            let schedules=self.proposers.read().unwrap();let epoch=cblock*4/rule.epoch_slots;
+            (schedules.catalog.clone(),schedules.admissions.range(epoch..=epoch+1).flat_map(|(_,set)|set.members.clone()).collect::<Vec<_>>())
+        };
+        let bootstrap={self.gateway.read().await.hub_peers.get("FRA").cloned()};
+        let Some(bootstrap)=bootstrap else{return Ok(())};
+        let mut directory=BTreeMap::new();let mut routes=vec![];
+        for hub in registered {
+            let mut seen=BTreeSet::new();
+            let peers=memberships.iter().filter(|member|member.hub==hub.code).filter_map(|member| {
+                let identity=member.identity.to_string();
+                let id=catalog.iter().position(|known|known==&identity)?;
+                if !seen.insert(id) {return None}
+                let mut peer=json!({"id":id,"identity":identity});
+                if id<12 {peer["address"]=bootstrap["address"].clone();peer["certificate"]=bootstrap["certificate"].clone();}
+                else if let Some(announced)=announcements.iter().find(|peer|peer.identity==member.identity) {
+                    peer["address"]=json!(announced.address);peer["certificate"]=json!(B64.encode(&announced.certificate));
+                }
+                Some(peer)
+            }).collect::<Vec<_>>();
+            routes.push((hub.code.clone(),peers.iter().map(|peer|peer["id"].as_u64().unwrap()as usize).collect()));
+            directory.insert(hub.code.clone(),json!({"hub":hub.code,"address":bootstrap["address"],"certificate":bootstrap["certificate"],"peers":peers,
+                "relayPeers":catalog.iter().take(12).enumerate().map(|(id,identity)|json!({"id":id,"identity":identity})).collect::<Vec<_>>()}));
+        }
+        server.set_registry_hubs(routes)?;
+        self.gateway.write().await.hub_member_peers=directory;
+        Ok(())
     }
     fn window(&self, number: u64) -> Result<schedule::Window> { self.proposers.read().unwrap().window(number) }
     fn proposer_ids(&self, number: u64) -> Result<Vec<usize>> { self.proposers.read().unwrap().ids(number) }
@@ -1497,6 +1561,9 @@ impl Network {
             }
         }
         if node == 0 {
+            if let Some(cblock)=step.events.iter().filter(|event|event.kind=="cblock.finalized").filter_map(|event|event.slot.map(|slot|slot/4)).max() {
+                self.refresh_member_peers(cblock).await?;
+            }
             let waiting = self.finalized.iter().copied().filter(|c| self.proof_prepared_through.is_none_or(|done| *c > done)).collect::<Vec<_>>();
             for c in waiting {
                 if !self.prepare_finalized_chain(c)? { break }
@@ -1739,7 +1806,22 @@ impl Network {
         gateway.follower_retained_block_bytes = bytes;
     }
     async fn tick(&mut self) -> Result<()> {
-        self.identities=self.proposers.read().unwrap().catalog.clone();
+        let admission_enabled={
+            let schedules=self.proposers.read().unwrap();
+            self.identities=schedules.catalog.clone();schedules.config.admission_from_slot.is_some()
+        };
+        if admission_enabled {for id in self.active.clone() {
+            let pending={
+                let schedules=self.proposers.read().unwrap();
+                let node=&mut self.nodes[id];
+                node.epoch_voting.install(&mut node.votor,&schedules,&self.identities[id])?;
+                node.epoch_voting.take_ready(&schedules)
+            };
+            for packet in pending {
+                let envelope=decode(&packet.payload)?;
+                self.accept_input(packet,envelope).await;
+            }
+        }}
         let _phase = self.profile.measure(None, "protocol.tick");
         if self.facts.is_some() {
             self.update_facts().await;
@@ -1979,9 +2061,7 @@ impl Network {
         let mut step = Step::new();
         if self.config.peer_port.is_some() {
             let schedules=self.proposers.read().unwrap();
-            let drawn=schedules.window(number)?;
-            let hub=schedules.config.hubs.iter().find(|hub|hub.code==drawn.hub_code);
-            if hub.and_then(|hub|hub.members.first()).is_some_and(|member|member.identity==self.identities[id]) {
+            if schedules.window_representative(number)?==id {
                 let targets=schedules.ids(number)?.into_iter().filter(|target|*target>=12).collect::<Vec<_>>();
                 if !targets.is_empty() {
                     let started_at_unix_us=SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64
@@ -2139,8 +2219,19 @@ impl Network {
         crate::proposer::stream_block(crate::proposer::ProposalLink::Local(self.transport.clone()),id,self.keys[id].clone(),block,run.start,self.gateway.clone(),self.identities[id].clone());
         Ok(())
     }
+    async fn accept_input(&mut self,packet:Received,envelope:Envelope) {
+        if let Err(error)=self.receive(packet,envelope).await {tracing::warn!(%error,"Rejected protocol input");}
+    }
     async fn receive(&mut self, packet: Received, e: Envelope) -> Result<()> {
         self.identities=self.proposers.read().unwrap().catalog.clone();
+        let cblock=match &e.body {Wire::Vote(signed)=>Some(signed.vote.slot),Wire::Certificate{certificate,..}=>Some(certificate.slot),_=>None};
+        if let Some(cblock)=cblock {
+            if cblock<self.nodes[packet.to].votor.pruned_below() {return Ok(())}
+            if !self.sync_voting(packet.to,cblock)? {
+                self.nodes[packet.to].epoch_voting.hold(cblock,packet)?;
+                return Ok(());
+            }
+        }
         self.profile.record(
             Some(packet.to),
             "receive.actor_delay",
@@ -2153,7 +2244,7 @@ impl Network {
         match e.body {
             // A commitment witness shares the wire with votes; every existing validator already
             // computed it locally. It is consumed by external replay, never as consensus input.
-            Wire::Cblock(_) | Wire::ValidatorEpoch {..} | Wire::WindowStart {..} | Wire::CommitReceipt(_) => {}
+            Wire::Cblock(_) | Wire::ValidatorEpoch {..} | Wire::WindowStart {..} | Wire::CommitReceipt(_) | Wire::ExchangeMetrics{..} => {}
             Wire::Submit(tx) => {
                 // Judged by the slot it targets: every actor, not only node zero's, admits submissions.
                 if self.native_cutover_slot().is_some_and(|cut| tx.header.target_slot >= cut) && self.built_in.contains(&tx.header.fee_payer) { return Ok(()) }
@@ -2364,7 +2455,6 @@ impl Network {
                 if self.nodes[id].votes.contains_key(&encode(&signed.vote)?) {
                     return Ok(());
                 }
-                self.sync_voting(id,signed.vote.slot)?;
                 let key=self.voter_key(signed.vote.slot,signed.vote.validator)?;
                 ensure!(self.proposers.read().unwrap().catalog.get(e.from).is_some_and(|identity|bs58::encode(key.as_bytes()).into_string()==*identity),"Wrong vote sender");
                 let message=vote_message(&signed.vote,self.genesis.as_ref().and_then(|g|g.bridge.as_ref()))?;
@@ -2393,7 +2483,6 @@ impl Network {
                     certificate.votes.len() == proofs.len(),
                     "Certificate missing proofs"
                 );
-                self.sync_voting(id,certificate.slot)?;
                 for (v,p) in certificate.votes.iter().zip(&proofs) {
                     ensure!(v==&p.vote,"Mismatched certificate vote");
                     let key=self.voter_key(v.slot,v.validator)?;
@@ -3115,7 +3204,10 @@ impl Network {
     async fn try_vote(&mut self, id: usize, w: u64) -> Result<()> {
         let _phase = self.profile.measure(Some(id), "validator.vote");
         for i in w * 4..w * 4 + 4 {
+            // Timeouts insert their Skip vote immediately too, so they need the same
+            // installed-set frontier as local blocks and received consensus inputs.
             let already_voted = self.nodes[id].voted.contains(&i);
+            if !already_voted&&!self.sync_voting(id,i)? {break}
             if i % 4 != 0 && !self.nodes[id].voted.contains(&(i - 1)) {
                 break;
             }
@@ -3217,7 +3309,6 @@ impl Network {
                 } else {
                     crypto::hash(&preimage)
                 };
-                self.sync_voting(id,i)?;
                 let block = consensus::Block {
                     id: BlockRef { slot: i, hash },
                     parent,
@@ -3414,6 +3505,7 @@ impl Network {
                         let catalog=executor.validator_catalog(checkpoint)?;
                         for snapshot in executor.admission_snapshots(checkpoint)? {
                             let publish=id==0 && (!schedules.admissions.contains_key(&snapshot.epoch)||catalog.len()>schedules.catalog.len());
+                            schedules.learn_hubs(snapshot.epoch,executor.admission_hubs(checkpoint,snapshot.epoch)?)?;
                             schedules.learn_admission(snapshot.clone(),catalog.clone())?;
                             if publish {step.out.push(Outbox{from:id,to:(0..12).collect(),body:Wire::ValidatorEpoch{snapshot,catalog:catalog.clone()}});}
                         }
@@ -3423,6 +3515,7 @@ impl Network {
                             }).collect())?;
                         }
                     }
+                    self.sync_voting(id,block.slot)?;
                     self.sign_finalized_ancestors(id, block, step)?;
                     let at = self.consensus_time(id, block.slot);
                     let state = self.nodes[id]
@@ -4098,10 +4191,77 @@ fn catalog_key(schedules:&ProposerSchedules,id:usize)->Result<ed25519_dalek::Ver
 }
 /// Members submit the same signed proposer envelopes as genesis actors. The link boundary
 /// validates the frozen identity, scheduled role and recipients before any validator sees them.
+fn verify_exchange_report(input:&crate::external::ExternalIngress,schedules:&std::sync::RwLock<ProposerSchedules>,started:u64)->Result<(String,crate::exchange_metrics::ExchangeReport)> {
+    use bincode::Options;
+    ensure!(input.envelope.len()<=128*1024 && input.recipients.as_deref()==Some(&[0]),"Invalid measurement report route or size");
+    let envelope:Envelope=decode(&input.envelope)?;
+    let frozen=schedules.read().unwrap();
+    let identity=bs58::encode(input.identity).into_string();
+    ensure!(frozen.catalog.get(envelope.from)==Some(&identity)&&envelope.from>=12,"Invalid measurement reporter");
+    crypto::verify_bytes(&ed25519_dalek::VerifyingKey::from_bytes(&input.identity)?,&encode(&envelope.body)?,&envelope.signature)?;
+    let Wire::ExchangeMetrics{epoch,snapshot}=envelope.body else{unreachable!()};
+    ensure!(epoch==started*4/frozen.config.epoch_slots,"Measurement report is outside the current epoch");
+    let set=frozen.admissions.get(&epoch).context("Measurement epoch is not finalized")?;
+    ensure!(set.members.iter().any(|member|member.identity.to_bytes()==input.identity&&member.hub==input.hub),"Measurement reporter is not admitted");
+    let report:crate::exchange_metrics::ExchangeReport=bincode::DefaultOptions::new().with_fixint_encoding().with_limit(128*1024).reject_trailing_bytes().deserialize(&snapshot)?;
+    ensure!(report.pairs.len()<=31&&report.spreads.len()<=1&&report.arrivals.len()<=390,"Measurement report has too many rows");
+    let valid_samples=|samples:&[(u64,u64)]|samples.len()<=128&&samples.iter().all(|(sequence,value)|*sequence>0&&*value<=600_000_000)&&samples.windows(2).all(|pair|pair[0].0<pair[1].0);
+    let mut pairs=BTreeSet::new();
+    for row in &report.pairs {
+        ensure!(row.hub==input.hub&&row.members[0]==identity&&row.members[0]<row.members[1]&&pairs.insert(row.members.clone())&&valid_samples(&row.values),"Invalid pair measurements");
+        ensure!(row.members.iter().all(|identity|set.members.iter().any(|member|member.hub==input.hub&&member.identity.to_string()==*identity)
+            &&!frozen.config.identities.contains(identity)),"Pair measurement names another hub or a hosted member");
+    }
+    for row in &report.spreads {
+        ensure!(row.hub==input.hub&&valid_samples(&row.values)&&set.members.iter().filter(|member|member.hub==input.hub).all(|member|!frozen.config.identities.contains(&member.identity.to_string())),"Invalid external hub spread");
+    }
+    for row in &report.arrivals {
+        // A report carries its member's recent rows; those older than the window it is judged in are
+        // left out rather than voiding the rest. start_us and arrived_us are offsets from the
+        // member's own start and grow without bound; only the arrival relative to the start is a duration.
+        if row.slot.saturating_add(128)<started*4 || row.slot>started*4+32 { continue }
+        ensure!((1..=3).contains(&row.proposer)&&(1..=3).contains(&row.receiver)&&row.proposer!=row.receiver
+            &&row.relative_to_start_us.unsigned_abs()<=600_000_000,"Invalid reported commitment arrival");
+        let ids=frozen.ids(row.slot/16)?;
+        ensure!(ids[row.receiver-1]==envelope.from&&frozen.window(row.slot/16)?.hub_code==input.hub,"Commitment arrival names another receiver");
+    }
+    Ok((identity,report))
+}
 async fn member_votes(mut incoming:mpsc::Receiver<acrux_transport::external::ExternalIngress>,transport:Arc<LocalTransport>,
-    schedules:Arc<std::sync::RwLock<ProposerSchedules>>,gateway:crate::gateway::SharedGateway,chain_tag:Option<[u8;32]>) {
+    schedules:Arc<std::sync::RwLock<ProposerSchedules>>,gateway:crate::gateway::SharedGateway,observer:crate::observer::Observer,chain_tag:Option<[u8;32]>) {
+    let mut reported=BTreeMap::new();
     while let Some(input)=incoming.recv().await {
         let started=gateway.read().await.current_window["number"].as_u64().unwrap_or(0)*4;
+        if input.envelope.get(8..12)==Some(14u32.to_le_bytes().as_slice()) {
+            let checked=verify_exchange_report(&input,&schedules,started);
+            match checked {
+                Ok((identity,mut report))=>{
+                    let now=Instant::now();reported.retain(|_,at:&mut Instant|now.saturating_duration_since(*at)<Duration::from_secs(10));
+                    if reported.get(&identity).is_some_and(|at|now.saturating_duration_since(*at)<Duration::from_secs(1)) {input.reject("Measurement report rate exceeded");continue}
+                    reported.insert(identity.clone(),now);
+                    let arrivals=std::mem::take(&mut report.arrivals);
+                    let mut events=vec![];
+                    let engine={
+                        let state=gateway.read().await;
+                        for row in arrivals {
+                            if let Some(view)=state.slots.get(&row.slot) {
+                                let commitment=&view["blocks"][row.proposer-1]["commitment"];
+                                if commitment["hash"]==hex::encode(row.hash)&&commitment["arrivals"].as_array().is_some_and(|arrivals|!arrivals.iter().any(|arrival|arrival["receiver"]==row.receiver)) {
+                                    events.push(crate::observer::Event{slot:Some(row.slot),anchor:"slot",at:row.arrived_us,kind:"commitment.arrived",data:row.json()});
+                                }
+                            }
+                        }
+                        state.exchange_metrics.as_ref().and_then(std::sync::Weak::upgrade)
+                    };
+                    if !events.is_empty() {
+                        if let Err(error)=observer.submit(0,events,vec![]).await {tracing::error!(%error,"member observations stopped");return}
+                    }
+                    if let Some(engine)=engine {engine.include_report(identity,report);}
+                },
+                Err(error)=>input.reject(&format!("Invalid measurement report: {error}")),
+            }
+            continue;
+        }
         let checked=(||->Result<(Envelope,Vec<usize>)>{
             ensure!(input.envelope.len()<=1024*1024,"Member frame too large");
             let envelope:Envelope=decode(&input.envelope)?;
@@ -4123,7 +4283,8 @@ async fn member_votes(mut incoming:mpsc::Receiver<acrux_transport::external::Ext
                 Wire::Commit(commitment)=> {
                     let ids=frozen.ids(commitment.slot/16)?;
                     ensure!((1..=3).contains(&commitment.proposer)&&ids[commitment.proposer-1]==envelope.from,"Unscheduled commitment");
-                    (commitment.slot,ids.into_iter().filter(|id|*id!=envelope.from).collect())
+                    let recipients=if ids.iter().all(|id|*id>=12) {vec![0]} else {ids.into_iter().filter(|id|*id!=envelope.from).collect()};
+                    (commitment.slot,recipients)
                 },
                 Wire::Attest(attestation)=> {
                     let ids=frozen.ids(attestation.slot/16)?;
@@ -4181,6 +4342,11 @@ async fn member_votes(mut incoming:mpsc::Receiver<acrux_transport::external::Ext
                             g.emit(Some(bs58::encode(input.identity).into_string()),Some(commitment.slot),"slot",0,"commitment.sent",data);
                         }
                     }
+                }
+                // An outside hub's hosted commitment copy is a read-model report. It must never
+                // create a fourth exchange participant or a hosted receipt.
+                if let Wire::Commit(commitment)=&envelope.body {
+                    if schedules.read().unwrap().ids(commitment.slot/16).is_ok_and(|ids|ids.iter().all(|id|*id>=12)) {continue}
                 }
                 for to in targets {
                 let result=if to<12 {transport.inject_external_at(from,to,input.envelope.clone(),input.received_at)} else {
@@ -4361,7 +4527,7 @@ impl NodeRunner {
             tokio::select! {
               _=&mut stop=>break,
               _=tokio::signal::ctrl_c()=>break,
-              packet=incoming.recv()=>{if let Some((packet,envelope))=packet{if let Err(error)=self.network.receive(packet,envelope).await{tracing::warn!(%error,"Rejected protocol input");} for _ in 0..7{let Ok((packet,envelope))=incoming.try_recv()else{break;};if let Err(error)=self.network.receive(packet,envelope).await{tracing::warn!(%error,"Rejected protocol input");}} }else{break;}},
+              packet=incoming.recv()=>{if let Some((packet,envelope))=packet{self.network.accept_input(packet,envelope).await; for _ in 0..7{let Ok((packet,envelope))=incoming.try_recv()else{break;};self.network.accept_input(packet,envelope).await;} }else{break;}},
               _=tick.tick()=>{self.network.tick().await?;let node=&self.network.nodes[self.id];let mut map=bases.lock().unwrap();for(w,r)in node.windows.iter().rev().take(2){map.insert((self.id,*w),r.start);}},
               _=traffic.tick(),if self.id==0&&self.network.config.traffic_per_second>0=>self.network.traffic().await?,
               command=async {match &mut commands{Some(rx)=>rx.recv().await,None=>std::future::pending().await}}=>{if let Some(command)=command{self.network.command(command).await;}}

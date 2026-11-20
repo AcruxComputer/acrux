@@ -21,6 +21,8 @@ import { chainDir, DEV_SEED, devKeypair } from './dev-keys.mjs'
 import { bridgeProgram, pdas, seed, relay, decodeEntry, chainTag, programData } from './bridge-relay.mjs'
 
 const arg = name => { const i = process.argv.indexOf(`--${name}`); return i < 0 ? undefined : process.argv[i + 1] }
+// --silent-at-boundary: the admitted member's node stops just before its admission boundary.
+const silentAtBoundary = process.argv.includes('--silent-at-boundary')
 const required = name => {
   const value = arg(name)
   assert.ok(value && /^\d+$/.test(value), `Set --${name} explicitly as an unsigned decimal integer; see the usage example.`)
@@ -308,6 +310,28 @@ try {
   const onSolanaNext = await onSolana.account.validatorSet.fetch(addresses.set(targetEpoch), 'confirmed')
   assert.equal(onSolanaNext.validators.find(member => member.key.equals(holder.publicKey)).stake.toString(), stakeLamports.toString())
   assert.ok((await rpc('getFinalizedCblock')).consensusSlot * 4 < targetEpoch * epochSlots, 'The next set must be handed to Solana before its boundary.')
+  if (silentAtBoundary) {
+    // The case live can meet first: a member admitted at a boundary that is silent there. Its node
+    // stops a few slots before the boundary, and the hosted net must finalize through it and past the next.
+    await waitSlot(targetEpoch * epochSlots - 8)
+    const stopped = observer
+    observer = null
+    stopped.kill()
+    const stoppedAt = (await rpc('getFinalizedCblock')).consensusSlot * 4
+    let last = stoppedAt, lastAt = Date.now(), longestStallMs = 0
+    await until(`Finality through the boundary at ${targetEpoch * epochSlots} and past ${(targetEpoch + 1) * epochSlots}`, Math.ceil(3 * epochSlots / 15) + 120, async () => {
+      const head = (await rpc('getFinalizedCblock')).consensusSlot * 4
+      if (head > last) { longestStallMs = Math.max(longestStallMs, Date.now() - lastAt); last = head; lastAt = Date.now() }
+      assert.ok(Date.now() - lastAt < 30_000, `Finality stood still for 30 s at slot ${last} with the admitted member silent.`)
+      return head >= (targetEpoch + 1) * epochSlots + 4 && head
+    })
+    const set = await rpc('getValidatorSet', { epoch: targetEpoch })
+    assert.ok(set.members.some(member => member.identity === holder.publicKey.toBase58()), 'The silent member is in the set it stays silent in.')
+    event('native_admission_silent_member_passed', { identity: holder.publicKey.toBase58(), admittedAtEpoch: targetEpoch, stoppedAtSlot: stoppedAt,
+      boundary: targetEpoch * epochSlots, nextBoundary: (targetEpoch + 1) * epochSlots, finalizedThrough: last, longestStallMs, stake: stakeLamports.toString() })
+    process.exitCode = 0
+    throw Object.assign(new Error('silent member check done'), { done: true })
+  }
   await waitSlot(targetEpoch * epochSlots + 4)
   await until('Outside identity enters voting mode and signs', 30, async () => memberEpochs.has(targetEpoch) && signedEpochs.has(targetEpoch))
   const voted = await until('A finalized proof includes the outside Finalize vote', 30, async () => {
@@ -345,8 +369,10 @@ try {
     leftAtEpoch: leaveEpoch, nativeDelegatedLamports: stakeLamports.toString(), outsideFinalizeCblock: voted.proof.consensusSlot,
     solanaCertificate: report, observerMatches })
 } catch (error) {
-  console.error(`The local net's last output:\n${tail}\nOutside process:\n${observerTail}`)
-  throw error
+  if (!error.done) {
+    console.error(`The local net's last output:\n${tail}\nOutside process:\n${observerTail}`)
+    throw error
+  }
 } finally {
   const failures = []
   for (const owned of [observer, child]) {

@@ -42,6 +42,12 @@ const stream = net.subscribe({ kind: 'all' }, event => { /* switch on event.type
 
 Methods with no parameters take `{}`. Every response and event parses under the contract's schemas, and failures arrive as `ApiClientError` with the error envelope in `body.error`. The API also serves `/openapi.json`, which carries the gateway's JSON-RPC and event stream as `x-acrux-json-rpc` and `x-acrux-event-stream`.
 
+Response and event objects strip unknown fields, so clients can read additive
+server changes with an older contract. Request bodies, query parameters, stream
+commands and JSON-RPC requests remain strict, including nested submission headers.
+Run `node scripts/response-compatibility-check.mjs` from `contract/` after its build
+to check the response fixtures and strict request boundaries.
+
 `?fixture=<name>` (or `X-Fixture`) on the API in `MODE=fixture`, and the exports of `@acrux/contract/fixtures`, give every screen state its fixture: registry, slot, transaction, send, lab and connectivity states.
 
 ## Burn read model

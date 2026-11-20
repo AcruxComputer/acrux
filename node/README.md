@@ -386,21 +386,34 @@ acrux node propose --hub FRA --identity validator.json --genesis chain/genesis/a
 `https://rpc.acrux.computer`. The genesis, placement manifest and bridge rule
 must match the net, just as for `node follow`. A new identity is an observer;
 it sends only link frames until a finalized epoch snapshot admits it. Admitted
-identities vote as described below; block production remains the next step.
+identities vote and produce their drawn blocks as described below.
 
 The command bootstraps from the gateway's finalized `getExecutionSnapshot` and
-`getHubPeers {hub}`. The latter returns `{hub,address,certificate,peers}`: the
-hub's logical co-proposer identities and IDs, one public `host:port` and a
-base64 DER QUIC certificate pinned from that gateway response. The host still
-runs all twelve identities, so they share one physical endpoint. The observer
+`getHubPeers {hub,direct:true}`. The latter returns
+`{hub,address,certificate,peers,relayPeers}`. The top-level address and base64 DER
+certificate identify the hosted replay endpoint; `relayPeers` names the twelve
+hosted relays. Each logical peer has an identity and ID, plus its own advertised
+address and certificate once recorded on Acrux. Omitting `direct` keeps the legacy
+response for genesis hubs; newly registered hubs are also found by `{hub}`. The observer
 opens one authenticated connection, with the hub's logical links multiplexed on
 it. The net challenges it with a fresh nonce; its identity signs a domain-bound
 proof of the nonce, hub and public key. No observer consensus input is accepted.
 
+For a hub with outside co-proposers, add `--peer-port <udp-port>` to open a
+direct authenticated listener. `--peer-address <public-host:udp-port>` is required
+when binding outside loopback; the same names are available as
+`ACRUX_PEER_PORT` and `ACRUX_PEER_ADDRESS`. Outside-only hubs need these direct
+links between their operators. Effective members automatically advertise the
+address and pinned certificate in a signed `acrux-peer-v1:` Memo transaction on
+Acrux. The identity pays the transaction fee and metadata-account rent from its
+native wallet. The metadata is hashed state, and discovery follows the member's
+effective hub; this requires no Hub Registry program upgrade.
+
 After bootstrap, encrypted shreds, commitments, signed attestations, votes and
 certificates arrive as the same `Envelope`/`Wire` messages used between validators.
-The observer receives the transcript addressed to its hub's first local member,
-which includes the data that member uses to re-execute other hubs' windows too.
+For a genesis hub the observer receives its first hosted member's transcript;
+an outside-only hub bootstraps from node zero's transcript. Both include the data
+needed to re-execute every hub's finalized windows.
 Mempool submissions are unnecessary: selected transactions and threshold
 fragments already ride inside encrypted blocks. It checks the signed data,
 reconstructs blocks, verifies agreement and finalization certificates, and uses
@@ -477,9 +490,13 @@ the previous e+2 draw lead from A+1; no second stake snapshot is taken. Registry
 joins, moves and leaves are interpreted at their effective epoch. A delegated
 stake counts when `activation_epoch < e` and `deactivation_epoch >= e` for target
 e. Outsiders need positive delegated stake; each genesis identity also keeps
-`genesisStakeLamports`. New hub n_min/rho rules are not applied. Drawing three
-co-proposers requires three eligible identities in a hub; smaller hubs can have
-admitted voters but receive no windows in this step.
+`genesisStakeLamports`. A new hub needs at least four eligible members and capped
+proposer stake of at least 1% of the snapshot's total stake. These conditions are
+evaluated at the same mid-epoch cut-off, so an outside-only hub receives windows
+from the next boundary after it qualifies. A late registration, join or delegation
+waits for the following cut-off. Registry ECEF coordinates are frozen with that
+epoch's set and supply the hub's regional placement. Genesis identities retain
+their bootstrap protection; outside identities in an ineligible hub stay waiting.
 
 The live bridge uses u32 vote bitmaps, so each snapshot admits at most 32 voters.
 Eligible identities are selected by descending stake, then public-key bytes for
@@ -509,14 +526,22 @@ acrux node propose --hub FRA --identity validator.json --genesis chain/genesis/a
 Read the Vote address from `getVoteAccounts` or derive the PDA above.
 `getVoteAccounts.current` includes installed Vote accounts and live delegation
 weights, including those waiting for admission. `getValidatorSet {epoch?}`
-returns the frozen set: `{epoch,cutoffSlot,members,catalog,genesisIdentities}`;
+returns the frozen set: `{epoch,cutoffSlot,members,catalog,genesisIdentities,hubs}`;
 each member has identity, hub, decimal-string stake, `validatorKind` and
 `admittedAtEpoch`. Omit epoch for the current set. `/hubs` uses this frozen set
-for actual proposer weights and admission metadata.
+for actual proposer weights and admission metadata. Each hub reports `hubCode`,
+`active`, `formedOutside` and `activatedAtEpoch`. `formedOutside` means that its
+current frozen members include no genesis identity. `activatedAtEpoch` records
+the first active epoch for that registered hub, or null while waiting. The API
+adds these fields to Acrux hubs and excludes inactive hubs from schedule previews.
 
 Before its epoch starts the snapshot is announced as `Wire::ValidatorEpoch`
 through the shared history; replay verifies it against finalized hashed state.
 The voter installs the next set when replay finalizes its mid-epoch cut-off.
+Hosted actors install that same finalized set at the cut-off and restore known
+sets before resuming consensus. Early votes and certificates wait within the
+existing 100,000-envelope / 64 MiB bounds. Neither a local block nor a timeout
+can produce a vote for an epoch whose set is still unknown.
 Wire votes, certificates and block material for an unknown set wait within the
 observer's existing memory bounds, then undergo signature checks and counting
 after installation. The bootstrap epoch keeps its identical inherited set.
@@ -622,7 +647,7 @@ step.
 
 ## Measured hash exchange
 
-Node 0.4.27 exports actual Algorithm 1 commitment exchanges. A drawn co-proposer
+Node 0.4.28 exports actual Algorithm 1 commitment exchanges. A drawn co-proposer
 returns a signed receipt for the original commitment's slot, proposer and hash.
 The sender measures its round trip with its monotonic clock, matching the first
 receipt once. Retransmissions do not add samples. These are round-trip
@@ -634,12 +659,16 @@ An unordered pair is labelled `applied` when both endpoints are hosted genesis
 validators using `LocalTransport::link_delay`, and `real` when an endpoint is an
 outside member. Its two public addresses are sorted lexicographically. The
 shared hosted engine pools its raw observations for each pair, so both hosted
-directions count when available. The API uses these hosted observations while
-pairs have a hosted endpoint. Outside-only collection belongs to the later hub
-step.
+directions count when available. Outside members also send identity-signed raw
+observations over their authenticated uplink. The host validates their hub and
+epoch membership and aggregates them for the same private API source, including
+outside-only pairs. Direct co-proposer links pull bounded history without
+simulated hub delay. The API does not average endpoint percentiles or connect to
+operators' private metrics listeners.
 
 `commitSpreadUs` keeps its existing series. New applied/real subset spreads use
-one hosted observer per slot: the lowest hosted co-proposer ID. Each subset
+one observer per slot: the lowest hosted co-proposer ID when present, otherwise
+the lowest drawn co-proposer ID in an outside-only hub. Each subset
 contains its own actual send and all peer arrivals of that link kind. A mixed
 window can contribute both kinds. The subset becomes a sample when complete;
 late commitments retain their actual arrival time, and a missing peer creates
@@ -675,8 +704,8 @@ acrux node propose --hub FRA --identity validator.json --genesis chain/genesis/a
 ```
 
 This optional listener uses `ACRUX_BIND`, loopback by default, and serves both
-metrics paths above. It reports its own receipt observations; the site does not
-need to connect to it yet. Receipt telemetry stays out of hub mirrors and is
+metrics paths above. It reports its own receipt observations; the site receives
+their signed uplink reports through the host. Receipt telemetry stays out of hub mirrors and is
 sent to an outside connection only after it demonstrates receipt support. The
 shared pull history remains bounded at 64 MiB, with no outgoing per-peer queue.
 

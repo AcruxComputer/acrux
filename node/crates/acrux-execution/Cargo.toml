@@ -1,6 +1,6 @@
 [package]
 name = "acrux-execution"
-version = "0.4.27"
+version = "0.4.28"
 edition = "2021"
 description = "Algorithm 4 selection, SVM execution with fees and state hashes, and threshold transactions."
 
@@ -20,3 +20,4 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 solana-sdk = { workspace = true }
 acrux-crypto = { path = "../acrux-crypto" }
+acrux-schedule = { path = "../acrux-schedule" }

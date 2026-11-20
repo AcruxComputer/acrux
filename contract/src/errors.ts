@@ -29,10 +29,10 @@ export const ErrorStage = z.enum(['validation', 'auth', 'read', 'upload', 'build
 export type ErrorStage = z.output<typeof ErrorStage>
 
 /** The program that refused a transaction, by address, so overlapping custom codes stay unambiguous. */
-export const ProgramError = z.strictObject({ programId: Address, name: z.string(), number: z.int().optional() })
+export const ProgramError = z.object({ programId: Address, name: z.string(), number: z.int().optional() })
 
 const fields = <C extends z.ZodType<string>>(code: C) =>
-  z.strictObject({
+  z.object({
     code,
     message: z.string(),
     retryable: z.boolean(),
@@ -63,7 +63,7 @@ export function defineErrors<const Extra extends Record<string, number>>(extra: 
   const status = { ...BASE_ERROR_STATUS, ...extra } as typeof BASE_ERROR_STATUS & Extra
   type Code = keyof typeof status & string
   const ErrorCode = z.enum(Object.keys(status) as [Code, ...Code[]])
-  const ApiError = z.strictObject({ error: fields(ErrorCode) })
+  const ApiError = z.object({ error: fields(ErrorCode) })
   return { status, ErrorCode, ApiError }
 }
 

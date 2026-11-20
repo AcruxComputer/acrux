@@ -72,6 +72,8 @@ pub enum Wire {
     WindowStart { number: u64, parent: Option<consensus::BlockRef>, started_at_unix_us: u64 },
     /// An authenticated receipt for one actual commitment; telemetry only.
     CommitReceipt(CommitReceipt),
+    /// Bounded signed read-only measurements from the member's own direct links.
+    ExchangeMetrics { epoch:u64, snapshot:Vec<u8> },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommitReceipt {

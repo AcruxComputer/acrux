@@ -135,6 +135,12 @@ enum NodeCommand {
         /// Optional private metrics listener on this member's machine.
         #[arg(long)]
         metrics_port: Option<u16>,
+        /// Optional authenticated direct co-proposer listener on this machine.
+        #[arg(long, env = "ACRUX_PEER_PORT")]
+        peer_port: Option<u16>,
+        /// Public DNS name or IP and UDP port for the direct listener.
+        #[arg(long, env = "ACRUX_PEER_ADDRESS", requires = "peer_port")]
+        peer_address: Option<String>,
     },
     /// Follows a net from its latest finalized cblock: decrypts, merges and re-executes every
     /// finalized slot and checks the state hashes against the net's and its certificates.
@@ -261,7 +267,7 @@ async fn run() -> anyhow::Result<()> {
         Command::Replay { block, rpc, slot, save, rows, json } => return acrux_node::replay::run(block.as_deref(), rpc.as_deref(), slot, save.as_deref(), rows, json.as_deref()).await,
         Command::Send { rpc, keypair, to, lamports, n, t, priority } => return cli::send(&rpc, &keypair, &to, lamports, n, t, priority).await,
         Command::Node { command: NodeCommand::Follow { url, genesis } } => return cli::follow(&url, &genesis).await,
-        Command::Node { command: NodeCommand::Propose { hub, identity, net, genesis, rpc_port, metrics_port } } => return acrux_node::propose::run(&net, &hub, &identity, &genesis, rpc_port, metrics_port).await,
+        Command::Node { command: NodeCommand::Propose { hub, identity, net, genesis, rpc_port, metrics_port, peer_port, peer_address } } => return acrux_node::propose::run(&net, &hub, &identity, &genesis, rpc_port, metrics_port, peer_port, peer_address).await,
         Command::Net { command: NetCommand::Import { url, store, genesis } } => return cli::import(&url, &store, &genesis).await,
         Command::Hub { command, rpc, program, identity } => {
             let action = match command {

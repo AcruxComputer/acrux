@@ -116,7 +116,7 @@ export function createNodeApi() {
     if (!chains.length) readyRegistry('acrux')
     const configs = Object.fromEntries(chains.map(chain => [chain, readyRegistry(chain)]))
     const rows = (await hubRows(page.chain)).filter(row => configs[row.chain])
-    return c.json(paginate(rows.map(row => hubView(row, configs[row.chain]!)), page))
+    return c.json(paginate(rows.map(row => hubView(row, configs[row.chain]!, registries[row.chain as Chain].hubActivation(row.code))), page))
   })
   // A code can exist on both chains: `?chain=` picks one, else Acrux's comes first.
   app.get('/v1/hubs/:code', async c => {
@@ -124,7 +124,7 @@ export function createNodeApi() {
     const rows = await db.hub.findMany({ where: { code, ...(chain ? { chain } : {}) }, include: { members: { orderBy: { stakeLamports: 'desc' } } }, orderBy: { chain: 'asc' } })
     const row = rows[0]
     if (!row) fail('NOT_FOUND', 'This hub was not found.')
-    const view = hubView(row, readyRegistry(row.chain as Chain))
+    const view = hubView(row, readyRegistry(row.chain as Chain), registries[row.chain as Chain].hubActivation(row.code))
     if (row.chain !== 'acrux') return c.json(view)
     const telemetry = await hashExchange.read()
     return c.json({ ...view, hashExchange: hubHashExchange(telemetry, exchangeMembers(), row.code) })
@@ -139,7 +139,7 @@ export function createNodeApi() {
   app.get('/v1/schedule', async c => {
     const query = readQuery(c, epochQuery), chain = query.chain ?? 'solana'
     const config = readyRegistry(chain), epoch = query.epoch ?? config.currentEpoch + 1
-    const hubs = (await hubRows(chain)).map(row => ({ code: row.code, region: regionOf(row.latitude, row.longitude),
+    const hubs = (await hubRows(chain)).filter(row => registries[chain].hubActivation(row.code)?.active !== false).map(row => ({ code: row.code, region: regionOf(row.latitude, row.longitude),
       members: row.members.filter(m => BigInt(m.proposerStakeLamports.toString()) > 0n).map(m => ({ identity: m.identity, stake: Number(BigInt(m.stakeLamports.toString()) / 1_000n),
         ...(m.validatorKind === 'genesis' || m.validatorKind === 'external' ? { validatorKind: m.validatorKind as 'genesis' | 'external' } : {}) })) }))
     return c.json(await schedulePreview(epoch, hubs, Number(registries[chain].stake.total() / 1_000n)))

@@ -1,6 +1,6 @@
 //! SVM execution and the account-state commitment used by every validator.
 use crate::selection::{self, Candidate, Selection};
-pub use crate::admission::{AdmissionConfig, AdmissionMember, AdmissionSnapshot, EffectiveMembership};
+pub use crate::admission::{AdmissionConfig, AdmissionMember, AdmissionSnapshot, AdmissionHub, PeerAnnouncement, EffectiveMembership, peer_address};
 use crate::admission::{self, AdmissionState};
 use anyhow::{anyhow, bail, Context, Result};
 use litesvm::LiteSVM;
@@ -1128,6 +1128,95 @@ impl SvmExecutor {
         Ok(self.admission_snapshots(checkpoint)?.into_iter().find(|snapshot| snapshot.epoch == epoch))
     }
 
+    fn admission_hub_snapshots(&self, checkpoint:&ExecutorCheckpoint)->Result<Vec<admission::HubSnapshot>> {
+        let Some(bridge)=self.bridge else{return Ok(vec![])};
+        let Some(account)=checkpoint.accounts.get(&admission::hubs_address(&bridge)) else{return Ok(vec![])};
+        anyhow::ensure!(account.owner==bridge&&!account.executable&&account.data.get(..8)==Some(&Sha256::digest(b"account:AdmissionHubs")[..8]),"Invalid admission hub places");
+        let snapshots:Vec<admission::HubSnapshot>=bincode::deserialize(&account.data[8..])?;
+        anyhow::ensure!(snapshots.len()<=admission::RETAINED_SNAPSHOTS&&snapshots.windows(2).all(|pair|pair[0].epoch<pair[1].epoch)
+            &&snapshots.iter().all(|snapshot|snapshot.hubs.windows(2).all(|pair|pair[0].code<pair[1].code)),"Invalid committed admission hub places");
+        Ok(snapshots)
+    }
+    pub fn admission_hubs(&self, checkpoint:&ExecutorCheckpoint,epoch:u64)->Result<Vec<AdmissionHub>> {
+        Ok(self.admission_hub_snapshots(checkpoint)?.into_iter().find(|snapshot|snapshot.epoch==epoch).map_or_else(Vec::new,|snapshot|snapshot.hubs))
+    }
+    fn hub_activation(&self,accounts:&BTreeMap<Pubkey,Arc<Account>>,code:&str,id:u64)->Result<Option<u64>> {
+        let Some(bridge)=self.bridge else{return Ok(None)};
+        let key=admission::hub_activation_address(&bridge,code,id);
+        let Some(account)=accounts.get(&key).filter(|account|!native_wallet(account)) else{return Ok(None)};
+        anyhow::ensure!(account.owner==bridge&&!account.executable&&account.data.len()==24&&account.data[..8]==Sha256::digest(b"account:HubActivation")[..8]
+            &&account.data[8..16]==id.to_le_bytes(),"Invalid committed hub activation");
+        Ok(Some(u64::from_le_bytes(account.data[16..24].try_into().unwrap())))
+    }
+    pub fn registered_hubs(&self,checkpoint:&ExecutorCheckpoint)->Result<Vec<AdmissionHub>> {
+        let Some(rule)=&self.admission_config else{return Ok(vec![])};
+        let mut hubs=admission::registry_hubs(&checkpoint.accounts,&rule.registry_program).into_values().map(|(id,mut hub)| {
+            hub.activated_at_epoch=self.hub_activation(&checkpoint.accounts,&hub.code,id)?;Ok(hub)
+        }).collect::<Result<Vec<_>>>()?;
+        hubs.sort_by(|a,b|a.code.cmp(&b.code));Ok(hubs)
+    }
+    pub fn effective_memberships_at(&self,checkpoint:&ExecutorCheckpoint,epoch:u64)->Result<Vec<EffectiveMembership>> {
+        let rule=self.admission_config.as_ref().context("Admission is not configured")?;
+        Ok(admission::memberships(&checkpoint.accounts,&rule.registry_program,epoch))
+    }
+    fn freeze_hub_places(&self,rule:&AdmissionConfig,snapshot:&AdmissionSnapshot,additions:&mut BTreeMap<Pubkey,Account>)->Result<admission::HubSnapshot> {
+        let eligible=admission::eligible_hubs(&snapshot.members)?;
+        let bridge=self.bridge.context("Admission requires bridge")?;
+        let used=snapshot.members.iter().map(|member|member.hub.as_str()).collect::<BTreeSet<_>>();
+        let mut hubs=vec![];
+        for (id,mut hub) in admission::registry_hubs(&self.accounts,&rule.registry_program).into_values() {
+            if !used.contains(hub.code.as_str()) {continue}
+            let key=admission::hub_activation_address(&bridge,&hub.code,id);
+            hub.activated_at_epoch=match additions.get(&key) {
+                Some(account)=>Some(u64::from_le_bytes(account.data[16..24].try_into().unwrap())),
+                None=>self.hub_activation(&self.accounts,&hub.code,id)?,
+            };
+            if hub.activated_at_epoch.is_none()&&eligible.contains(&hub.code) {
+                let previous=self.svm.get_account(&key);
+                anyhow::ensure!(previous.as_ref().is_none_or(native_wallet),"Hub activation address has an incompatible account");
+                let mut data=Sha256::digest(b"account:HubActivation")[..8].to_vec();data.extend_from_slice(&id.to_le_bytes());data.extend_from_slice(&snapshot.epoch.to_le_bytes());
+                additions.insert(key,Account {lamports:previous.map_or(0,|account|account.lamports).max(self.rent_exempt_minimum(data.len())),data,owner:bridge,executable:false,rent_epoch:0});
+                hub.activated_at_epoch=Some(snapshot.epoch);
+            }
+            hubs.push(hub);
+        }
+        hubs.sort_by(|a,b|a.code.cmp(&b.code));Ok(admission::HubSnapshot {epoch:snapshot.epoch,hubs})
+    }
+    pub fn peer_announcements(&self,checkpoint:&ExecutorCheckpoint)->Result<Vec<PeerAnnouncement>> {
+        let Some(rule)=&self.admission_config else{return Ok(vec![])};
+        let tag=Sha256::digest(b"account:PeerAnnouncement");
+        let mut peers=vec![];
+        for (address,account) in &checkpoint.accounts {
+            if account.owner!=rule.registry_program||account.executable||account.data.get(..8)!=Some(&tag[..8]) {continue}
+            let peer:PeerAnnouncement=bincode::deserialize(&account.data[8..])?;
+            anyhow::ensure!(*address==admission::peer_address(&rule.registry_program,&peer.identity)&&admission::valid_peer(&peer),"Invalid committed peer announcement");
+            peers.push(peer);
+        }
+        peers.sort_by_key(|peer|peer.identity);
+        Ok(peers)
+    }
+    fn record_peer_announcements(&mut self,slot:u64,peers:Vec<PeerAnnouncement>)->Result<()> {
+        if peers.is_empty() {return Ok(())}
+        let rule=self.admission_config.as_ref().context("Peer announcement requires admission")?;
+        let registry=rule.registry_program;
+        let effective=admission::memberships(&self.accounts,&registry,slot/rule.epoch_slots).into_iter().map(|member|member.identity).collect::<BTreeSet<_>>();
+        for peer in peers {
+            if !effective.contains(&peer.identity) {continue}
+            let key=admission::peer_address(&registry,&peer.identity);
+            let previous=self.svm.get_account(&key);
+            if previous.as_ref().is_some_and(|account|!native_wallet(account)&&(account.owner!=registry||account.executable||account.data.get(..8)!=Some(&Sha256::digest(b"account:PeerAnnouncement")[..8]))) {continue}
+            let mut data=Sha256::digest(b"account:PeerAnnouncement")[..8].to_vec();data.extend(bincode::serialize(&peer)?);
+            let before=previous.as_ref().map_or(0,|account|account.lamports);
+            let lamports=before.max(self.rent_exempt_minimum(data.len()));
+            let Some(mut payer)=self.svm.get_account(&peer.identity).filter(native_wallet) else{continue};
+            let Some(remaining)=payer.lamports.checked_sub(lamports-before).filter(|remaining|*remaining>=self.fees.reserve_lamports) else{continue};
+            payer.lamports=remaining;
+            self.put(peer.identity,payer)?;
+            self.put(key,Account {lamports,data,owner:registry,executable:false,rent_epoch:0})?;
+        }
+        Ok(())
+    }
+
     pub fn admission_members(&self, epoch: u64) -> Result<Vec<AdmissionMember>> {
         Ok(self.admission_snapshot(&self.checkpoint(), epoch)?.map_or_else(Vec::new, |snapshot| snapshot.members))
     }
@@ -1190,6 +1279,10 @@ impl SvmExecutor {
                 additions.insert(key,Account { lamports:previous.map_or(0,|account| account.lamports).max(self.rent_exempt_minimum(data.len())),data,owner:bridge,executable:false,rent_epoch:0 });
             }
         }
+        let mut hub_snapshots=self.admission_hub_snapshots(&self.checkpoint())?;
+        if initial {
+            hub_snapshots.push(self.freeze_hub_places(&rule,&state.snapshots[0],&mut additions)?);
+        }
         let mut new_votes = false;
         if initial || epoch > state.prepared_epoch {
             for entered in (if initial { first_epoch } else { state.prepared_epoch.saturating_add(1) })..=epoch {
@@ -1227,10 +1320,19 @@ impl SvmExecutor {
                 let cutoff_slot = source.checked_mul(rule.epoch_slots).and_then(|start| start.checked_add(rule.epoch_slots / 2)).context("Admission cutoff overflow")?;
                 let target = source.checked_add(1).context("Admission epoch overflow")?;
                 let frozen = admission::snapshot(&rule,&self.accounts,&catalog,target,cutoff_slot,state.snapshots.last())?;
+                hub_snapshots.push(self.freeze_hub_places(&rule,&frozen,&mut additions)?);
                 state.snapshots.push(frozen);
                 if state.snapshots.len() > admission::RETAINED_SNAPSHOTS { state.snapshots.remove(0); }
                 state.next_cutoff_epoch = target;
             }
+        }
+        if !hub_snapshots.is_empty() {
+            hub_snapshots.retain(|snapshot|state.snapshots.iter().any(|set|set.epoch==snapshot.epoch));
+            let key=admission::hubs_address(&bridge);
+            let previous=self.svm.get_account(&key);
+            anyhow::ensure!(previous.as_ref().is_none_or(|account|native_wallet(account)||(account.owner==bridge&&!account.executable&&account.data.get(..8)==Some(&Sha256::digest(b"account:AdmissionHubs")[..8]))),"Admission hub address has an incompatible account");
+            let mut data=Sha256::digest(b"account:AdmissionHubs")[..8].to_vec();data.extend(bincode::serialize(&hub_snapshots)?);
+            additions.insert(key,Account {lamports:previous.map_or(0,|account|account.lamports).max(self.rent_exempt_minimum(data.len())),data,owner:bridge,executable:false,rent_epoch:0});
         }
         let mut data = Sha256::digest(b"account:Admission")[..8].to_vec(); data.extend(bincode::serialize(&state)?);
         let before = existing.as_ref().map_or(0,|account| account.lamports);
@@ -1858,6 +1960,7 @@ impl SvmExecutor {
                 .checked_add(svm_base_fee)
                 .context("Simulation balance overflow")?;
             self.svm.set_account(payer, simulation_account)?;
+            let peers=if self.admission_config.as_ref().is_some_and(|rule|slot>=rule.from_slot) {admission::peer_memos(&tx)} else {vec![]};
             let simulated = self.svm.simulate_transaction(tx);
             self.svm.set_account(payer, real_account)?;
             let outcome = match simulated {
@@ -1914,6 +2017,7 @@ impl SvmExecutor {
                     after: AccountView::default(),
                 },
             };
+            if outcome.success {self.record_peer_announcements(slot,peers)?;}
             let outcome = ExecutionResult { after: self.account_view(&keys), before, ..outcome };
             self.remember_executed(candidate.id.clone(), &item.transaction.bytes);
             results.push(outcome);
@@ -2493,7 +2597,7 @@ mod tests {
         let mut hub_data = vec![0;113];
         hub_data[..8].copy_from_slice(&Sha256::digest(b"account:Hub")[..8]);
         hub_data[8..16].copy_from_slice(&1u64.to_le_bytes());
-        hub_data[16..16+hub.len()].copy_from_slice(hub.as_bytes()); hub_data[112] = hub_bump;
+        hub_data[16..16+hub.len()].copy_from_slice(hub.as_bytes()); hub_data[24..28].copy_from_slice(&6_378_137i32.to_le_bytes()); hub_data[112] = hub_bump;
         executor.put(hub_key,Account { lamports:executor.rent_exempt_minimum(hub_data.len()),data:hub_data,owner:registry,..Account::default() }).unwrap();
         let (key,bump) = Pubkey::find_program_address(&[b"member",identity.as_ref()],&registry);
         let mut data = vec![0;154];
@@ -2506,7 +2610,7 @@ mod tests {
             if !target.is_empty() {
                 let (next,next_bump) = Pubkey::find_program_address(&[b"hub",target.as_bytes()],&registry);
                 let mut next_data = vec![0;113]; next_data[..8].copy_from_slice(&Sha256::digest(b"account:Hub")[..8]);
-                next_data[8..16].copy_from_slice(&1u64.to_le_bytes()); next_data[16..16+target.len()].copy_from_slice(target.as_bytes()); next_data[112] = next_bump;
+                next_data[8..16].copy_from_slice(&1u64.to_le_bytes()); next_data[16..16+target.len()].copy_from_slice(target.as_bytes()); next_data[24..28].copy_from_slice(&6_378_137i32.to_le_bytes()); next_data[112] = next_bump;
                 executor.put(next,Account { lamports:executor.rent_exempt_minimum(next_data.len()),data:next_data,owner:registry,..Account::default() }).unwrap();
                 data[97..129].copy_from_slice(next.as_ref()); data[129..137].copy_from_slice(&1u64.to_le_bytes());
             }
@@ -2551,8 +2655,9 @@ mod tests {
     fn admission_cutoff_freezes_late_membership_and_stake_for_next_epoch() {
         use solana_sdk::{stake::{instruction as stake_instruction,state::{Authorized,Lockup,StakeStateV2}},vote::state::VoteState};
         let (mut executor,owner,rule,_,_,_) = admission_check_executor();
-        let external = Pubkey::new_unique(); let late = Pubkey::new_unique();
+        let external = Pubkey::new_unique(); let late = Pubkey::new_unique(); let padding=Pubkey::new_unique();
         admission_member(&mut executor,rule.registry_program,external,"FRA",2,None);
+        admission_member(&mut executor,rule.registry_program,padding,"FRA",2,None);
         let supply_before = executor.native_supply().unwrap().unwrap(); let total_before = executor.total_lamports().unwrap();
         executor.execute_slot(64,vec![]).unwrap();
         let checkpoint = executor.checkpoint();
@@ -2574,6 +2679,8 @@ mod tests {
         };
         let early_stake = Keypair::new();
         admission_send(&mut executor,&owner,create(&early_stake,external),Some(&early_stake),65);
+        let padding_stake=Keypair::new();
+        admission_send(&mut executor,&owner,create(&padding_stake,padding),Some(&padding_stake),66);
         admission_member(&mut executor,rule.registry_program,rule.genesis[0].0,"FRA",0,Some(("NYC",3)));
         admission_member(&mut executor,rule.registry_program,rule.genesis[1].0,"FRA",0,Some(("",3)));
         let cutoff_stake = Keypair::new();
@@ -2599,7 +2706,46 @@ mod tests {
         assert_eq!(next.members.iter().find(|member| member.identity == rule.genesis[0].0).unwrap().stake,rule.genesis_stake_lamports+delegated);
         let catalog = executor.validator_catalog(&executor.checkpoint()).unwrap();
         assert_eq!(&catalog[..12],&rule.genesis.iter().map(|(identity,_)| *identity).collect::<Vec<_>>());
-        assert_eq!(&catalog[12..],&[external,late]);
+        assert_eq!(&catalog[12..],&[external,padding,late]);
+    }
+
+    #[test]
+    fn outside_hub_freezes_place_and_requires_four_members_and_one_percent() {
+        use solana_sdk::stake::state::{Meta,Stake,StakeStateV2,Delegation};
+        let (mut executor,_,rule,_,_,_)=admission_check_executor();
+        let outsiders=(0..4).map(|_|Pubkey::new_unique()).collect::<Vec<_>>();
+        for identity in &outsiders {admission_member(&mut executor,rule.registry_program,*identity,"MAD",2,None);}
+        executor.execute_slot(64,vec![]).unwrap();
+        let mut stake_keys=vec![];
+        for identity in &outsiders {
+            let key=Pubkey::new_unique();stake_keys.push(key);
+            let mut data=bincode::serialize(&StakeStateV2::Stake(Meta::default(),Stake {delegation:Delegation {voter_pubkey:validator_vote_address(identity),stake:100_000_000,activation_epoch:2,deactivation_epoch:u64::MAX,..Delegation::default()},credits_observed:0},Default::default())).unwrap();
+            data.resize(StakeStateV2::size_of(),0);
+            executor.put(key,Account {lamports:100_000_000,data,owner:solana_sdk::stake::program::id(),..Account::default()}).unwrap();
+        }
+        executor.execute_slot(80,vec![]).unwrap();
+        let frozen=executor.admission_snapshot(&executor.checkpoint(),3).unwrap().unwrap();
+        assert_eq!(frozen.members.iter().filter(|member|member.hub=="MAD").count(),4);
+        let place=executor.admission_hubs(&executor.checkpoint(),3).unwrap().into_iter().find(|hub|hub.code=="MAD").unwrap();
+        assert_eq!(place.activated_at_epoch,Some(3));
+        let (latitude,longitude)=place.latitude_longitude();assert!(latitude.abs()<0.001&&longitude.abs()<0.001);
+        let hub_key=Pubkey::find_program_address(&[b"hub",b"MAD"],&rule.registry_program).0;
+        let mut current=executor.svm.get_account(&hub_key).unwrap();current.data[24..28].fill(0);current.data[28..32].copy_from_slice(&6_378_137i32.to_le_bytes());executor.put(hub_key,current).unwrap();
+        executor.put(stake_keys[0],Account::default()).unwrap();
+        executor.execute_slot(112,vec![]).unwrap();
+        assert!(!executor.admission_snapshot(&executor.checkpoint(),4).unwrap().unwrap().members.iter().any(|member|member.hub=="MAD"),"a three-member outside hub leaves the next active set");
+        assert_eq!(executor.admission_hubs(&executor.checkpoint(),3).unwrap().into_iter().find(|hub|hub.code=="MAD").unwrap(),place,"a later registry place cannot rewrite an already frozen draw");
+        let catalog=executor.validator_catalog(&executor.checkpoint()).unwrap();
+        for identity in &outsiders {
+            let mut data=bincode::serialize(&StakeStateV2::Stake(Meta::default(),Stake {delegation:Delegation {voter_pubkey:validator_vote_address(identity),stake:1,activation_epoch:2,deactivation_epoch:u64::MAX,..Delegation::default()},credits_observed:0},Default::default())).unwrap();data.resize(StakeStateV2::size_of(),0);
+            executor.put(Pubkey::new_unique(),Account {lamports:1,data,owner:solana_sdk::stake::program::id(),..Account::default()}).unwrap();
+        }
+        for key in stake_keys {executor.put(key,Account::default()).unwrap();}
+        let waiting=admission::snapshot(&rule,&executor.accounts,&catalog,5,144,None).unwrap();
+        assert!(!waiting.members.iter().any(|member|member.hub=="MAD"),"four identities below one percent capped stake do not activate");
+        for slot in [144,176,208,240] {executor.execute_slot(slot,vec![]).unwrap();}
+        assert!(executor.admission_snapshot(&executor.checkpoint(),3).unwrap().is_none());
+        assert_eq!(executor.registered_hubs(&executor.checkpoint()).unwrap().into_iter().find(|hub|hub.code=="MAD").unwrap().activated_at_epoch,Some(3),"first activation outlives rolling epoch places");
     }
 
     #[test]
@@ -2614,6 +2760,7 @@ mod tests {
         let before = executor.checkpoint(); let before_hash = executor.state_hash();
         executor.execute_slot(81,vec![]).unwrap();
         let first_hash = executor.state_hash(); let first = executor.admission_snapshot(&executor.checkpoint(),3).unwrap().unwrap();
+        let first_hubs=executor.admission_hubs(&executor.checkpoint(),3).unwrap();
         assert_eq!(first.cutoff_slot,80,"a skipped cutoff freezes the ancestor state at the first executed slot after it");
         assert_ne!(first_hash,before_hash);
         let marker = executor.svm.get_account(&admission::marker_address(&executor.bridge.unwrap())).unwrap();
@@ -2632,6 +2779,7 @@ mod tests {
         loaded.execute_slot(81,vec![]).unwrap();
         assert_eq!(loaded.state_hash(),first_hash,"loading the pre-cutoff durable checkpoint produces the identical committed snapshot");
         assert_eq!(loaded.admission_snapshot(&loaded.checkpoint(),3).unwrap(),Some(first));
+        assert_eq!(loaded.admission_hubs(&loaded.checkpoint(),3).unwrap(),first_hubs,"frozen hub places survive rollback and durable load");
         assert_eq!(loaded.validator_catalog(&loaded.checkpoint()).unwrap(),executor.validator_catalog(&executor.checkpoint()).unwrap());
         let hash = loaded.state_hash(); loaded.prepare_stake_epoch(81).unwrap(); assert_eq!(loaded.state_hash(),hash,"the freeze is idempotent before fees");
     }

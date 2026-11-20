@@ -100,6 +100,7 @@ pub struct GatewayState {
     pub transactions_by_cblock: BTreeMap<u64, Vec<String>>,
     /// Public addresses and pinned QUIC certificate, published only when the peer endpoint runs.
     pub hub_peers: BTreeMap<String, Value>,
+    pub hub_member_peers: BTreeMap<String, Value>,
     pub current_window: Value,
     pub upcoming_windows: Vec<Value>,
     pub counters: Value,
@@ -152,6 +153,7 @@ impl GatewayState {
             signatures: BTreeMap::new(),
             transactions_by_cblock: BTreeMap::new(),
             hub_peers: BTreeMap::new(),
+            hub_member_peers: BTreeMap::new(),
             current_window: Value::Null,
             upcoming_windows: vec![],
             facts: Value::Null,
@@ -388,10 +390,14 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
     let result: std::result::Result<Value, (&str, &str)> = match method {
         "getSnapshot" => Ok(state.read().await.snapshot()),
         "getHubPeers" => {
-            match params.as_object().filter(|params|params.len()==1).and_then(|params|params.get("hub")).and_then(Value::as_str) {
-                Some(hub) if !hub.is_empty() && hub.len() <= 16 => state.read().await.hub_peers.get(hub).cloned()
-                    .ok_or(("NOT_FOUND","This hub has no public peer endpoint.")),
-                _ => Err(("INVALID_INPUT","Give the hub code as {hub: string}.")),
+            match params.as_object().filter(|params|params.keys().all(|key|key=="hub"||key=="direct")&&params.get("direct").is_none_or(|value|value==true)).and_then(|params|params.get("hub")).and_then(Value::as_str) {
+                Some(hub) if !hub.is_empty() && hub.len() <= 16 => {
+                    let state=state.read().await;
+                    let peers=if params["direct"]==true {state.hub_member_peers.get(hub)}
+                        else{state.hub_peers.get(hub).or_else(||state.hub_member_peers.get(hub))};
+                    peers.cloned().ok_or(("NOT_FOUND","This hub has no public peer endpoint."))
+                },
+                _ => Err(("INVALID_INPUT","Give {hub: string}, optionally with direct: true.")),
             }
         },
         "getCurrentWindow" => Ok(state.read().await.current_window.clone()),

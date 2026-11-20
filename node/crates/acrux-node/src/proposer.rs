@@ -13,13 +13,13 @@ use std::{collections::BTreeMap,sync::Arc,time::{Duration,Instant}};
 #[derive(Clone)]
 pub(crate) enum ProposalLink {
     Local(Arc<crate::transport::LocalTransport>),
-    Member {control:Arc<crate::external::ExternalControl>,seed:u64,relay_stakes:Vec<u64>},
+    Member {control:Arc<crate::member_link::MemberLink>,seed:u64,relay_stakes:Vec<u64>},
 }
 impl ProposalLink {
     pub(crate) async fn send(&self,from:usize,to:usize,bytes:Vec<u8>)->Result<()> {
         match self {
             Self::Local(link)=>link.send(from,to,bytes).await,
-            Self::Member {control,..}=>control.send_to(&[to],&bytes).await,
+            Self::Member {control,..}=>control.send(from,to,bytes).await,
         }
     }
     fn relay(&self,slot:u64,slice:u32,role:usize,shred:u8)->usize {
