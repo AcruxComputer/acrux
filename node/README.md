@@ -307,6 +307,25 @@ reserve is a fixed amount, rather than a live classification of addresses.
 circulatingLamports}`. Amounts and scale are decimal strings; the slot is a
 number. The API exposes this as `/v1/bridge`'s `native` field.
 
+**Validator earnings.** `getValidatorEarningsEpochs {}` returns
+`{epochSlots, epochs}` with the counted bridge epochs newest first.
+`getValidatorEarnings {epoch}` returns `{epoch, countedFromSlot, rows}`. Each row
+holds `identity`, its historical `hub`, `validatorKind` (`genesis` or `external`),
+and decimal lamport strings `base`, `priority`, and `inclusion`. Members of that
+epoch's fixed set with no earnings have zero rows. Base is the unburned part;
+priority and inclusion are the amounts actually credited, including each copy
+or fragment. Nothing is issued.
+
+Counting starts at the first slot this release executes, with no backfill.
+`countedFromSlot > epoch * epochSlots` marks a partly counted epoch. Normal
+persistent nets commit the tally and historical roster in `state.redb` with the
+same finalized checkpoint as the paid balances, retain every observed epoch,
+and restore them on restart. Rollback restores the counters too. These rows
+never enter the account-state hash or follower snapshot, so consensus and
+followers are unchanged. An unobserved epoch or a non-persistent sandbox answers
+`NET_UNAVAILABLE`. The API serves the hub-filtered history at
+`GET /v1/hubs/:code/earnings`.
+
 The F7 check is `node node/scripts/follow-far-check.mjs` from `backend/` after a
 release build. It checks the usual local net ports before using them, starts its
 own net there and a proxy on 5056 with 145 ms delay in each direction, then runs

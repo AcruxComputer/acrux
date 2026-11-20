@@ -40,6 +40,7 @@ const responseFixtures = {
   HashExchangeHub: f.hashExchangeWithOutside.hubs[0], HashExchange: f.hashExchangeWithOutside,
   HashExchangeTelemetry: { ...f.hashExchangeWithOutside, commitSpreadByLinkUs: f.factsWithOutside.commitSpreadByLinkUs },
   HubHashExchange: f.outsideFormedHub.hashExchange, Hub: f.outsideFormedHub, Hubs: paged(f.hubs), GenesisShare: f.genesisShare,
+  HubEarningsRow: f.hubEarnings.epochs[0].rows[1], HubEarningsEpoch: f.hubEarnings.epochs[0], HubEarnings: f.hubEarnings,
   RegistryConfig: f.registryConfig, SchedulePreview: f.schedulePreview, FaucetPolicy: f.faucetPolicy,
   FaucetStatus: f.makeFaucetStatus(), FaucetGrant: f.faucetGrant(), Facts: f.factsWithOutside,
   Evidence: f.labRuns[0].evidence[0], LabScenario: f.scenarios[0], LabRun: f.labRuns[0],
@@ -108,6 +109,8 @@ const feeBurns = { program: address, mint: address, nativeFromSlot: 64, epochSlo
     closed: true, baseFeeBurnedLamports: '1000500', feeBurnAmountBaseUnits: '1000', remainderLamports: '500' }],
   nextCursor: null, feeBurnedBaseUnits: '1000' }
 const rpcFixtures = {
+  getValidatorEarningsEpochs: { epochSlots: f.hubEarnings.epochSlots, epochs: f.hubEarnings.epochs.map(epoch => epoch.epoch) },
+  getValidatorEarnings: { ...f.hubEarnings.epochs[0], rows: f.hubEarnings.epochs[0].rows.map(row => ({ ...row, hub: 'FRA' })) },
   getFeeBurns: feeBurns, getSnapshot: snapshot, getSlot: slot, getRecentSlots: [slot], getCurrentWindow: slot.window,
   getSchedule: [slot.window], getCounters: snapshot.counters, getTransaction: transaction,
   getLatestBlockhash: { blockhash: address, slot: 64, startedSlot: 64 }, getFacts: f.factsWithOutside,
@@ -152,6 +155,7 @@ const requests = [
   ['StreamCommand:unsubscribe', StreamCommand, { version: 1, type: 'unsubscribe' }],
 ]
 const rpcParams = {
+  getValidatorEarningsEpochs: {}, getValidatorEarnings: { epoch: 43 },
   getFeeBurns: {}, getSnapshot: {}, getSlot: { slot: 64 }, getRecentSlots: {}, getCurrentWindow: {},
   getSchedule: {}, getCounters: {}, getTransaction: { id: transaction.header.id }, getLatestBlockhash: {}, getFacts: {},
   getBalance: { address }, getDemoPool: {}, getQuote: quoteRequest, submitTransaction: plain,

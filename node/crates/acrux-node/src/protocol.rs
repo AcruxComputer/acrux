@@ -436,6 +436,8 @@ pub struct Network {
     solana_sent: BTreeMap<String, Value>,
     /// Validator 0's actor writes each finalized state through this, when the net persists.
     state_writer: Option<std::sync::mpsc::Sender<crate::state::Pending>>,
+    /// Which read-model epochs the writer has already received, including coalesced writes.
+    earnings_queued: BTreeMap<u64,Arc<crate::execution::ValidatorEarningsEpoch>>,
     burn_observed_from: u64,
     counter_base: (u64, u64),
     genesis_hash: String,
@@ -667,6 +669,9 @@ impl Network {
             Some(store) => store.load()?,
             None => None,
         };
+        let earnings=state_store.as_ref().map(|store|store.earnings(proposer_config.epoch_slots));
+        let saved_earnings=earnings.as_ref().map(|store|store.load()).transpose()?.unwrap_or_default();
+        gateway.write().await.earnings=earnings.clone();
         if let (Some(store),Some(bridge)) = (&state_store,genesis.as_ref().and_then(|g|g.bridge.as_ref())) {
             if let Some(native) = bridge.native_cutover()? {
                 gateway.write().await.fee_burns = Some(store.fee_burns(crate::fee_burns::Config {
@@ -771,7 +776,7 @@ impl Network {
         let mut nodes = vec![];
         for id in 0..12 {
             let mut votor = Votor::new(id, stakes.clone())?;
-            let executor = match (&saved, resumed) {
+            let mut executor = match (&saved, resumed) {
                 (Some(saved), Some(block)) => {
                     votor.resume(block);
                     let mut executor = SvmExecutor::from_state(&programs, saved.state.clone())?;
@@ -816,6 +821,9 @@ impl Network {
                     executor
                 }
             };
+            // Node zero's canonical execution supplies the local read model; the other
+            // validators and followers need only the unchanged account state.
+            if id==0 && earnings.is_some() {executor.set_earnings(proposer_config.epoch_slots,saved_earnings.clone())?;}
             let genesis = executor.checkpoint();
             nodes.push(Node {
                 id,
@@ -946,6 +954,7 @@ impl Network {
         if let (Some(bridge), Some(urls)) = (genesis.as_ref().and_then(|g| g.bridge.clone()), bridge_rpc_urls) {
             tokio::spawn(crate::bridge::read_deposits(urls, bridge.program, bridge_deposits.clone(), gateway.clone(), bridge_prunes.clone()));
         }
+        let earnings_queued=nodes[0].genesis.validator_earnings().clone();
         Ok(Self {
             config,
             profile,
@@ -1006,6 +1015,7 @@ impl Network {
             solana: Default::default(),
             solana_sent: BTreeMap::new(),
             state_writer,
+            earnings_queued,
             burn_observed_from: resumed.map_or(0,|block|block.slot * 4 + 4),
             counter_base,
             genesis_hash,
@@ -1440,6 +1450,7 @@ impl Network {
                     solana: Default::default(),
                     solana_sent: BTreeMap::new(),
                     state_writer: if id == 0 { self.state_writer.take() } else { None },
+                    earnings_queued: if id == 0 { std::mem::take(&mut self.earnings_queued) } else { BTreeMap::new() },
                     burn_observed_from: self.burn_observed_from,
                     counter_base: self.counter_base,
                     genesis_hash: self.genesis_hash.clone(),
@@ -2837,6 +2848,7 @@ impl Network {
             // inclusion fees. A rollback restores the marker along with every other account.
             self.nodes[id].executor.as_mut().unwrap().activate_native_cutover(s)?;
             self.nodes[id].executor.as_mut().unwrap().prepare_stake_epoch(s)?;
+            self.nodes[id].executor.as_mut().unwrap().observe_earnings_slot(s);
             let mut validation = payloads
                 .iter()
                 .flat_map(|(q, txs)| {
@@ -3858,7 +3870,7 @@ impl Network {
         }
     }
     /// Queues validator 0's state at a cblock it just finalized for the state writer.
-    fn save_state(&self, cblock: u64) -> Result<()> {
+    fn save_state(&mut self, cblock: u64) -> Result<()> {
         let Some(writer) = &self.state_writer else {
             return Ok(());
         };
@@ -3895,7 +3907,22 @@ impl Network {
                 },from_slot:self.burn_observed_from,observations });
             }
         }
-        writer.send(crate::state::Pending { checkpoint: checkpoint.clone(), meta,burns }).map_err(|_| anyhow::anyhow!("State checkpoint writer stopped"))?;
+        let mut earnings_members=BTreeMap::new();
+        let schedules=self.proposers.read().unwrap();
+        for (epoch,tally) in checkpoint.validator_earnings() {
+            if self.earnings_queued.get(epoch).is_some_and(|queued|Arc::ptr_eq(queued,tally)) {continue}
+            let (identities,_)=schedules.voting_set(epoch*(schedules.config.epoch_slots/4))?;
+            let fixed=schedules.admissions.get(epoch);
+            let members=identities.into_iter().map(|identity| {
+                let hub=fixed.and_then(|set|set.members.iter().find(|member|member.identity.to_string()==identity)).map(|member|member.hub.clone())
+                    .or_else(||schedules.config.hubs.iter().find(|hub|hub.members.iter().any(|member|member.identity==identity)).map(|hub|hub.code.clone())).unwrap();
+                let validator_kind=if schedules.config.identities.contains(&identity){"genesis"}else{"external"}.into();
+                crate::earnings::Member{identity,hub,validator_kind}
+            }).collect();
+            earnings_members.insert(*epoch,members);
+        }
+        writer.send(crate::state::Pending { checkpoint: checkpoint.clone(), meta,burns,earnings_members }).map_err(|_| anyhow::anyhow!("State checkpoint writer stopped"))?;
+        self.earnings_queued=checkpoint.validator_earnings().clone();
         Ok(())
     }
     /// Hands the transactions people sent in the finalized chain through `cblock` to the kept

@@ -2,7 +2,7 @@ import { FAUCET_RETIRED_MESSAGE } from './bridge.js'
 import type { z } from 'zod'
 import { toBase58, toBase64 } from './encoding.js'
 import { PROTOCOL_PARAMETERS, errors } from './schemas.js'
-import type { Balance, GenesisShare, Bridge, BridgeTransfer, Burn, BurnEpoch, DemoPool, Evidence, Facts, FaucetPolicy, FaucetStatus, FaucetGrant, LabScenario, RegistryConfig, SchedulePreview, SpecMap } from './schemas.js'
+import type { Balance, GenesisShare, HubEarnings, Bridge, BridgeTransfer, Burn, BurnEpoch, DemoPool, Evidence, Facts, FaucetPolicy, FaucetStatus, FaucetGrant, LabScenario, RegistryConfig, SchedulePreview, SpecMap } from './schemas.js'
 import type { HashExchangePair, HashExchange as HashExchangeView, HubHashExchange, Cblock, Certificate, ExecutionSchedule, Hub, LabRun, Member, MergedTransaction, NetSnapshot, Parameters, Proposer, Slot, Transaction, Window } from './schemas.js'
 import type { ApiErrorBody } from './errors.js'
 import type { LabReplay, ProtocolEvent } from './events.js'
@@ -591,3 +591,21 @@ export const genesisShare: GenesisShare = { currentEpoch: 14, epochs: [
   { epoch: 15, fixedAtSlot: 6479600, genesisStake: '12000000000000000', totalStake: '13200000000000000', genesisShareBps: 9090, genesisMembers: 12, externalMembers: 8 },
 ] }
 export const genesisShareGenesisOnly: GenesisShare = { currentEpoch: 12, epochs: [genesisShare.epochs[0]!] }
+
+/** Existing fees move to validators; these are synthetic observations, with no issuance. */
+export const hubEarnings: HubEarnings = { hubCode: 'FRA', epochSlots: 432000, epochs: [
+  { epoch: 43, countedFromSlot: 43 * 432000, rows: [
+    { identity: frankfurt.members[0]!.identity, validatorKind: 'genesis', base: '105000', priority: '9100', inclusion: '42000' },
+    { identity: outsideFixtureIdentity, validatorKind: 'external', base: '95000', priority: '15000', inclusion: '36000' },
+  ] },
+  { epoch: 42, countedFromSlot: 42 * 432000 + 128, rows: [
+    { identity: frankfurt.members[0]!.identity, validatorKind: 'genesis', base: '25000', priority: '5000', inclusion: '12000' },
+    { identity: outsideFixtureIdentity, validatorKind: 'external', base: '0', priority: '0', inclusion: '0' },
+  ] },
+] }
+export const outsideHubEarnings: HubEarnings = { hubCode: 'SIN', epochSlots: 432000, epochs: [
+  { epoch: 43, countedFromSlot: 43 * 432000, rows: outsideFormedHub.members.map((member, index) => ({
+    identity: member.identity, validatorKind: 'external', base: index === 3 ? '0' : '75000', priority: index === 3 ? '0' : '10000', inclusion: index === 3 ? '0' : '30000',
+  })) },
+] }
+export const hubEarningsEmpty: HubEarnings = { hubCode: 'FRA', epochSlots: 432000, epochs: [] }

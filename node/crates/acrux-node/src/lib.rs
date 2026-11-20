@@ -1,5 +1,6 @@
 pub mod bridge;
 pub mod fee_burns;
+pub mod earnings;
 pub mod facts;
 pub mod cli;
 pub mod carry;

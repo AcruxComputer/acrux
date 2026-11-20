@@ -105,6 +105,15 @@ export type Hub = z.infer<typeof Hub>
 export const Hubs = page(Hub)
 /** The genesis validators' share of stake in each bridge epoch's fixed set; the next epoch appears once its set is fixed. */
 export const GenesisShare = z.object({ currentEpoch: Count, epochs: z.array(z.object({ epoch: Count, fixedAtSlot: Count.nullable(), genesisStake: U64, totalStake: U64, genesisShareBps: Count.max(10000), genesisMembers: Count, externalMembers: Count })) })
+/** Earned fees only, in native lamports; amounts may exceed u64 after repeated circulation. */
+export const HubEarningsRow = z.object({ identity: Address, validatorKind: z.enum(['genesis', 'external']), base: BaseUnits, priority: BaseUnits, inclusion: BaseUnits })
+/** countedFromSlot is the first observed slot, so a partial first epoch is explicit. */
+export const HubEarningsEpoch = z.object({ epoch: Count, countedFromSlot: Count, rows: z.array(HubEarningsRow) })
+/** Finalized fee observations, newest bridge epoch first, with each epoch's historical roster. */
+export const HubEarnings = z.object({ hubCode: HubCode, epochSlots: Count.min(1), epochs: z.array(HubEarningsEpoch) })
+export type HubEarningsRow = z.infer<typeof HubEarningsRow>
+export type HubEarningsEpoch = z.infer<typeof HubEarningsEpoch>
+export type HubEarnings = z.infer<typeof HubEarnings>
 export const RegistryConfig = z.object({ status: z.enum(['fixture', 'waiting', 'ready']), chain: RegistryChain, programId: Address.nullable(), cluster: z.enum(['localnet', 'mainnet-beta', 'acrux']), depositLamports: U64.nullable(), registrationFeeBps: Count.max(10000).nullable(), cooldownEpochs: Count.nullable(), inactivityEpochs: Count.nullable(), codeRules: z.object({ pattern: z.string().nullable(), minLength: Count.nullable(), maxLength: Count.nullable() }), minimumMembers: Count.nullable(), minimumStake: U64.nullable(), currentEpoch: Count, missingConfiguration: z.array(z.string()) })
 export const SchedulePreview = z.object({ epoch: Count, seed: z.string(), source: z.enum(['fixture', 'registry']), algorithm: z.literal(3), alpha: z.number().min(0).max(1), totalWindows: Count, shares: z.array(z.object({ hubCode: HubCode, proposerStake: U64, probability: z.number(), assignedWindows: Count })), regionalRuns: z.array(z.object({ region: z.string(), firstWindow: Count, lastWindow: Count })), windows: z.array(Window) })
 export const FaucetPolicy = z.object({ amountLamports: U64.nullable(), perKey: Count.nullable(), perIp: Count.nullable(), periodSeconds: Count.nullable(), missingConfiguration: z.array(z.string()) })

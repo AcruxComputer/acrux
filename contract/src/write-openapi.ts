@@ -14,6 +14,7 @@ const operations: Operation[] = [
   { method:'get', path:'/health', operationId:'health',summary:'Service and configuration status', response:'Health' },
   { method:'get', path:'/v1/hubs', operationId:'hubs',summary:'Registry hubs',response:'Hubs',query:s.PageQuery },
   { method:'get', path:'/v1/hubs/{code}', operationId:'hub',summary:'Hub and members',response:'Hub',params:{code:'HubCode'} },
+  { method:'get', path:'/v1/hubs/{code}/earnings', operationId:'hubEarnings',summary:'Finalized validator fees by historical hub and bridge epoch, newest first',response:'HubEarnings',params:{code:'HubCode'} },
   { method:'get', path:'/v1/registry/config', operationId:'registryConfig',summary:'Registry flow configuration',response:'RegistryConfig' },
   { method:'get', path:'/v1/registry/members/{identity}', operationId:'member',summary:'Validator membership and cooldown',response:'Member',params:{identity:'Address'} },
   { method:'get', path:'/v1/schedule', operationId:'schedule',summary:'Algorithm 3 epoch preview',response:'SchedulePreview',query:z.strictObject({epoch:s.Count.optional()}) },

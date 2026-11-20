@@ -3,7 +3,7 @@
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "info": {
     "title": "Acrux API",
-    "version": "0.1.29",
+    "version": "0.1.30",
     "description": "Round 1 fixture contract. Amounts are decimal integer strings. Times are relative microseconds with UTC slot wallTime."
   },
   "servers": [
@@ -1940,6 +1940,230 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Hub"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The error envelope: branch on error.code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/hubs/{code}/earnings": {
+      "get": {
+        "operationId": "hubEarnings",
+        "summary": "Finalized validator fees by historical hub and bridge epoch, newest first",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "code",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/HubCode"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Fixture",
+            "required": false,
+            "description": "Fixture server only: a scenario, or an error code to force that error.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "normal",
+                "empty",
+                "waiting",
+                "pending",
+                "executed",
+                "finalized",
+                "skipped",
+                "sent",
+                "partly_included",
+                "failed",
+                "expired",
+                "unknown",
+                "active",
+                "inactive",
+                "pending_only",
+                "queued",
+                "running",
+                "done",
+                "failed_to_start",
+                "limit_reached",
+                "unfunded",
+                "stalled",
+                "unavailable",
+                "code_taken",
+                "crash",
+                "disagreeing_vectors",
+                "missing_attestation",
+                "equivocation",
+                "majority_lost",
+                "burn-no-epochs",
+                "burn-pending",
+                "burn-burned",
+                "burn-running",
+                "VALIDATION_ERROR",
+                "UNAUTHORIZED",
+                "ORIGIN_NOT_ALLOWED",
+                "NOT_FOUND",
+                "PROGRAM_UNAVAILABLE",
+                "CONFIGURATION_REQUIRED",
+                "IDEMPOTENCY_CONFLICT",
+                "TRANSACTION_EXPIRED",
+                "PAYLOAD_TOO_LARGE",
+                "UNSUPPORTED_MEDIA_TYPE",
+                "SIMULATION_FAILED",
+                "CHAIN_REFUSED",
+                "RATE_LIMITED",
+                "INTERNAL_ERROR",
+                "UPSTREAM_UNAVAILABLE",
+                "FAUCET_LIMIT",
+                "FAUCET_EMPTY",
+                "FAUCET_RETIRED",
+                "GRANT_FAILED",
+                "NET_STALLED",
+                "NET_UNAVAILABLE",
+                "INVALID_INPUT"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HubEarnings"
                 }
               }
             }
@@ -9984,6 +10208,197 @@
       "HubCode": {
         "type": "string",
         "minLength": 1
+      },
+      "HubEarnings": {
+        "type": "object",
+        "properties": {
+          "hubCode": {
+            "type": "string",
+            "minLength": 1
+          },
+          "epochSlots": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "epochs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "epoch": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "countedFromSlot": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "rows": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "identity": {
+                        "type": "string",
+                        "minLength": 32,
+                        "maxLength": 44
+                      },
+                      "validatorKind": {
+                        "type": "string",
+                        "enum": [
+                          "genesis",
+                          "external"
+                        ]
+                      },
+                      "base": {
+                        "type": "string",
+                        "maxLength": 78,
+                        "pattern": "^(0|[1-9][0-9]*)$"
+                      },
+                      "priority": {
+                        "type": "string",
+                        "maxLength": 78,
+                        "pattern": "^(0|[1-9][0-9]*)$"
+                      },
+                      "inclusion": {
+                        "type": "string",
+                        "maxLength": 78,
+                        "pattern": "^(0|[1-9][0-9]*)$"
+                      }
+                    },
+                    "required": [
+                      "identity",
+                      "validatorKind",
+                      "base",
+                      "priority",
+                      "inclusion"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "epoch",
+                "countedFromSlot",
+                "rows"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "hubCode",
+          "epochSlots",
+          "epochs"
+        ],
+        "additionalProperties": false
+      },
+      "HubEarningsEpoch": {
+        "type": "object",
+        "properties": {
+          "epoch": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "countedFromSlot": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "identity": {
+                  "type": "string",
+                  "minLength": 32,
+                  "maxLength": 44
+                },
+                "validatorKind": {
+                  "type": "string",
+                  "enum": [
+                    "genesis",
+                    "external"
+                  ]
+                },
+                "base": {
+                  "type": "string",
+                  "maxLength": 78,
+                  "pattern": "^(0|[1-9][0-9]*)$"
+                },
+                "priority": {
+                  "type": "string",
+                  "maxLength": 78,
+                  "pattern": "^(0|[1-9][0-9]*)$"
+                },
+                "inclusion": {
+                  "type": "string",
+                  "maxLength": 78,
+                  "pattern": "^(0|[1-9][0-9]*)$"
+                }
+              },
+              "required": [
+                "identity",
+                "validatorKind",
+                "base",
+                "priority",
+                "inclusion"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "epoch",
+          "countedFromSlot",
+          "rows"
+        ],
+        "additionalProperties": false
+      },
+      "HubEarningsRow": {
+        "type": "object",
+        "properties": {
+          "identity": {
+            "type": "string",
+            "minLength": 32,
+            "maxLength": 44
+          },
+          "validatorKind": {
+            "type": "string",
+            "enum": [
+              "genesis",
+              "external"
+            ]
+          },
+          "base": {
+            "type": "string",
+            "maxLength": 78,
+            "pattern": "^(0|[1-9][0-9]*)$"
+          },
+          "priority": {
+            "type": "string",
+            "maxLength": 78,
+            "pattern": "^(0|[1-9][0-9]*)$"
+          },
+          "inclusion": {
+            "type": "string",
+            "maxLength": 78,
+            "pattern": "^(0|[1-9][0-9]*)$"
+          }
+        },
+        "required": [
+          "identity",
+          "validatorKind",
+          "base",
+          "priority",
+          "inclusion"
+        ],
+        "additionalProperties": false
       },
       "HubHashExchange": {
         "type": "object",
@@ -36382,6 +36797,125 @@
   "x-acrux-json-rpc": {
     "url": "http://127.0.0.1:4930",
     "methods": {
+      "getValidatorEarningsEpochs": {
+        "params": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "result": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "properties": {
+            "epochSlots": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "epochs": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              }
+            }
+          },
+          "required": [
+            "epochSlots",
+            "epochs"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "getValidatorEarnings": {
+        "params": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "properties": {
+            "epoch": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "epoch"
+          ],
+          "additionalProperties": false
+        },
+        "result": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "properties": {
+            "epoch": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "countedFromSlot": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "rows": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "identity": {
+                    "type": "string",
+                    "minLength": 32,
+                    "maxLength": 44
+                  },
+                  "hub": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "validatorKind": {
+                    "type": "string",
+                    "enum": [
+                      "genesis",
+                      "external"
+                    ]
+                  },
+                  "base": {
+                    "type": "string",
+                    "maxLength": 78,
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  "priority": {
+                    "type": "string",
+                    "maxLength": 78,
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  },
+                  "inclusion": {
+                    "type": "string",
+                    "maxLength": 78,
+                    "pattern": "^(0|[1-9][0-9]*)$"
+                  }
+                },
+                "required": [
+                  "identity",
+                  "hub",
+                  "validatorKind",
+                  "base",
+                  "priority",
+                  "inclusion"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": [
+            "epoch",
+            "countedFromSlot",
+            "rows"
+          ],
+          "additionalProperties": false
+        }
+      },
       "getFeeBurns": {
         "params": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",

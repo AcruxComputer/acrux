@@ -24,6 +24,7 @@ import { createBurnReader, mountBurnRoutes, readNodeFeeBurns } from './burn.js'
 import { BridgeReader, readBridgeRelayer, readBridgeTransfers } from './bridge.js'
 import { readReplayRange } from './replay.js'
 import { createGenesisShareReader } from './genesis-share.js'
+import { createHubEarningsReader } from './earnings.js'
 import { createHashExchangeReader, hubHashExchange, memberHashExchange } from './hash-exchange.js'
 /** `?from=&to=`: the totals of one slot range, an epoch say. */
 const ReplayQuery = z.object({ from: z.coerce.number().int().nonnegative().optional(), to: z.coerce.number().int().nonnegative().optional() })
@@ -123,6 +124,12 @@ export function createNodeApi() {
   app.get('/v1/genesis-share', async c => {
     try { return c.json(await genesisShare()) }
     catch { fail('NET_UNAVAILABLE', 'Acrux Net is unavailable.', { retryable: true, stage: 'read' }) }
+  })
+  const hubEarnings = createHubEarningsReader(env.GATEWAY_RPC_URL)
+  app.get('/v1/hubs/:code/earnings', async c => {
+    const code = readParam(c, 'code', HubCode)
+    readQuery(c, z.strictObject({}))
+    return c.json(await hubEarnings(code))
   })
   // A code can exist on both chains: `?chain=` picks one, else Acrux's comes first.
   app.get('/v1/hubs/:code', async c => {

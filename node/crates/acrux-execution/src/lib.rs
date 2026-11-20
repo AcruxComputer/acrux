@@ -4,3 +4,4 @@ pub mod selection;
 pub mod execution;
 pub mod threshold;
 pub mod admission;
+pub mod earnings;

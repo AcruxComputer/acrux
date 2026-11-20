@@ -2,6 +2,8 @@
 use crate::selection::{self, Candidate, Selection};
 pub use crate::admission::{AdmissionConfig, AdmissionMember, AdmissionSnapshot, AdmissionHub, PeerAnnouncement, EffectiveMembership, peer_address};
 use crate::admission::{self, AdmissionState};
+pub use crate::earnings::{ValidatorEarnings, ValidatorEarningsEpoch};
+use crate::earnings::{Earnings, EarningsState, FeeKind};
 use anyhow::{anyhow, bail, Context, Result};
 use litesvm::LiteSVM;
 use serde::{Deserialize, Serialize};
@@ -304,9 +306,15 @@ pub struct ExecutorCheckpoint {
     recent: VecDeque<(Hash, u64)>,
     inclusion_used: BTreeMap<(u64, Pubkey, u8), u64>,
     fees: Fees,
+    earnings: EarningsState,
 }
 
 impl ExecutorCheckpoint {
+    /// Read-model fee credits at this checkpoint; these do not enter its state hash.
+    pub fn validator_earnings(&self) -> &BTreeMap<u64, Arc<ValidatorEarningsEpoch>> {
+        &self.earnings.epochs
+    }
+
     /// The state's lattice hash in base58: for the genesis checkpoint, the chain's genesis hash.
     pub fn hash(&self) -> String {
         bs58::encode(self.accumulator).into_string()
@@ -379,9 +387,21 @@ pub struct SvmExecutor {
     stake_config: Option<StakeConfig>,
     admission_config: Option<AdmissionConfig>,
     fee_burn_config: Option<FeeBurnConfig>,
+    earnings: Earnings,
 }
 
 impl SvmExecutor {
+    /// Enables local fee reporting from this point, restoring only separately persisted rows.
+    /// Public execution snapshots deliberately do not carry these counters.
+    pub fn set_earnings(&mut self, epoch_slots: u64, saved: Vec<ValidatorEarningsEpoch>) -> Result<()> {
+        self.earnings.configure(epoch_slots, saved)
+    }
+
+    /// Call before inclusion charging; execution also observes empty slots itself.
+    pub fn observe_earnings_slot(&mut self, slot: u64) {
+        self.earnings.observe_slot(slot);
+    }
+
     pub fn checkpoint(&self) -> ExecutorCheckpoint {
         ExecutorCheckpoint {
             accounts: self.accounts.clone(),
@@ -392,6 +412,7 @@ impl SvmExecutor {
             recent: self.recent.clone(),
             inclusion_used: self.inclusion_used.clone(),
             fees: self.fees.clone(),
+            earnings: self.earnings.state.clone(),
         }
     }
 
@@ -468,6 +489,7 @@ impl SvmExecutor {
         self.inclusion_used = snapshot.inclusion_used.into_iter().map(|(w, p, q, v)| Ok(((w, Pubkey::from_str(&p)?, q), v))).collect::<Result<_>>()?;
         self.fees = snapshot.fees;
         self.track_capacity_cu = snapshot.track_capacity_cu;
+        self.earnings.state = EarningsState::default();
         Ok(())
     }
 
@@ -507,6 +529,7 @@ impl SvmExecutor {
         self.recent = checkpoint.recent;
         self.inclusion_used = checkpoint.inclusion_used;
         self.fees = checkpoint.fees;
+        self.earnings.state = checkpoint.earnings;
         Ok(())
     }
 
@@ -575,6 +598,7 @@ impl SvmExecutor {
             stake_config: None,
             admission_config: None,
             fee_burn_config: None,
+            earnings: Earnings::default(),
         };
         for program in [
             "ComputeBudget111111111111111111111111111111",
@@ -752,6 +776,7 @@ impl SvmExecutor {
         }
         self.debit(payer, amount, false)?;
         self.credit(destination, amount)?;
+        self.earnings.credit(destination, amount, FeeKind::Inclusion);
         self.inclusion_used
             .insert((window, payer, proposer), used + amount);
         self.inclusion_used.retain(|(w, _, _), _| *w + 2 >= window);
@@ -1809,6 +1834,7 @@ impl SvmExecutor {
     }
 
     pub fn execute_slot(&mut self, slot: u64, items: Vec<ExecutionItem>) -> Result<SlotExecution> {
+        self.observe_earnings_slot(slot);
         self.prepare_stake_epoch(slot)?;
         self.set_slot_clock(slot)?;
         self.apply_placements(slot)?;
@@ -1885,7 +1911,7 @@ impl SvmExecutor {
             if self.debit(payer, amount, true).is_err() {
                 return false;
             }
-            if self.distribute(amount, &item.source_proposers).is_err() {
+            if self.distribute(amount, &item.source_proposers, FeeKind::Priority).is_err() {
                 return false;
             }
             charged_priority.insert(candidate.id.clone(), amount);
@@ -1942,7 +1968,7 @@ impl SvmExecutor {
                 continue;
             }
             self.record_base_fee_burn(burned)?;
-            self.distribute(base_fee - burned, &item.source_proposers)?;
+            self.distribute(base_fee - burned, &item.source_proposers, FeeKind::Base)?;
             let real_account = self
                 .svm
                 .get_account(&payer)
@@ -2079,7 +2105,7 @@ impl SvmExecutor {
     fn credit(&mut self, key: Pubkey, amount: u64) -> Result<()> {
         self.fund(&key.to_string(), amount)
     }
-    fn distribute(&mut self, amount: u64, sources: &[u8]) -> Result<()> {
+    fn distribute(&mut self, amount: u64, sources: &[u8], kind: FeeKind) -> Result<()> {
         let each = amount / sources.len() as u64;
         let remainder = amount % sources.len() as u64;
         for (i, proposer) in sources.iter().enumerate() {
@@ -2087,7 +2113,9 @@ impl SvmExecutor {
                 .proposers
                 .get(proposer)
                 .context("Missing proposer fee recipient")?;
-            self.credit(key, each + if i == 0 { remainder } else { 0 })?;
+            let credited = each + if i == 0 { remainder } else { 0 };
+            self.credit(key, credited)?;
+            self.earnings.credit(key, credited, kind);
         }
         Ok(())
     }
@@ -3367,3 +3395,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "earnings_tests.rs"]
+mod earnings_tests;

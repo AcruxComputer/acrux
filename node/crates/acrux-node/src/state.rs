@@ -67,6 +67,7 @@ impl StateStore {
             w.open_table(EXECUTED)?;
             w.open_table(META)?;
             crate::fee_burns::create_tables(&w)?;
+            crate::earnings::create_table(&w)?;
         }
         w.commit()?;
         Ok(Self(Arc::new(db)))
@@ -74,6 +75,10 @@ impl StateStore {
 
     pub fn fee_burns(&self, config: crate::fee_burns::Config) -> crate::fee_burns::FeeBurnStore {
         crate::fee_burns::FeeBurnStore { db:self.0.clone(),config }
+    }
+
+    pub fn earnings(&self, epoch_slots:u64) -> crate::earnings::EarningsStore {
+        crate::earnings::EarningsStore { db:self.0.clone(),epoch_slots }
     }
 
     pub fn load(&self) -> Result<Option<Saved>> {
@@ -98,10 +103,10 @@ impl StateStore {
 
     /// Writes `checkpoint` over `earlier`, the state this store holds, in one transaction.
     pub fn write(&self, checkpoint: &ExecutorCheckpoint, earlier: Option<&ExecutorCheckpoint>, meta: &Meta) -> Result<()> {
-        self.write_observed(checkpoint,earlier,meta,&[])
+        self.write_observed(checkpoint,earlier,meta,&[],&std::collections::BTreeMap::new())
     }
 
-    fn write_observed(&self, checkpoint: &ExecutorCheckpoint, earlier: Option<&ExecutorCheckpoint>, meta: &Meta, burns: &[crate::fee_burns::Batch]) -> Result<()> {
+    fn write_observed(&self, checkpoint: &ExecutorCheckpoint, earlier: Option<&ExecutorCheckpoint>, meta: &Meta, burns: &[crate::fee_burns::Batch], earnings_members:&std::collections::BTreeMap<u64,Vec<crate::earnings::Member>>) -> Result<()> {
         let (accounts, gone) = checkpoint.account_changes(earlier);
         let (executed, expired) = checkpoint.executed_changes(earlier);
         let w = self.0.begin_write()?;
@@ -122,6 +127,7 @@ impl StateStore {
             }
             w.open_table(META)?.insert("state", serde_json::to_vec(meta)?.as_slice())?;
             crate::fee_burns::write(&w,burns)?;
+            crate::earnings::write(&w,checkpoint,earlier,earnings_members)?;
         }
         w.commit()?;
         Ok(())
@@ -132,6 +138,7 @@ pub struct Pending {
     pub checkpoint: ExecutorCheckpoint,
     pub meta: Meta,
     pub burns: Vec<crate::fee_burns::Batch>,
+    pub earnings_members: std::collections::BTreeMap<u64,Vec<crate::earnings::Member>>,
 }
 
 /// The writer thread: takes the newest finalized state queued and writes what changed since the
@@ -158,14 +165,16 @@ pub fn spawn_writer(store: StateStore, mut written: Option<ExecutorCheckpoint>, 
             while let Ok(newer) = receiver.try_recv() {
                 let mut burns = std::mem::take(&mut pending.burns);
                 burns.extend(newer.burns);
-                pending = Pending { checkpoint:newer.checkpoint,meta:newer.meta,burns };
+                let mut earnings_members=std::mem::take(&mut pending.earnings_members);
+                earnings_members.extend(newer.earnings_members);
+                pending = Pending { checkpoint:newer.checkpoint,meta:newer.meta,burns,earnings_members };
             }
             if let Some(delay) = delay {
                 std::thread::sleep(delay);
             }
             let result = match refuse_until {
                 Some(until) if std::time::Instant::now() < until => Err(anyhow::anyhow!("the disk refused the write (ACRUX_STATE_WRITE_FAIL_MS)")),
-                _ => store.write_observed(&pending.checkpoint, written.as_ref(), &pending.meta, &pending.burns),
+                _ => store.write_observed(&pending.checkpoint, written.as_ref(), &pending.meta, &pending.burns,&pending.earnings_members),
             };
             match result {
                 Ok(()) => {

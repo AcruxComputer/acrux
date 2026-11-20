@@ -8,7 +8,7 @@ import {
   type LabRun, type ProtocolEvent, type Transaction,
 } from '@acrux/contract'
 import {
-  facts, genesisShare, genesisShareGenesisOnly, faucetGrant, faucetStatus, fixtureErrors, hubs, labRuns, labRunsByState,
+  facts, genesisShare, genesisShareGenesisOnly, hubEarnings, outsideHubEarnings, hubEarningsEmpty, faucetGrant, faucetStatus, fixtureErrors, hubs, labRuns, labRunsByState,
   makeFixtureTransaction, makeLabReplay, makeSchedulePreview, registryConfig, scenarios, externalBlockTransaction,
   specMap, transactionsByState, replayRange, replaySlot, burnNoEpochs, burnPending, burnBurned, burnRunning, bridgeFixture, bridgeWaitingFixture, bridgeTransfersFixture,
 } from '@acrux/contract/fixtures'
@@ -80,6 +80,12 @@ export function createFixtureApi() {
     return c.json(paginate(rows, readQuery(c, PageQuery)))
   })
   app.get('/v1/genesis-share', c => c.json(c.get('scenario') === 'empty' ? genesisShareGenesisOnly : genesisShare))
+  app.get('/v1/hubs/:code/earnings', c => {
+    const code = readParam(c, 'code', HubCode)
+    readQuery(c, z.strictObject({}))
+    const earnings = c.get('scenario') === 'empty' ? hubEarningsEmpty : code === 'SIN' ? outsideHubEarnings : hubEarnings
+    return c.json({ ...earnings, hubCode: code, epochs: earnings.epochs.map(epoch => ({ ...epoch, rows: earnings.hubCode === code ? epoch.rows : [] })) })
+  })
   app.get('/v1/hubs/:code', c => {
     const code = readParam(c, 'code', HubCode)
     const found = hubs.find(h => h.code === code)

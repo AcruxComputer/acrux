@@ -126,6 +126,7 @@ pub struct GatewayState {
     pub fee_burn_from_slot: Option<u64>,
     pub admission_from_slot: Option<u64>,
     pub fee_burns: Option<crate::fee_burns::FeeBurnStore>,
+    pub earnings: Option<crate::earnings::EarningsStore>,
     /// Volatile acknowledgement of the relayer's durable Postgres save cursor.
     pub bridge_saved_cursor: Option<u64>,
     pub parameters: Value,
@@ -169,6 +170,7 @@ impl GatewayState {
             bridge_epoch_slots: None,
             fee_burn_from_slot: None, admission_from_slot: None,
             fee_burns: None,
+            earnings: None,
             bridge_saved_cursor: None,
             counters: json!({"slots":0,"finalizedCblocks":0,"skips":0,"averageCommitSpreadUs":0}),
             counter_base: (0, 0),
@@ -296,7 +298,7 @@ pub async fn run_gateway(
 }
 
 /// The `@acrux/contract` version whose shapes the gateway answers in.
-pub const CONTRACT_VERSION: &str = "0.1.27";
+pub const CONTRACT_VERSION: &str = "0.1.30";
 
 async fn health(State(state): State<SharedGateway>) -> Json<Value> {
     let state = state.read().await;
@@ -427,6 +429,7 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
             }
         },
         "getFeeBurns" => fee_burn_page(&state,&params).await,
+        "getValidatorEarnings" | "getValidatorEarningsEpochs" => earnings_read(&state,method,&params).await,
         "getCblockProof" => {
             let state = state.read().await;
             let selectors = [params.get("consensusSlot"), params.get("epoch"), params.get("latest"), params.get("feeBurnEpoch")].iter().filter(|selector| selector.is_some()).count();
@@ -700,6 +703,24 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
 }
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+async fn earnings_read(state:&SharedGateway,method:&str,params:&Value)->std::result::Result<Value,(&'static str,&'static str)> {
+    let epoch=if method=="getValidatorEarnings" {
+        if params.as_object().is_none_or(|params|params.len()!=1||!params.contains_key("epoch")) {
+            return Err(("INVALID_INPUT","Give a nonnegative epoch."))
+        }
+        Some(params.get("epoch").and_then(safe_integer).ok_or(("INVALID_INPUT","Give a nonnegative epoch."))?)
+    } else {
+        if params.as_object().is_none_or(|params|!params.is_empty()) {return Err(("INVALID_INPUT","getValidatorEarningsEpochs takes no parameters."))}
+        None
+    };
+    let store=state.read().await.earnings.clone().ok_or(("NET_UNAVAILABLE","Earnings require a persistent net."))?;
+    tokio::task::spawn_blocking(move || -> Result<Option<Value>> {
+        match epoch {Some(epoch)=>store.epoch(epoch),None=>store.epochs().map(Some)}
+    }).await.map_err(|_|("INTERNAL_ERROR","The earnings read failed."))?
+        .map_err(|_|("INTERNAL_ERROR","The earnings history could not be read."))?
+        .ok_or(("NET_UNAVAILABLE","This epoch has no counted finalized slots yet."))
+}
+
 async fn fee_burn_page(state: &SharedGateway, params: &Value) -> std::result::Result<Value, (&'static str, &'static str)> {
     let cursor = match params.get("cursor") {
         None => None,
