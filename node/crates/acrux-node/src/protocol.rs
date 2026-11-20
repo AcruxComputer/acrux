@@ -380,6 +380,8 @@ pub struct Network {
     wall: u64,
     samples: Vec<u64>,
     final_times: Vec<u64>,
+    /// Fault Lab only: node zero's time to finalized for each cblock, for the run's yardstick.
+    final_cblocks: BTreeMap<u64, u64>,
     finalized: BTreeSet<u64>,
     skipped: BTreeSet<u64>,
     slot_views: BTreeMap<u64, Value>,
@@ -975,6 +977,7 @@ impl Network {
             wall,
             samples: vec![],
             final_times: vec![],
+            final_cblocks: BTreeMap::new(),
             finalized: BTreeSet::new(),
             skipped: BTreeSet::new(),
             slot_views: BTreeMap::new(),
@@ -1406,6 +1409,7 @@ impl Network {
                     wall: self.wall,
                     samples: vec![],
                     final_times: vec![],
+                    final_cblocks: BTreeMap::new(),
                     finalized: BTreeSet::new(),
                     skipped: BTreeSet::new(),
                     slot_views: BTreeMap::new(),
@@ -1495,6 +1499,7 @@ impl Network {
                 self.handover_samples = std::mem::take(&mut actor.handover_samples);
                 self.facts = actor.facts.take();
                 self.final_times = std::mem::take(&mut actor.final_times);
+                self.final_cblocks = std::mem::take(&mut actor.final_cblocks);
                 self.finalized = std::mem::take(&mut actor.finalized);
                 self.skipped = std::mem::take(&mut actor.skipped);
                 self.traffic_seq = actor.traffic_seq;
@@ -1622,6 +1627,7 @@ impl Network {
                 if self.observed_final.lock().unwrap().insert(cblock) {
                     self.keep_finalized(cblock).await;
                     self.final_times.push(event.at);
+                    if self.config.fault.is_some() { self.final_cblocks.insert(cblock, event.at); }
                 }
             }
             let prepared = self.pending_bridge_proofs.keys().copied().take_while(|c| *c <= durable).collect::<Vec<_>>();
@@ -1753,10 +1759,38 @@ impl Network {
             _ => &["unreadable_fragment"],
         };
         let missing = expected.iter().filter(|k| !evidence.iter().any(|e| e["kind"] == **k)).collect::<Vec<_>>();
+        // The yardstick: each cblock of the window before, the attacker's and the one after, from node
+        // zero's own records: its votes by kind, its certificates, and its time to finalized.
+        let yardstick = {
+            let node = &self.nodes[0];
+            let cblocks = (w.saturating_sub(1) * 4..(w + 2) * 4).map(|c| {
+                let mut votes = BTreeMap::<&str, u64>::new();
+                for signed in node.votes.values().filter(|v| v.vote.slot == c) {
+                    *votes.entry(match signed.vote.kind {
+                        consensus::VoteKind::Notar => "notar",
+                        consensus::VoteKind::NotarFallback => "notar_fallback",
+                        consensus::VoteKind::Skip => "skip",
+                        consensus::VoteKind::SkipFallback => "skip_fallback",
+                        consensus::VoteKind::Finalize => "finalize",
+                    }).or_default() += 1;
+                }
+                let certificates = node.seen_certificates.iter().filter(|(slot, _, _)| *slot == c).map(|(_, kind, _)| match kind {
+                    consensus::CertificateKind::Notarization => "notarization",
+                    consensus::CertificateKind::NotarFallback => "notar_fallback",
+                    consensus::CertificateKind::FastFinalization => "fast_finalization",
+                    consensus::CertificateKind::Finalization => "slow_finalization",
+                    consensus::CertificateKind::Skip => "skip",
+                }).collect::<BTreeSet<_>>();
+                let finalized = self.final_cblocks.get(&c);
+                let status = if self.skipped.contains(&c) { "skipped" } else if finalized.is_some() { "finalized" } else { "pending" };
+                json!({"cblock":c,"window":c/4,"status":status,"skipped":self.skipped.contains(&c),"votes":votes,"certificates":certificates,"finalizedUs":finalized})
+            }).collect::<Vec<_>>();
+            json!({"attackerWindow":w,"slotsSkipped":skipped.len() * 4,"cblocks":cblocks})
+        };
         let outcome = if missing.is_empty() {
-            json!({"status":"done","outcome":evidence.iter().map(|e| e["description"].as_str().unwrap_or_default()).collect::<Vec<_>>().join(" "),"evidence":evidence,"failure":null})
+            json!({"status":"done","outcome":evidence.iter().map(|e| e["description"].as_str().unwrap_or_default()).collect::<Vec<_>>().join(" "),"evidence":evidence,"yardstick":yardstick,"failure":null})
         } else {
-            json!({"status":"failed","outcome":null,"evidence":evidence,"failure":format!("The run ended without the expected evidence: {}", missing.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(", "))})
+            json!({"status":"failed","outcome":null,"evidence":evidence,"yardstick":yardstick,"failure":format!("The run ended without the expected evidence: {}", missing.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(", "))})
         };
         {
             let mut g = self.gateway.write().await;

@@ -43,7 +43,7 @@ const responseFixtures = {
   HubEarningsRow: f.hubEarnings.epochs[0].rows[1], HubEarningsEpoch: f.hubEarnings.epochs[0], HubEarnings: f.hubEarnings,
   RegistryConfig: f.registryConfig, SchedulePreview: f.schedulePreview, FaucetPolicy: f.faucetPolicy,
   FaucetStatus: f.makeFaucetStatus(), FaucetGrant: f.faucetGrant(), Facts: f.factsWithOutside,
-  Evidence: f.labRuns[0].evidence[0], LabScenario: f.scenarios[0], LabRun: f.labRuns[0],
+  Evidence: f.labRuns[0].evidence[0], LabScenario: f.scenarios[0], LabRun: f.labRuns[0], LabYardstick: f.labRuns[0].yardstick, LabYardstickCblock: f.labRuns[0].yardstick.cblocks[0],
   LabRuns: paged(f.labRuns), SpecMap: f.specMap,
   BridgeVault: f.bridgeFixture.vaults[0], BridgeCertified: f.bridgeFixture.lightClient.latestCertified,
   BridgeRelayer: relayer, BridgeNative: native, Bridge: { ...f.bridgeFixture, relayer, native },

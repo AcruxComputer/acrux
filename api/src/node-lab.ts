@@ -11,7 +11,7 @@ import type { PrismaClient } from '@prisma/client'
 import { env } from './config.js'
 
 type Listener = (event: ProtocolEvent) => void
-type Outcome = { status: 'done' | 'failed'; outcome: string | null; evidence: Evidence[]; failure: string | null }
+type Outcome = { status: 'done' | 'failed'; outcome: string | null; evidence: Evidence[]; yardstick: LabRun['yardstick']; failure: string | null }
 type RunRow = Awaited<ReturnType<PrismaClient['labRun']['findFirstOrThrow']>>
 
 export class NodeLab {
@@ -25,10 +25,10 @@ export class NodeLab {
   scenario(id: string): LabScenario { return scenarios.find(s => s.id === id)! }
 
   view(row: RunRow): LabRun {
-    const result = row.outcome as { outcome: string | null; evidence: Evidence[] } | null
+    const result = row.outcome as { outcome: string | null; evidence: Evidence[]; yardstick?: LabRun['yardstick'] } | null
     return { id: row.id, scenario: this.scenario(row.scenario), seed: row.seed, status: row.status,
       createdAt: row.createdAt.toISOString(), startedAt: row.startedAt?.toISOString() ?? null, endedAt: row.finishedAt?.toISOString() ?? null,
-      outcome: result?.outcome ?? null, evidence: result?.evidence ?? [], failure: (row.failure as string | null) ?? null }
+      outcome: result?.outcome ?? null, evidence: result?.evidence ?? [], yardstick: result?.yardstick ?? null, failure: (row.failure as string | null) ?? null }
   }
 
   async start(scenario: string, seed: string) {
@@ -104,7 +104,7 @@ export class NodeLab {
     const failed = code !== 0 || !outcome
     row = await this.db.labRun.update({ where: { id }, data: {
       status: failed && !outcome ? 'failed_to_start' : 'done', finishedAt: new Date(),
-      outcome: outcome ? { outcome: outcome.outcome, evidence: outcome.evidence } : undefined,
+      outcome: outcome ? { outcome: outcome.outcome, evidence: outcome.evidence, yardstick: outcome.yardstick } : undefined,
       failure: outcome?.failure ?? (failed ? `The sandbox stopped (exit ${code}). ${stderr.trim().split('\n').pop() ?? ''}`.trim() : undefined) } })
     await this.record(id, this.updated(this.view(row)))
     rmSync(dir, { recursive: true, force: true })

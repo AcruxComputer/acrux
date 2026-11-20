@@ -14,7 +14,7 @@ export class FixtureLab {
   start(template: LabRun, seed: string, failed: boolean) {
     const createdAt = new Date().toISOString()
     const run: LabRun = { ...template, id: randomUUID(), seed, createdAt, startedAt: null, endedAt: failed ? createdAt : null,
-      status: failed ? 'failed_to_start' : 'queued', outcome: null, evidence: [], failure: failed ? 'The fixture sandbox could not acquire a runner.' : null }
+      status: failed ? 'failed_to_start' : 'queued', outcome: null, evidence: [], yardstick: null, failure: failed ? 'The fixture sandbox could not acquire a runner.' : null }
     const record: Record = { run, events: [], listeners: new Set() }
     this.records.set(run.id, record)
     this.publish(record, { version: 1, type: 'lab.updated', streamId: `lab-${run.id}`, sequence: 0, slot: null, anchor: 'stream', atUs: 0, data: run })

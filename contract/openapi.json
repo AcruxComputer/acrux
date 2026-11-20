@@ -3,7 +3,7 @@
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "info": {
     "title": "Acrux API",
-    "version": "0.1.30",
+    "version": "0.1.31",
     "description": "Round 1 fixture contract. Amounts are decimal integer strings. Times are relative microseconds with UTC slot wallTime."
   },
   "servers": [
@@ -11239,6 +11239,97 @@
               "additionalProperties": false
             }
           },
+          "yardstick": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "attackerWindow": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "slotsSkipped": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "cblocks": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "cblock": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "window": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "status": {
+                          "type": "string"
+                        },
+                        "skipped": {
+                          "type": "boolean"
+                        },
+                        "votes": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          }
+                        },
+                        "certificates": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "finalizedUs": {
+                          "anyOf": [
+                            {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "cblock",
+                        "window",
+                        "status",
+                        "skipped",
+                        "votes",
+                        "certificates",
+                        "finalizedUs"
+                      ],
+                      "additionalProperties": false
+                    }
+                  }
+                },
+                "required": [
+                  "attackerWindow",
+                  "slotsSkipped",
+                  "cblocks"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "failure": {
             "type": [
               "string",
@@ -11256,6 +11347,7 @@
           "endedAt",
           "outcome",
           "evidence",
+          "yardstick",
           "failure"
         ],
         "additionalProperties": false
@@ -11498,6 +11590,97 @@
                     "additionalProperties": false
                   }
                 },
+                "yardstick": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "attackerWindow": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "slotsSkipped": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "cblocks": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "cblock": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "window": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "status": {
+                                "type": "string"
+                              },
+                              "skipped": {
+                                "type": "boolean"
+                              },
+                              "votes": {
+                                "type": "object",
+                                "propertyNames": {
+                                  "type": "string"
+                                },
+                                "additionalProperties": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                }
+                              },
+                              "certificates": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string"
+                                }
+                              },
+                              "finalizedUs": {
+                                "anyOf": [
+                                  {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "cblock",
+                              "window",
+                              "status",
+                              "skipped",
+                              "votes",
+                              "certificates",
+                              "finalizedUs"
+                            ],
+                            "additionalProperties": false
+                          }
+                        }
+                      },
+                      "required": [
+                        "attackerWindow",
+                        "slotsSkipped",
+                        "cblocks"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "failure": {
                   "type": [
                     "string",
@@ -11515,6 +11698,7 @@
                 "endedAt",
                 "outcome",
                 "evidence",
+                "yardstick",
                 "failure"
               ],
               "additionalProperties": false
@@ -11603,6 +11787,150 @@
           "parameters",
           "lemma",
           "expectedOutcome"
+        ],
+        "additionalProperties": false
+      },
+      "LabYardstick": {
+        "type": "object",
+        "properties": {
+          "attackerWindow": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "slotsSkipped": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "cblocks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "cblock": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "window": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "status": {
+                  "type": "string"
+                },
+                "skipped": {
+                  "type": "boolean"
+                },
+                "votes": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  }
+                },
+                "certificates": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "finalizedUs": {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "cblock",
+                "window",
+                "status",
+                "skipped",
+                "votes",
+                "certificates",
+                "finalizedUs"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "attackerWindow",
+          "slotsSkipped",
+          "cblocks"
+        ],
+        "additionalProperties": false
+      },
+      "LabYardstickCblock": {
+        "type": "object",
+        "properties": {
+          "cblock": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "window": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "status": {
+            "type": "string"
+          },
+          "skipped": {
+            "type": "boolean"
+          },
+          "votes": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "certificates": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "finalizedUs": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "cblock",
+          "window",
+          "status",
+          "skipped",
+          "votes",
+          "certificates",
+          "finalizedUs"
         ],
         "additionalProperties": false
       },
@@ -26737,6 +27065,97 @@
                       "additionalProperties": false
                     }
                   },
+                  "yardstick": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "attackerWindow": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "slotsSkipped": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "cblocks": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "cblock": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                "window": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                "status": {
+                                  "type": "string"
+                                },
+                                "skipped": {
+                                  "type": "boolean"
+                                },
+                                "votes": {
+                                  "type": "object",
+                                  "propertyNames": {
+                                    "type": "string"
+                                  },
+                                  "additionalProperties": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  }
+                                },
+                                "certificates": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                },
+                                "finalizedUs": {
+                                  "anyOf": [
+                                    {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "cblock",
+                                "window",
+                                "status",
+                                "skipped",
+                                "votes",
+                                "certificates",
+                                "finalizedUs"
+                              ],
+                              "additionalProperties": false
+                            }
+                          }
+                        },
+                        "required": [
+                          "attackerWindow",
+                          "slotsSkipped",
+                          "cblocks"
+                        ],
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
                   "failure": {
                     "type": [
                       "string",
@@ -26754,6 +27173,7 @@
                   "endedAt",
                   "outcome",
                   "evidence",
+                  "yardstick",
                   "failure"
                 ],
                 "additionalProperties": false
@@ -27143,6 +27563,97 @@
                   "additionalProperties": false
                 }
               },
+              "yardstick": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "attackerWindow": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "slotsSkipped": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "cblocks": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "cblock": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "window": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "status": {
+                              "type": "string"
+                            },
+                            "skipped": {
+                              "type": "boolean"
+                            },
+                            "votes": {
+                              "type": "object",
+                              "propertyNames": {
+                                "type": "string"
+                              },
+                              "additionalProperties": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              }
+                            },
+                            "certificates": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "finalizedUs": {
+                              "anyOf": [
+                                {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "cblock",
+                            "window",
+                            "status",
+                            "skipped",
+                            "votes",
+                            "certificates",
+                            "finalizedUs"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    "required": [
+                      "attackerWindow",
+                      "slotsSkipped",
+                      "cblocks"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
               "failure": {
                 "type": [
                   "string",
@@ -27160,6 +27671,7 @@
               "endedAt",
               "outcome",
               "evidence",
+              "yardstick",
               "failure"
             ],
             "additionalProperties": false
@@ -36226,6 +36738,97 @@
                             "additionalProperties": false
                           }
                         },
+                        "yardstick": {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "attackerWindow": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                "slotsSkipped": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                "cblocks": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "object",
+                                    "properties": {
+                                      "cblock": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 9007199254740991
+                                      },
+                                      "window": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 9007199254740991
+                                      },
+                                      "status": {
+                                        "type": "string"
+                                      },
+                                      "skipped": {
+                                        "type": "boolean"
+                                      },
+                                      "votes": {
+                                        "type": "object",
+                                        "propertyNames": {
+                                          "type": "string"
+                                        },
+                                        "additionalProperties": {
+                                          "type": "integer",
+                                          "minimum": 0,
+                                          "maximum": 9007199254740991
+                                        }
+                                      },
+                                      "certificates": {
+                                        "type": "array",
+                                        "items": {
+                                          "type": "string"
+                                        }
+                                      },
+                                      "finalizedUs": {
+                                        "anyOf": [
+                                          {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    "required": [
+                                      "cblock",
+                                      "window",
+                                      "status",
+                                      "skipped",
+                                      "votes",
+                                      "certificates",
+                                      "finalizedUs"
+                                    ],
+                                    "additionalProperties": false
+                                  }
+                                }
+                              },
+                              "required": [
+                                "attackerWindow",
+                                "slotsSkipped",
+                                "cblocks"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "failure": {
                           "type": [
                             "string",
@@ -36243,6 +36846,7 @@
                         "endedAt",
                         "outcome",
                         "evidence",
+                        "yardstick",
                         "failure"
                       ],
                       "additionalProperties": false
@@ -42804,6 +43408,97 @@
                     "additionalProperties": false
                   }
                 },
+                "yardstick": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "attackerWindow": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "slotsSkipped": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "cblocks": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "cblock": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "window": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "status": {
+                                "type": "string"
+                              },
+                              "skipped": {
+                                "type": "boolean"
+                              },
+                              "votes": {
+                                "type": "object",
+                                "propertyNames": {
+                                  "type": "string"
+                                },
+                                "additionalProperties": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                }
+                              },
+                              "certificates": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string"
+                                }
+                              },
+                              "finalizedUs": {
+                                "anyOf": [
+                                  {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "cblock",
+                              "window",
+                              "status",
+                              "skipped",
+                              "votes",
+                              "certificates",
+                              "finalizedUs"
+                            ],
+                            "additionalProperties": false
+                          }
+                        }
+                      },
+                      "required": [
+                        "attackerWindow",
+                        "slotsSkipped",
+                        "cblocks"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "failure": {
                   "type": [
                     "string",
@@ -42821,6 +43516,7 @@
                 "endedAt",
                 "outcome",
                 "evidence",
+                "yardstick",
                 "failure"
               ],
               "additionalProperties": false
@@ -51870,6 +52566,97 @@
                               "additionalProperties": false
                             }
                           },
+                          "yardstick": {
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "attackerWindow": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "slotsSkipped": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "cblocks": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "object",
+                                      "properties": {
+                                        "cblock": {
+                                          "type": "integer",
+                                          "minimum": 0,
+                                          "maximum": 9007199254740991
+                                        },
+                                        "window": {
+                                          "type": "integer",
+                                          "minimum": 0,
+                                          "maximum": 9007199254740991
+                                        },
+                                        "status": {
+                                          "type": "string"
+                                        },
+                                        "skipped": {
+                                          "type": "boolean"
+                                        },
+                                        "votes": {
+                                          "type": "object",
+                                          "propertyNames": {
+                                            "type": "string"
+                                          },
+                                          "additionalProperties": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          }
+                                        },
+                                        "certificates": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        },
+                                        "finalizedUs": {
+                                          "anyOf": [
+                                            {
+                                              "type": "integer",
+                                              "minimum": 0,
+                                              "maximum": 9007199254740991
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "cblock",
+                                        "window",
+                                        "status",
+                                        "skipped",
+                                        "votes",
+                                        "certificates",
+                                        "finalizedUs"
+                                      ],
+                                      "additionalProperties": false
+                                    }
+                                  }
+                                },
+                                "required": [
+                                  "attackerWindow",
+                                  "slotsSkipped",
+                                  "cblocks"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
                           "failure": {
                             "type": [
                               "string",
@@ -51887,6 +52674,7 @@
                           "endedAt",
                           "outcome",
                           "evidence",
+                          "yardstick",
                           "failure"
                         ],
                         "additionalProperties": false

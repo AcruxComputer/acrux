@@ -1,6 +1,6 @@
 [package]
 name = "acrux-schedule"
-version = "0.4.30"
+version = "0.4.31"
 edition = "2021"
 description = "Algorithm 3: the hub schedule and its proposers for each epoch."
 

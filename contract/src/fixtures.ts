@@ -347,17 +347,27 @@ function scenarioEvidence(scenario: z.infer<typeof LabScenario>, slot: Slot): z.
     signatures: scenario.id === 'equivocation' ? [slot.blocks[2]!.commitment!.signature, fixtureSignature('conflict-two')] : [],
     observedFragments: scenario.id === 'private-front-run' ? 1 : null, threshold: scenario.id === 'private-front-run' ? 2 : null }
 }
+/** The window before the attack, the attacker's window 4 and the one after; a skip in window 4 when `skipped`. */
+function labYardstick(skipped: boolean): NonNullable<LabRun['yardstick']> {
+  const cblocks: NonNullable<LabRun['yardstick']>['cblocks'] = Array.from({ length: 12 }, (_, at) => {
+    const cblock = 12 + at, window = Math.floor(cblock / 4), skip = skipped && cblock >= 16 && cblock < 20
+    return skip
+      ? { cblock, window, status: 'skipped', skipped: true, votes: { skip: 12 } as Record<string, number>, certificates: ['skip'], finalizedUs: null }
+      : { cblock, window, status: 'finalized', skipped: false, votes: { notar: 12, finalize: 12 } as Record<string, number>, certificates: ['notarization', 'finalization'], finalizedUs: 412_000 + at * 1_500 }
+  })
+  return { attackerWindow: 4, slotsSkipped: skipped ? 16 : 0, cblocks }
+}
 export const labRuns: LabRun[] = scenarios.map(scenario => {
   const skipped = ['last-look', 'equivocation', 'split-commitments'].includes(scenario.id)
   const slot = makeFixtureSlot(64, skipped ? 'skipped' : 'finalized', { crashedProposer: scenario.id === 'crash' ? 3 : undefined, skipReason: scenario.id === 'equivocation' ? 'equivocation' : 'disagreeing_vectors' })
   return { id: `run-${scenario.id}`, scenario, seed: scenario.seed, status: 'done', createdAt: FIXTURE_TIME,
     startedAt: FIXTURE_TIME, endedAt: '2026-11-16T00:00:02.000Z', outcome: scenario.expectedOutcome,
-    evidence: [scenarioEvidence(scenario, slot)], failure: null }
+    evidence: [scenarioEvidence(scenario, slot)], yardstick: labYardstick(skipped), failure: null }
 })
 export const labRunsByState: Record<LabRun['status'], LabRun> = {
-  queued: { ...labRuns[0]!, id: 'run-queued', status: 'queued', startedAt: null, endedAt: null, outcome: null, evidence: [] },
-  running: { ...labRuns[0]!, id: 'run-running', status: 'running', endedAt: null, outcome: null, evidence: [] },
-  done: labRuns[0]!, failed_to_start: { ...labRuns[0]!, id: 'run-failed', status: 'failed_to_start', startedAt: null, endedAt: FIXTURE_TIME, outcome: null, evidence: [], failure: 'The fixture sandbox could not acquire a runner.' },
+  queued: { ...labRuns[0]!, id: 'run-queued', status: 'queued', startedAt: null, endedAt: null, outcome: null, evidence: [], yardstick: null },
+  running: { ...labRuns[0]!, id: 'run-running', status: 'running', endedAt: null, outcome: null, evidence: [], yardstick: null },
+  done: labRuns[0]!, failed_to_start: { ...labRuns[0]!, id: 'run-failed', status: 'failed_to_start', startedAt: null, endedAt: FIXTURE_TIME, outcome: null, evidence: [], yardstick: null, failure: 'The fixture sandbox could not acquire a runner.' },
 }
 /** Every envelope keeps its own anchor; sequence orders a replay across overlapping slots. */
 export function makeLabReplay(run: LabRun): LabReplay {
@@ -373,7 +383,7 @@ export function makeLabReplay(run: LabRun): LabReplay {
     const anchorStart = anchor === 'slot' ? ((slot ?? 64) - 64) * 50000 : anchor === 'consensus' ? (Math.floor((slot ?? 64) / 4) * 4 - 64) * 50000 : 0
     timeline.push({ event: { version: 1, sequence: timeline.length, streamId: `lab-${run.id}`, slot, anchor, atUs, type, data } as ProtocolEvent, offset: anchorStart + atUs })
   }
-  add('lab.updated', { ...run, status: 'running', endedAt: null, outcome: null, evidence: [] }, 0, null, 'stream')
+  add('lab.updated', { ...run, status: 'running', endedAt: null, outcome: null, evidence: [], yardstick: null }, 0, null, 'stream')
   add('window.started', slots[0]!.window, 0, null, 'window')
   for (const slot of slots) {
     if (run.scenario.id === 'censorship') { slot.mergedOrder[0]!.sourceProposers = [3]; slot.mergedOrder[0]!.kind = 'plain'; slot.mergedOrder[0]!.n = 3; slot.mergedOrder[0]!.t = 1; slot.mergedOrder[0]!.fragmentIndices = [] }
