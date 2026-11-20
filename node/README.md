@@ -371,7 +371,7 @@ A validator that falls more than two windows behind catches up: it executes and 
 A sandbox of twelve validators runs for 12 s with the scenario's fault in window 4 and writes `events.jsonl` (every protocol event of windows 3 to 5, appended live) and `outcome.json` (protocol, status, outcome, evidence and yardstick). The yardstick keeps node zero's status, votes, certificate kinds and finalization time for every cblock of those three windows. The API runs it per lab run and keeps both in Postgres.
 
 `--protocol today|agreement|lanes` belongs only to `lab run`; it defaults to
-`today`. `lanes` is accepted but stops with "lanes is not built yet". Public
+`today`. Public
 `net up`, RPC followers and outside proposers keep the existing unanimous rule.
 There is no activation slot or public-net protocol setting.
 
@@ -387,6 +387,26 @@ too. A node missing a chosen block or key waits for the existing
 Rotor slices and key-release attestations. Validators execute and vote through
 the same merge and Votor paths.
 
+`lanes` runs three independent content Votors, one per proposer role. A lane
+checks only its proposer's attestation column: at least two signed rows, the
+owner's released key, and the same non-null hash in every received row after
+all three rows or two global message flights. A split commitment therefore
+skip-certifies its own lane; it does not reject the other columns. Votes are
+signed with a lane-specific domain and keep the existing 60% and 80% thresholds.
+
+Execution waits for every lane's finalization or skip certificate, then uses the
+existing SortTxs, tracks and SVM execution on accepted blocks only. The existing
+execution Votor certifies the merged state and advances the window clock. Its
+deadline cannot skip a cblock while content decisions are still pending. Lab
+cblock preimages commit to the accepted lane hashes in proposer order; public
+cblock encodings are unchanged. A lane skipped inside a window stays skipped
+until its next window, as Votor's parent rule requires. Other lanes continue,
+and their accepted set may change between cblocks in the same window.
+
+For lanes, each yardstick cblock additionally carries three `lanes` rows with
+proposer, finalized/skipped/pending status, votes by kind and certificate kinds.
+The existing aggregate votes and certificates describe execution finality.
+
 | Scenario | Fault | Evidence | Lemma |
 |---|---|---|---|
 | `last-look` | proposer 3 commits 28 ms late | `late_block_dropped`, `skip_certificate` | Lemma 2.3 |
@@ -400,9 +420,13 @@ The table describes `today`. Under `agreement`, `split-commitments` instead
 requires `window_continued`, naming the attack slot, `agreedSet` and
 `finalized: true`. `last-look` keeps `late_block_dropped` and expects
 `window_continued` in place of a skip. Crash, censorship, equivocation and
-private-fragment evidence retain their meanings. Run the six paired cases with
+private-fragment evidence retain their meanings. Under `lanes`, split commitments
+require `lane_skipped`, including the attacker's skip certificate and the other
+finalized lanes. Last-look and equivocation retain their late-drop/slashing
+evidence and use `lane_skipped` instead of a whole-cblock skip. Crash, censorship
+and private-fragment evidence remain unchanged. Run the nine paired cases with
 `node node/scripts/lab-agreement-check.mjs` from `backend/`; it prints each
-run's yardstick summary and removes its own temporary stores.
+run's yardstick and per-lane summary and removes its own temporary stores.
 
 ## CLI
 

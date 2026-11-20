@@ -1,7 +1,6 @@
-// Build 6 steps 1/2: six paired Fault Lab runs, once each, on the same seed.
+// Build 6 steps 1..3: nine fresh Fault Lab runs, once each, on the same historical seed.
 // Usage from backend, after the coordinated release build:
 // node node/scripts/lab-agreement-check.mjs
-// After a genuine agreement fix: add --agreement-only to reuse the recorded today baselines.
 // Only twelve loopback QUIC ports 5062..5073 are used; lab opens no HTTP listeners.
 // Raw runs stay under node/target and are removed after reporting; failed event streams are retained as gzip diagnostics.
 import assert from 'node:assert/strict'
@@ -11,6 +10,7 @@ import dgram from 'node:dgram'
 import { createReadStream, createWriteStream } from 'node:fs'
 import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, relative, resolve, sep } from 'node:path'
+import { createInterface } from 'node:readline'
 import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
 import { createGzip } from 'node:zlib'
@@ -19,12 +19,10 @@ const backend = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const nodeDir = join(backend, 'node'), target = join(nodeDir, 'target')
 const binary = join(target, 'release', process.platform === 'win32' ? 'acrux.exe' : 'acrux')
 const sourceGenesis = join(backend, 'chain/genesis/acrux-net.json')
-const reportPath = join(nodeDir, 'reports/r20-agreement.json')
-const baselinePath = join(nodeDir, 'reports/r20-agreement-initial.json')
-const agreementOnly = process.argv.slice(2).length === 1 && process.argv[2] === '--agreement-only'
-assert.ok(process.argv.length === 2 || agreementOnly, 'Only --agreement-only is supported; the seed and scenarios stay fixed.')
+const reportPath = join(nodeDir, 'reports/r21-lanes.json')
+assert.equal(process.argv.length, 2, 'R21 runs all nine fresh cases; the seed and scenarios stay fixed.')
 const seed = 'acrux-r20-agreement', basePort = 5062, attackerWindow = 4
-const cases = ['split-commitments', 'crash', 'censorship'].flatMap(scenario => ['today', 'agreement'].map(protocol => ({ scenario, protocol })))
+const cases = ['split-commitments', 'crash', 'censorship'].flatMap(scenario => ['today', 'agreement', 'lanes'].map(protocol => ({ scenario, protocol })))
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
 let root, current, interrupted = false
 const event = (name, fields) => console.log(JSON.stringify({ event: name, ...fields }))
@@ -67,11 +65,38 @@ function validateOutcome(item) {
     require(Array.isArray(row.certificates), `Missing certificate list for cblock ${row.cblock}.`)
     require(row.finalizedUs === null || Number.isSafeInteger(row.finalizedUs) && row.finalizedUs >= 0, `Invalid measured finalization time for cblock ${row.cblock}.`)
     require(row.status !== 'finalized' || row.finalizedUs !== null, `Finalized cblock ${row.cblock} needs its observed finalization time.`)
+    if (item.protocol === 'lanes') {
+      const lanes = row.lanes
+      require(Array.isArray(lanes) && lanes.length === 3 && [1, 2, 3].every(proposer => lanes.filter(lane => lane.proposer === proposer).length === 1),
+        `Cblock ${row.cblock} must retain all three independent lanes.`)
+      for (const lane of lanes ?? []) {
+        require(['pending', 'finalized', 'skipped'].includes(lane.status), `Invalid lane ${lane.proposer} status at cblock ${row.cblock}.`)
+        require(lane.votes && Object.values(lane.votes).every(value => Number.isSafeInteger(value) && value >= 0), `Invalid lane vote counts at cblock ${row.cblock}.`)
+        require(Array.isArray(lane.certificates), `Missing lane certificates at cblock ${row.cblock}.`)
+      }
+    }
   }
   const attack = yardstick.cblocks.filter(row => row.window === attackerWindow)
   require(yardstick.slotsSkipped === attack.filter(row => row.skipped).length * 4, 'Attacker-window skipped slots must match its cblock rows.')
   const evidence = outcome.evidence ?? []
-  if (item.scenario === 'split-commitments' && item.protocol === 'today') {
+  if (item.protocol === 'lanes' && ['split-commitments', 'crash'].includes(item.scenario)) {
+    require(yardstick.slotsSkipped === 0 && attack.every(row => row.status === 'finalized'),
+      'Independent honest lanes must keep all four attacker-window cblocks finalized.')
+    for (const row of attack) {
+      require([1, 2].every(proposer => row.lanes?.some(lane => lane.proposer === proposer && lane.status === 'finalized')),
+        `Honest lanes 1 and 2 must finalize at cblock ${row.cblock}.`)
+      require(row.lanes?.some(lane => lane.proposer === 3 && lane.status === 'skipped'),
+        `Only attacker lane 3 must skip at cblock ${row.cblock}.`)
+    }
+    require(attack.some(row => row.lanes?.some(lane => lane.proposer === 3 && lane.certificates.includes('skip'))),
+      'The skipped attacker lane must have its actual skip certificate.')
+    if (item.scenario === 'split-commitments') require(evidence.some(row => row.kind === 'lane_skipped' && row.proposer === 3
+      && row.skipCertificate?.kind === 'skip' && row.skipCertificate.hash === null
+      && row.skipCertificate.signers?.length > 0 && row.signatures?.length > 0
+      && JSON.stringify(row.otherLanesFinalized) === '[1,2]'),
+      'Lane evidence must preserve the skip certificate, signatures and finalized honest lanes.')
+    if (item.scenario === 'crash') require(evidence.some(row => row.kind === 'two_proposers_continue'), 'Crash still needs the existing two-proposer evidence.')
+  } else if (item.scenario === 'split-commitments' && item.protocol === 'today') {
     require(yardstick.slotsSkipped === 16, 'Today must expose the whole skipped attacker window.')
     require(evidence.some(row => row.kind === 'skip_certificate'), 'Today split commitments need their skip certificate evidence.')
   } else if (item.scenario === 'split-commitments') {
@@ -96,7 +121,13 @@ function windowSummary(outcome) {
       skipped: own.filter(row => row.status === 'skipped').length,
       pending: own.filter(row => row.status === 'pending').length,
       slotsSkipped: own.filter(row => row.skipped).length * 4,
-      statuses: own.map(row => ({ cblock: row.cblock, status: row.status })) }
+      statuses: own.map(row => ({ cblock: row.cblock, status: row.status })),
+      lanes: [1, 2, 3].flatMap(proposer => {
+        const laneRows = own.flatMap(row => (row.lanes ?? []).filter(lane => lane.proposer === proposer).map(lane => ({ cblock: row.cblock, status: lane.status })))
+        return laneRows.length ? [{ proposer, finalized: laneRows.filter(row => row.status === 'finalized').length,
+          skipped: laneRows.filter(row => row.status === 'skipped').length, pending: laneRows.filter(row => row.status === 'pending').length,
+          statuses: laneRows }] : []
+      }) }
   })
 }
 async function preserveFailedEvents(dir, item, started) {
@@ -107,11 +138,44 @@ async function preserveFailedEvents(dir, item, started) {
     if (error.code !== 'ENOENT') throw error
     return { unavailable: 'The failed lab process produced no events.jsonl.' }
   }
-  const output = join(dirname(reportPath), `r20-${item.scenario}-${item.protocol}-${started}-events.jsonl.gz`)
+  const output = join(dirname(reportPath), `r21-${item.scenario}-${item.protocol}-${started}-events.jsonl.gz`)
   await mkdir(dirname(output), { recursive: true })
   await pipeline(createReadStream(input), createGzip(), createWriteStream(output, { flags: 'wx' }))
   return { path: relative(backend, output).split(sep).join('/'), compression: 'gzip',
     uncompressedBytes: raw.size, compressedBytes: (await stat(output)).size }
+}
+async function readEventContext(dir, crash) {
+  const windows = new Map(), firstReturnedSlot = new Map()
+  let truncated = false
+  const input = createReadStream(join(dir, 'events.jsonl'), { encoding: 'utf8' })
+  const lines = createInterface({ input, crlfDelay: Infinity })
+  const relevant = new Set(['commitment.sent', 'commitment.arrived', 'attestation.sent', 'attestation.arrived', 'slot.agreed', 'slot.executed', 'slot.skipped'])
+  try {
+    for await (const line of lines) {
+      if (!line.trim()) continue
+      const event = JSON.parse(line), data = event.data
+      if (event.type === 'window.started' && [3, 4, 5].includes(data.number) && !windows.has(data.number)) {
+        windows.set(data.number, { window: data.number, hubCode: data.hubCode,
+          proposers: data.proposers.map(({ index, identity }) => ({ proposer: index, identity })) })
+      }
+      if (!crash || event.slot !== 80 || !relevant.has(event.type)) continue
+      const proposer = data.proposer ?? data.attestation?.proposer ?? null
+      const key = `${event.type}/${event.node ?? ''}/${proposer}/${data.arrival?.receiver ?? ''}/${data.validator ?? ''}`
+      if (firstReturnedSlot.has(key)) continue
+      if (firstReturnedSlot.size >= 128) { truncated = true; continue }
+      firstReturnedSlot.set(key, { type: event.type, node: event.node ?? null, atUs: event.atUs,
+        proposer, hash: data.hash ?? null, pi: data.pi ?? data.attestation?.pi ?? null,
+        receiver: data.arrival?.receiver ?? null, relativeToStartUs: data.arrival?.relativeToStartUs ?? null,
+        validator: data.validator ?? null, agreedSet: data.agreedSet ?? null,
+        stateHash: data.stateHash ?? null, reason: data.reason ?? null })
+    }
+  } catch (error) { if (error.code !== 'ENOENT') throw error }
+  finally { lines.close(); input.destroy() }
+  const proposerWindows = [...windows.values()].sort((a, b) => a.window - b.window)
+  const crashedIdentity = windows.get(4)?.proposers.find(row => row.proposer === 3)?.identity ?? null
+  const nextRole = crashedIdentity ? windows.get(5)?.proposers.find(row => row.identity === crashedIdentity)?.proposer ?? null : null
+  return { proposerWindows, ...(crash ? { postCrash: { firstSlot: 80, crashedIdentity, nextWindowRole: nextRole,
+    firstSlotEvents: [...firstReturnedSlot.values()], traceTruncated: truncated } } : {}) }
 }
 async function runOnce({ scenario, protocol }, genesis, env, binarySha256) {
   if (interrupted) throw new Error('Lab comparison interrupted.')
@@ -141,7 +205,9 @@ async function runOnce({ scenario, protocol }, genesis, env, binarySha256) {
   catch (error) { if (error.code !== 'ENOENT') throw error }
   const item = { scenario, protocol, binarySha256, durationMs: Date.now() - started, ...result, timedOut,
     ...(spawnError ? { spawnError } : {}), outcome }
+  Object.assign(item, await readEventContext(dir, scenario === 'crash'))
   item.windows = windowSummary(outcome)
+  if (item.postCrash) item.postCrash.window = item.windows.find(row => row.window === 5)
   item.nonAttackSlotsSkipped = item.windows.filter(row => row.window !== attackerWindow).reduce((sum, row) => sum + row.slotsSkipped, 0)
   item.problems = validateOutcome(item)
   if (item.problems.length) {
@@ -156,7 +222,7 @@ async function runOnce({ scenario, protocol }, genesis, env, binarySha256) {
 try {
   await access(binary)
   await freePorts()
-  root = await mkdtemp(join(target, 'r20-agreement-'))
+  root = await mkdtemp(join(target, 'r21-lanes-'))
   const genesis = JSON.parse(await readFile(sourceGenesis, 'utf8'))
   for (const program of genesis.programs) program.path = resolve(backend, 'chain', program.path)
   const genesisPath = join(root, 'genesis.json')
@@ -170,42 +236,16 @@ try {
   const version = /^version = "([^"]+)"/m.exec(await readFile(join(nodeDir, 'crates/acrux-node/Cargo.toml'), 'utf8'))?.[1]
   const binarySha256 = createHash('sha256').update(await readFile(binary)).digest('hex')
   const startedAt = new Date().toISOString()
-  const byCase = new Map()
-  if (agreementOnly) {
-    const baseline = JSON.parse(await readFile(baselinePath, 'utf8'))
-    assert.equal(baseline.seed, seed, 'Corrective verification keeps the exact original seed.')
-    assert.equal(baseline.basePort, basePort)
-    assert.equal(baseline.trafficPerSecond, 50)
-    assert.equal(baseline.runSeconds, 12)
-    assert.match(baseline.binarySha256, /^[0-9a-f]{64}$/)
-    for (const requested of cases.filter(item => item.protocol === 'today')) {
-      const found = baseline.runs.filter(item => item.scenario === requested.scenario && item.protocol === 'today')
-      assert.equal(found.length, 1, 'Each original today baseline must appear exactly once.')
-      const item = structuredClone(found[0])
-      item.binarySha256 = baseline.binarySha256
-      item.reusedFrom = relative(backend, baselinePath).split(sep).join('/')
-      // Evaluate the preserved evidence with the corrected scenario requirements; never alter
-      // the original report or hide its initial agreement failures.
-      item.problems = validateOutcome(item)
-      byCase.set(`${item.scenario}/${item.protocol}`, item)
-    }
-  }
-  for (const requested of cases.filter(item => !agreementOnly || item.protocol === 'agreement')) {
-    const item = await runOnce(requested, genesisPath, env, binarySha256)
-    byCase.set(`${item.scenario}/${item.protocol}`, item)
-  }
-  const runs = cases.map(item => byCase.get(`${item.scenario}/${item.protocol}`))
-  assert.ok(runs.every(Boolean), 'The final comparison must retain all six scenario/protocol rows.')
-  const report = { check: 'r20-lab-agreement', startedAt, finishedAt: new Date().toISOString(),
+  const runs = []
+  for (const requested of cases) runs.push(await runOnce(requested, genesisPath, env, binarySha256))
+  const report = { check: 'r21-lab-lanes', startedAt, finishedAt: new Date().toISOString(),
     version, binary: relative(backend, binary).split(sep).join('/'), binarySha256,
-    correctiveVerification: agreementOnly,
-    ...(agreementOnly ? { baselineReport: relative(backend, baselinePath).split(sep).join('/'), executedCases: 3, reusedCases: 3 } : { executedCases: 6, reusedCases: 0 }),
-    seed, basePort, trafficPerSecond: 50, runSeconds: 12, attackerWindow,
+    executedCases: 9, reusedCases: 0, seed, basePort, trafficPerSecond: 50, runSeconds: 12, attackerWindow,
     comparedWindows: [3, 4, 5], passed: runs.every(item => item.problems.length === 0), runs }
   await mkdir(dirname(reportPath), { recursive: true })
   await writeFile(reportPath, JSON.stringify(report, null, 2) + '\n')
   event('lab_agreement_report', { report: relative(backend, reportPath).split(sep).join('/'), runs: runs.length, passed: report.passed })
-  assert.ok(report.passed, `Lab comparison failed; inspect ${relative(backend, reportPath)}. Each selected case ran once; recorded today baselines were reused only with --agreement-only.`)
+  assert.ok(report.passed, `Lab comparison failed; inspect ${relative(backend, reportPath)}. All nine cases ran once from fresh stores; no historical baseline was reused.`)
 } finally {
   await stopOwned()
   if (root) {

@@ -3,7 +3,7 @@
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "info": {
     "title": "Acrux API",
-    "version": "0.1.32",
+    "version": "0.1.33",
     "description": "Round 1 fixture contract. Amounts are decimal integer strings. Times are relative microseconds with UTC slot wallTime."
   },
   "servers": [
@@ -7924,7 +7924,8 @@
               "slashing_proof",
               "skip_certificate",
               "unreadable_fragment",
-              "window_continued"
+              "window_continued",
+              "lane_skipped"
             ]
           },
           "slot": {
@@ -8012,6 +8013,91 @@
           },
           "finalized": {
             "type": "boolean"
+          },
+          "skipCertificate": {
+            "type": "object",
+            "properties": {
+              "consensusSlot": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "notarization",
+                  "notar_fallback",
+                  "fast_finalization",
+                  "slow_finalization",
+                  "skip"
+                ]
+              },
+              "stakeShare": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "threshold": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "hash": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "signers": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 32,
+                  "maxLength": 44
+                }
+              },
+              "atUs": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "linkedConsensusSlot": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "consensusSlot",
+              "kind",
+              "stakeShare",
+              "threshold",
+              "hash",
+              "signers",
+              "atUs",
+              "linkedConsensusSlot"
+            ],
+            "additionalProperties": false
+          },
+          "otherLanesFinalized": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3
+            }
           }
         },
         "required": [
@@ -11185,7 +11271,8 @@
                     "slashing_proof",
                     "skip_certificate",
                     "unreadable_fragment",
-                    "window_continued"
+                    "window_continued",
+                    "lane_skipped"
                   ]
                 },
                 "slot": {
@@ -11273,6 +11360,91 @@
                 },
                 "finalized": {
                   "type": "boolean"
+                },
+                "skipCertificate": {
+                  "type": "object",
+                  "properties": {
+                    "consensusSlot": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "notarization",
+                        "notar_fallback",
+                        "fast_finalization",
+                        "slow_finalization",
+                        "skip"
+                      ]
+                    },
+                    "stakeShare": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1
+                    },
+                    "threshold": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1
+                    },
+                    "hash": {
+                      "anyOf": [
+                        {
+                          "type": "string",
+                          "pattern": "^[a-f0-9]{64}$"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "signers": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 32,
+                        "maxLength": 44
+                      }
+                    },
+                    "atUs": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "linkedConsensusSlot": {
+                      "anyOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "consensusSlot",
+                    "kind",
+                    "stakeShare",
+                    "threshold",
+                    "hash",
+                    "signers",
+                    "atUs",
+                    "linkedConsensusSlot"
+                  ],
+                  "additionalProperties": false
+                },
+                "otherLanesFinalized": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 3
+                  }
                 }
               },
               "required": [
@@ -11353,6 +11525,51 @@
                               "type": "null"
                             }
                           ]
+                        },
+                        "lanes": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "proposer": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 3
+                              },
+                              "status": {
+                                "type": "string",
+                                "enum": [
+                                  "finalized",
+                                  "skipped",
+                                  "pending"
+                                ]
+                              },
+                              "votes": {
+                                "type": "object",
+                                "propertyNames": {
+                                  "type": "string"
+                                },
+                                "additionalProperties": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                }
+                              },
+                              "certificates": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "required": [
+                              "proposer",
+                              "status",
+                              "votes",
+                              "certificates"
+                            ],
+                            "additionalProperties": false
+                          }
                         }
                       },
                       "required": [
@@ -11570,7 +11787,8 @@
                           "slashing_proof",
                           "skip_certificate",
                           "unreadable_fragment",
-                          "window_continued"
+                          "window_continued",
+                          "lane_skipped"
                         ]
                       },
                       "slot": {
@@ -11658,6 +11876,91 @@
                       },
                       "finalized": {
                         "type": "boolean"
+                      },
+                      "skipCertificate": {
+                        "type": "object",
+                        "properties": {
+                          "consensusSlot": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "kind": {
+                            "type": "string",
+                            "enum": [
+                              "notarization",
+                              "notar_fallback",
+                              "fast_finalization",
+                              "slow_finalization",
+                              "skip"
+                            ]
+                          },
+                          "stakeShare": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1
+                          },
+                          "threshold": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1
+                          },
+                          "hash": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "pattern": "^[a-f0-9]{64}$"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "signers": {
+                            "type": "array",
+                            "items": {
+                              "type": "string",
+                              "minLength": 32,
+                              "maxLength": 44
+                            }
+                          },
+                          "atUs": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "linkedConsensusSlot": {
+                            "anyOf": [
+                              {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "consensusSlot",
+                          "kind",
+                          "stakeShare",
+                          "threshold",
+                          "hash",
+                          "signers",
+                          "atUs",
+                          "linkedConsensusSlot"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "otherLanesFinalized": {
+                        "type": "array",
+                        "items": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 3
+                        }
                       }
                     },
                     "required": [
@@ -11738,6 +12041,51 @@
                                     "type": "null"
                                   }
                                 ]
+                              },
+                              "lanes": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "proposer": {
+                                      "type": "integer",
+                                      "minimum": 1,
+                                      "maximum": 3
+                                    },
+                                    "status": {
+                                      "type": "string",
+                                      "enum": [
+                                        "finalized",
+                                        "skipped",
+                                        "pending"
+                                      ]
+                                    },
+                                    "votes": {
+                                      "type": "object",
+                                      "propertyNames": {
+                                        "type": "string"
+                                      },
+                                      "additionalProperties": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 9007199254740991
+                                      }
+                                    },
+                                    "certificates": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  },
+                                  "required": [
+                                    "proposer",
+                                    "status",
+                                    "votes",
+                                    "certificates"
+                                  ],
+                                  "additionalProperties": false
+                                }
                               }
                             },
                             "required": [
@@ -11936,6 +12284,51 @@
                       "type": "null"
                     }
                   ]
+                },
+                "lanes": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "proposer": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 3
+                      },
+                      "status": {
+                        "type": "string",
+                        "enum": [
+                          "finalized",
+                          "skipped",
+                          "pending"
+                        ]
+                      },
+                      "votes": {
+                        "type": "object",
+                        "propertyNames": {
+                          "type": "string"
+                        },
+                        "additionalProperties": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        }
+                      },
+                      "certificates": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "required": [
+                      "proposer",
+                      "status",
+                      "votes",
+                      "certificates"
+                    ],
+                    "additionalProperties": false
+                  }
                 }
               },
               "required": [
@@ -12005,6 +12398,51 @@
                 "type": "null"
               }
             ]
+          },
+          "lanes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "proposer": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 3
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "finalized",
+                    "skipped",
+                    "pending"
+                  ]
+                },
+                "votes": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  }
+                },
+                "certificates": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "proposer",
+                "status",
+                "votes",
+                "certificates"
+              ],
+              "additionalProperties": false
+            }
           }
         },
         "required": [
@@ -12015,6 +12453,48 @@
           "votes",
           "certificates",
           "finalizedUs"
+        ],
+        "additionalProperties": false
+      },
+      "LabYardstickLane": {
+        "type": "object",
+        "properties": {
+          "proposer": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "finalized",
+              "skipped",
+              "pending"
+            ]
+          },
+          "votes": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "certificates": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "proposer",
+          "status",
+          "votes",
+          "certificates"
         ],
         "additionalProperties": false
       },
@@ -27070,7 +27550,8 @@
                             "slashing_proof",
                             "skip_certificate",
                             "unreadable_fragment",
-                            "window_continued"
+                            "window_continued",
+                            "lane_skipped"
                           ]
                         },
                         "slot": {
@@ -27158,6 +27639,91 @@
                         },
                         "finalized": {
                           "type": "boolean"
+                        },
+                        "skipCertificate": {
+                          "type": "object",
+                          "properties": {
+                            "consensusSlot": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "kind": {
+                              "type": "string",
+                              "enum": [
+                                "notarization",
+                                "notar_fallback",
+                                "fast_finalization",
+                                "slow_finalization",
+                                "skip"
+                              ]
+                            },
+                            "stakeShare": {
+                              "type": "number",
+                              "minimum": 0,
+                              "maximum": 1
+                            },
+                            "threshold": {
+                              "type": "number",
+                              "minimum": 0,
+                              "maximum": 1
+                            },
+                            "hash": {
+                              "anyOf": [
+                                {
+                                  "type": "string",
+                                  "pattern": "^[a-f0-9]{64}$"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "signers": {
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "minLength": 32,
+                                "maxLength": 44
+                              }
+                            },
+                            "atUs": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "linkedConsensusSlot": {
+                              "anyOf": [
+                                {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "consensusSlot",
+                            "kind",
+                            "stakeShare",
+                            "threshold",
+                            "hash",
+                            "signers",
+                            "atUs",
+                            "linkedConsensusSlot"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "otherLanesFinalized": {
+                          "type": "array",
+                          "items": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 3
+                          }
                         }
                       },
                       "required": [
@@ -27238,6 +27804,51 @@
                                       "type": "null"
                                     }
                                   ]
+                                },
+                                "lanes": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "object",
+                                    "properties": {
+                                      "proposer": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": 3
+                                      },
+                                      "status": {
+                                        "type": "string",
+                                        "enum": [
+                                          "finalized",
+                                          "skipped",
+                                          "pending"
+                                        ]
+                                      },
+                                      "votes": {
+                                        "type": "object",
+                                        "propertyNames": {
+                                          "type": "string"
+                                        },
+                                        "additionalProperties": {
+                                          "type": "integer",
+                                          "minimum": 0,
+                                          "maximum": 9007199254740991
+                                        }
+                                      },
+                                      "certificates": {
+                                        "type": "array",
+                                        "items": {
+                                          "type": "string"
+                                        }
+                                      }
+                                    },
+                                    "required": [
+                                      "proposer",
+                                      "status",
+                                      "votes",
+                                      "certificates"
+                                    ],
+                                    "additionalProperties": false
+                                  }
                                 }
                               },
                               "required": [
@@ -27360,7 +27971,8 @@
                       "slashing_proof",
                       "skip_certificate",
                       "unreadable_fragment",
-                      "window_continued"
+                      "window_continued",
+                      "lane_skipped"
                     ]
                   },
                   "slot": {
@@ -27448,6 +28060,91 @@
                   },
                   "finalized": {
                     "type": "boolean"
+                  },
+                  "skipCertificate": {
+                    "type": "object",
+                    "properties": {
+                      "consensusSlot": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "notarization",
+                          "notar_fallback",
+                          "fast_finalization",
+                          "slow_finalization",
+                          "skip"
+                        ]
+                      },
+                      "stakeShare": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      },
+                      "threshold": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      },
+                      "hash": {
+                        "anyOf": [
+                          {
+                            "type": "string",
+                            "pattern": "^[a-f0-9]{64}$"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "signers": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 32,
+                          "maxLength": 44
+                        }
+                      },
+                      "atUs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "linkedConsensusSlot": {
+                        "anyOf": [
+                          {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "consensusSlot",
+                      "kind",
+                      "stakeShare",
+                      "threshold",
+                      "hash",
+                      "signers",
+                      "atUs",
+                      "linkedConsensusSlot"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "otherLanesFinalized": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 3
+                    }
                   }
                 },
                 "required": [
@@ -27610,7 +28307,8 @@
                         "slashing_proof",
                         "skip_certificate",
                         "unreadable_fragment",
-                        "window_continued"
+                        "window_continued",
+                        "lane_skipped"
                       ]
                     },
                     "slot": {
@@ -27698,6 +28396,91 @@
                     },
                     "finalized": {
                       "type": "boolean"
+                    },
+                    "skipCertificate": {
+                      "type": "object",
+                      "properties": {
+                        "consensusSlot": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "kind": {
+                          "type": "string",
+                          "enum": [
+                            "notarization",
+                            "notar_fallback",
+                            "fast_finalization",
+                            "slow_finalization",
+                            "skip"
+                          ]
+                        },
+                        "stakeShare": {
+                          "type": "number",
+                          "minimum": 0,
+                          "maximum": 1
+                        },
+                        "threshold": {
+                          "type": "number",
+                          "minimum": 0,
+                          "maximum": 1
+                        },
+                        "hash": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "pattern": "^[a-f0-9]{64}$"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "signers": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 32,
+                            "maxLength": 44
+                          }
+                        },
+                        "atUs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "linkedConsensusSlot": {
+                          "anyOf": [
+                            {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "consensusSlot",
+                        "kind",
+                        "stakeShare",
+                        "threshold",
+                        "hash",
+                        "signers",
+                        "atUs",
+                        "linkedConsensusSlot"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "otherLanesFinalized": {
+                      "type": "array",
+                      "items": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 3
+                      }
                     }
                   },
                   "required": [
@@ -27778,6 +28561,51 @@
                                   "type": "null"
                                 }
                               ]
+                            },
+                            "lanes": {
+                              "type": "array",
+                              "items": {
+                                "type": "object",
+                                "properties": {
+                                  "proposer": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": 3
+                                  },
+                                  "status": {
+                                    "type": "string",
+                                    "enum": [
+                                      "finalized",
+                                      "skipped",
+                                      "pending"
+                                    ]
+                                  },
+                                  "votes": {
+                                    "type": "object",
+                                    "propertyNames": {
+                                      "type": "string"
+                                    },
+                                    "additionalProperties": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    }
+                                  },
+                                  "certificates": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "required": [
+                                  "proposer",
+                                  "status",
+                                  "votes",
+                                  "certificates"
+                                ],
+                                "additionalProperties": false
+                              }
                             }
                           },
                           "required": [
@@ -36810,7 +37638,8 @@
                                   "slashing_proof",
                                   "skip_certificate",
                                   "unreadable_fragment",
-                                  "window_continued"
+                                  "window_continued",
+                                  "lane_skipped"
                                 ]
                               },
                               "slot": {
@@ -36898,6 +37727,91 @@
                               },
                               "finalized": {
                                 "type": "boolean"
+                              },
+                              "skipCertificate": {
+                                "type": "object",
+                                "properties": {
+                                  "consensusSlot": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                      "notarization",
+                                      "notar_fallback",
+                                      "fast_finalization",
+                                      "slow_finalization",
+                                      "skip"
+                                    ]
+                                  },
+                                  "stakeShare": {
+                                    "type": "number",
+                                    "minimum": 0,
+                                    "maximum": 1
+                                  },
+                                  "threshold": {
+                                    "type": "number",
+                                    "minimum": 0,
+                                    "maximum": 1
+                                  },
+                                  "hash": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string",
+                                        "pattern": "^[a-f0-9]{64}$"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "signers": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "string",
+                                      "minLength": 32,
+                                      "maxLength": 44
+                                    }
+                                  },
+                                  "atUs": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "linkedConsensusSlot": {
+                                    "anyOf": [
+                                      {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 9007199254740991
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "consensusSlot",
+                                  "kind",
+                                  "stakeShare",
+                                  "threshold",
+                                  "hash",
+                                  "signers",
+                                  "atUs",
+                                  "linkedConsensusSlot"
+                                ],
+                                "additionalProperties": false
+                              },
+                              "otherLanesFinalized": {
+                                "type": "array",
+                                "items": {
+                                  "type": "integer",
+                                  "minimum": 1,
+                                  "maximum": 3
+                                }
                               }
                             },
                             "required": [
@@ -36978,6 +37892,51 @@
                                             "type": "null"
                                           }
                                         ]
+                                      },
+                                      "lanes": {
+                                        "type": "array",
+                                        "items": {
+                                          "type": "object",
+                                          "properties": {
+                                            "proposer": {
+                                              "type": "integer",
+                                              "minimum": 1,
+                                              "maximum": 3
+                                            },
+                                            "status": {
+                                              "type": "string",
+                                              "enum": [
+                                                "finalized",
+                                                "skipped",
+                                                "pending"
+                                              ]
+                                            },
+                                            "votes": {
+                                              "type": "object",
+                                              "propertyNames": {
+                                                "type": "string"
+                                              },
+                                              "additionalProperties": {
+                                                "type": "integer",
+                                                "minimum": 0,
+                                                "maximum": 9007199254740991
+                                              }
+                                            },
+                                            "certificates": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          },
+                                          "required": [
+                                            "proposer",
+                                            "status",
+                                            "votes",
+                                            "certificates"
+                                          ],
+                                          "additionalProperties": false
+                                        }
                                       }
                                     },
                                     "required": [
@@ -37100,7 +38059,8 @@
                             "slashing_proof",
                             "skip_certificate",
                             "unreadable_fragment",
-                            "window_continued"
+                            "window_continued",
+                            "lane_skipped"
                           ]
                         },
                         "slot": {
@@ -37188,6 +38148,91 @@
                         },
                         "finalized": {
                           "type": "boolean"
+                        },
+                        "skipCertificate": {
+                          "type": "object",
+                          "properties": {
+                            "consensusSlot": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "kind": {
+                              "type": "string",
+                              "enum": [
+                                "notarization",
+                                "notar_fallback",
+                                "fast_finalization",
+                                "slow_finalization",
+                                "skip"
+                              ]
+                            },
+                            "stakeShare": {
+                              "type": "number",
+                              "minimum": 0,
+                              "maximum": 1
+                            },
+                            "threshold": {
+                              "type": "number",
+                              "minimum": 0,
+                              "maximum": 1
+                            },
+                            "hash": {
+                              "anyOf": [
+                                {
+                                  "type": "string",
+                                  "pattern": "^[a-f0-9]{64}$"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "signers": {
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "minLength": 32,
+                                "maxLength": 44
+                              }
+                            },
+                            "atUs": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "linkedConsensusSlot": {
+                              "anyOf": [
+                                {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "consensusSlot",
+                            "kind",
+                            "stakeShare",
+                            "threshold",
+                            "hash",
+                            "signers",
+                            "atUs",
+                            "linkedConsensusSlot"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "otherLanesFinalized": {
+                          "type": "array",
+                          "items": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 3
+                          }
                         }
                       },
                       "required": [
@@ -43522,7 +44567,8 @@
                           "slashing_proof",
                           "skip_certificate",
                           "unreadable_fragment",
-                          "window_continued"
+                          "window_continued",
+                          "lane_skipped"
                         ]
                       },
                       "slot": {
@@ -43610,6 +44656,91 @@
                       },
                       "finalized": {
                         "type": "boolean"
+                      },
+                      "skipCertificate": {
+                        "type": "object",
+                        "properties": {
+                          "consensusSlot": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "kind": {
+                            "type": "string",
+                            "enum": [
+                              "notarization",
+                              "notar_fallback",
+                              "fast_finalization",
+                              "slow_finalization",
+                              "skip"
+                            ]
+                          },
+                          "stakeShare": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1
+                          },
+                          "threshold": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1
+                          },
+                          "hash": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "pattern": "^[a-f0-9]{64}$"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "signers": {
+                            "type": "array",
+                            "items": {
+                              "type": "string",
+                              "minLength": 32,
+                              "maxLength": 44
+                            }
+                          },
+                          "atUs": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "linkedConsensusSlot": {
+                            "anyOf": [
+                              {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "consensusSlot",
+                          "kind",
+                          "stakeShare",
+                          "threshold",
+                          "hash",
+                          "signers",
+                          "atUs",
+                          "linkedConsensusSlot"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "otherLanesFinalized": {
+                        "type": "array",
+                        "items": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 3
+                        }
                       }
                     },
                     "required": [
@@ -43690,6 +44821,51 @@
                                     "type": "null"
                                   }
                                 ]
+                              },
+                              "lanes": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "proposer": {
+                                      "type": "integer",
+                                      "minimum": 1,
+                                      "maximum": 3
+                                    },
+                                    "status": {
+                                      "type": "string",
+                                      "enum": [
+                                        "finalized",
+                                        "skipped",
+                                        "pending"
+                                      ]
+                                    },
+                                    "votes": {
+                                      "type": "object",
+                                      "propertyNames": {
+                                        "type": "string"
+                                      },
+                                      "additionalProperties": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 9007199254740991
+                                      }
+                                    },
+                                    "certificates": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  },
+                                  "required": [
+                                    "proposer",
+                                    "status",
+                                    "votes",
+                                    "certificates"
+                                  ],
+                                  "additionalProperties": false
+                                }
                               }
                             },
                             "required": [
@@ -52705,7 +53881,8 @@
                                     "slashing_proof",
                                     "skip_certificate",
                                     "unreadable_fragment",
-                                    "window_continued"
+                                    "window_continued",
+                                    "lane_skipped"
                                   ]
                                 },
                                 "slot": {
@@ -52793,6 +53970,91 @@
                                 },
                                 "finalized": {
                                   "type": "boolean"
+                                },
+                                "skipCertificate": {
+                                  "type": "object",
+                                  "properties": {
+                                    "consensusSlot": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    },
+                                    "kind": {
+                                      "type": "string",
+                                      "enum": [
+                                        "notarization",
+                                        "notar_fallback",
+                                        "fast_finalization",
+                                        "slow_finalization",
+                                        "skip"
+                                      ]
+                                    },
+                                    "stakeShare": {
+                                      "type": "number",
+                                      "minimum": 0,
+                                      "maximum": 1
+                                    },
+                                    "threshold": {
+                                      "type": "number",
+                                      "minimum": 0,
+                                      "maximum": 1
+                                    },
+                                    "hash": {
+                                      "anyOf": [
+                                        {
+                                          "type": "string",
+                                          "pattern": "^[a-f0-9]{64}$"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "signers": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string",
+                                        "minLength": 32,
+                                        "maxLength": 44
+                                      }
+                                    },
+                                    "atUs": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    },
+                                    "linkedConsensusSlot": {
+                                      "anyOf": [
+                                        {
+                                          "type": "integer",
+                                          "minimum": 0,
+                                          "maximum": 9007199254740991
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "consensusSlot",
+                                    "kind",
+                                    "stakeShare",
+                                    "threshold",
+                                    "hash",
+                                    "signers",
+                                    "atUs",
+                                    "linkedConsensusSlot"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "otherLanesFinalized": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": 3
+                                  }
                                 }
                               },
                               "required": [
@@ -52873,6 +54135,51 @@
                                               "type": "null"
                                             }
                                           ]
+                                        },
+                                        "lanes": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "object",
+                                            "properties": {
+                                              "proposer": {
+                                                "type": "integer",
+                                                "minimum": 1,
+                                                "maximum": 3
+                                              },
+                                              "status": {
+                                                "type": "string",
+                                                "enum": [
+                                                  "finalized",
+                                                  "skipped",
+                                                  "pending"
+                                                ]
+                                              },
+                                              "votes": {
+                                                "type": "object",
+                                                "propertyNames": {
+                                                  "type": "string"
+                                                },
+                                                "additionalProperties": {
+                                                  "type": "integer",
+                                                  "minimum": 0,
+                                                  "maximum": 9007199254740991
+                                                }
+                                              },
+                                              "certificates": {
+                                                "type": "array",
+                                                "items": {
+                                                  "type": "string"
+                                                }
+                                              }
+                                            },
+                                            "required": [
+                                              "proposer",
+                                              "status",
+                                              "votes",
+                                              "certificates"
+                                            ],
+                                            "additionalProperties": false
+                                          }
                                         }
                                       },
                                       "required": [
@@ -52995,7 +54302,8 @@
                               "slashing_proof",
                               "skip_certificate",
                               "unreadable_fragment",
-                              "window_continued"
+                              "window_continued",
+                              "lane_skipped"
                             ]
                           },
                           "slot": {
@@ -53083,6 +54391,91 @@
                           },
                           "finalized": {
                             "type": "boolean"
+                          },
+                          "skipCertificate": {
+                            "type": "object",
+                            "properties": {
+                              "consensusSlot": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "kind": {
+                                "type": "string",
+                                "enum": [
+                                  "notarization",
+                                  "notar_fallback",
+                                  "fast_finalization",
+                                  "slow_finalization",
+                                  "skip"
+                                ]
+                              },
+                              "stakeShare": {
+                                "type": "number",
+                                "minimum": 0,
+                                "maximum": 1
+                              },
+                              "threshold": {
+                                "type": "number",
+                                "minimum": 0,
+                                "maximum": 1
+                              },
+                              "hash": {
+                                "anyOf": [
+                                  {
+                                    "type": "string",
+                                    "pattern": "^[a-f0-9]{64}$"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "signers": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string",
+                                  "minLength": 32,
+                                  "maxLength": 44
+                                }
+                              },
+                              "atUs": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "linkedConsensusSlot": {
+                                "anyOf": [
+                                  {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "consensusSlot",
+                              "kind",
+                              "stakeShare",
+                              "threshold",
+                              "hash",
+                              "signers",
+                              "atUs",
+                              "linkedConsensusSlot"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "otherLanesFinalized": {
+                            "type": "array",
+                            "items": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "maximum": 3
+                            }
                           }
                         },
                         "required": [

@@ -39,6 +39,12 @@ pub struct CblockWitness {
     pub state_hashes: Vec<String>,
     pub outbox_root: Option<[u8; 32]>,
 }
+/// Lab lane votes cannot be replayed into another lane or the public execution Votor.
+pub(crate) fn lane_vote_message(lane:usize,vote:&consensus::Vote)->anyhow::Result<Vec<u8>> {
+    let mut message=b"acrux-lab-lane-v1".to_vec();
+    message.extend(bincode::serialize(&(lane as u8,vote))?);
+    Ok(message)
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Wire {
     Shreds(Vec<Shred>),
@@ -74,6 +80,9 @@ pub enum Wire {
     CommitReceipt(CommitReceipt),
     /// Bounded signed read-only measurements from the member's own direct links.
     ExchangeMetrics { epoch:u64, snapshot:Vec<u8> },
+    /// Lab-only additions keep every public wire discriminant unchanged.
+    LaneVote { lane:usize,signed:SignedVote },
+    LaneCertificate { lane:usize,certificate:consensus::Certificate,proofs:Vec<SignedVote> },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommitReceipt {

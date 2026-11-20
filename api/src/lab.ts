@@ -12,10 +12,9 @@ export class FixtureLab {
   get(id: string) { return this.records.get(id) }
 
   start(template: LabRun, seed: string, failed: boolean, protocol: LabProtocol = 'today') {
-    failed ||= protocol === 'lanes'
     const createdAt = new Date().toISOString()
     const run: LabRun = { ...template, id: randomUUID(), seed, protocol, createdAt, startedAt: null, endedAt: failed ? createdAt : null,
-      status: failed ? 'failed_to_start' : 'queued', outcome: null, evidence: [], yardstick: null, failure: protocol === 'lanes' ? 'The lanes protocol is not built yet.' : failed ? 'The fixture sandbox could not acquire a runner.' : null }
+      status: failed ? 'failed_to_start' : 'queued', outcome: null, evidence: [], yardstick: null, failure: failed ? 'The fixture sandbox could not acquire a runner.' : null }
     const record: Record = { run, events: [], listeners: new Set() }
     this.records.set(run.id, record)
     this.publish(record, { version: 1, type: 'lab.updated', streamId: `lab-${run.id}`, sequence: 0, slot: null, anchor: 'stream', atUs: 0, data: run })

@@ -298,7 +298,7 @@ pub async fn run_gateway(
 }
 
 /// The `@acrux/contract` version whose shapes the gateway answers in.
-pub const CONTRACT_VERSION: &str = "0.1.32";
+pub const CONTRACT_VERSION: &str = "0.1.33";
 
 async fn health(State(state): State<SharedGateway>) -> Json<Value> {
     let state = state.read().await;

@@ -43,7 +43,7 @@ const responseFixtures = {
   HubEarningsRow: f.hubEarnings.epochs[0].rows[1], HubEarningsEpoch: f.hubEarnings.epochs[0], HubEarnings: f.hubEarnings,
   RegistryConfig: f.registryConfig, SchedulePreview: f.schedulePreview, FaucetPolicy: f.faucetPolicy,
   FaucetStatus: f.makeFaucetStatus(), FaucetGrant: f.faucetGrant(), Facts: f.factsWithOutside,
-  Evidence: f.labRuns[0].evidence[0], LabScenario: f.scenarios[0], LabRun: f.labRuns[0], LabYardstick: f.labRuns[0].yardstick, LabYardstickCblock: f.labRuns[0].yardstick.cblocks[0],
+  Evidence: f.labRuns[0].evidence[0], LabScenario: f.scenarios[0], LabRun: f.labRuns[0], LabYardstick: f.labRuns[0].yardstick, LabYardstickCblock: f.labRuns[0].yardstick.cblocks[0], LabYardstickLane: f.labRunsByProtocol.lanes.yardstick.cblocks[4].lanes[2],
   LabRuns: paged(f.labRuns), SpecMap: f.specMap,
   BridgeVault: f.bridgeFixture.vaults[0], BridgeCertified: f.bridgeFixture.lightClient.latestCertified,
   BridgeRelayer: relayer, BridgeNative: native, Bridge: { ...f.bridgeFixture, relayer, native },
@@ -93,6 +93,9 @@ for (const [name, schema, fixture] of [
   ['ProgramError', ProgramError, error.error.programError], ['baseErrors.ApiError', baseErrors.ApiError, error],
   ['LabReplay', LabReplay, replay], ['LabReplay:agreement', LabReplay, f.labReplays[f.labRunsByProtocol.agreement.id]],
   ['Evidence:window_continued', s.Evidence, f.windowContinuedEvidence],
+  ['Evidence:lane_skipped', s.Evidence, f.laneSkippedEvidence],
+  ['LabReplay:lanes', LabReplay, f.labReplays[f.labRunsByProtocol.lanes.id]],
+  ['LabReplay:lanes-crash', LabReplay, f.labReplays[f.labLanesCrashRun.id]],
   ['LabRun:agreement', s.LabRun, f.labRunsByProtocol.agreement], ['LabRun:lanes', s.LabRun, f.labRunsByProtocol.lanes],
   ['LabScenarios', z.array(s.LabScenario), f.scenarios],
   ['RpcFailure', RpcFailure, { jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'Refused', data: error } }],
@@ -182,6 +185,6 @@ for (const [name, schema, fixture] of [['PlainSubmission', s.PlainSubmission, pl
 }
 assert.equal(StreamCommand.safeParse({ version: 1, type: 'subscribe', filter: { kind: 'all', [extra]: 'rejected' } }).success, false,
   'StreamCommand rejects unknown nested filter fields')
-console.log(JSON.stringify({ check: 'response-compatibility', responseObjects: objectResponses.length, auxiliaryResponses: 11,
+console.log(JSON.stringify({ check: 'response-compatibility', responseObjects: objectResponses.length, auxiliaryResponses: 14,
   eventVariants: events.size, rpcResults: Object.keys(rpcMethods).length, nestedResponseObjects: objectSites,
   strictRequestCases: requests.length, strictNestedRequests: 3, olderShapes: 4, result: 'passed' }))

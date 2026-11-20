@@ -3,7 +3,7 @@ import type { z } from 'zod'
 import { toBase58, toBase64 } from './encoding.js'
 import { PROTOCOL_PARAMETERS, errors } from './schemas.js'
 import type { Balance, GenesisShare, HubEarnings, Bridge, BridgeTransfer, Burn, BurnEpoch, DemoPool, Evidence, Facts, FaucetPolicy, FaucetStatus, FaucetGrant, LabScenario, RegistryConfig, SchedulePreview, SpecMap } from './schemas.js'
-import type { HashExchangePair, HashExchange as HashExchangeView, HubHashExchange, Cblock, Certificate, ExecutionSchedule, Hub, LabProtocol, LabRun, Member, MergedTransaction, NetSnapshot, Parameters, Proposer, Slot, Transaction, Window } from './schemas.js'
+import type { HashExchangePair, HashExchange as HashExchangeView, HubHashExchange, Cblock, Certificate, ExecutionSchedule, Hub, LabProtocol, LabRun, LabYardstickLane, Member, MergedTransaction, NetSnapshot, Parameters, Proposer, Slot, Transaction, Window } from './schemas.js'
 import type { ApiErrorBody } from './errors.js'
 import type { LabReplay, ProtocolEvent } from './events.js'
 
@@ -357,6 +357,16 @@ function labYardstick(skipped: boolean): NonNullable<LabRun['yardstick']> {
   })
   return { attackerWindow: 4, slotsSkipped: skipped ? 16 : 0, cblocks }
 }
+/** The bad lane skips in window 4 while the other two lanes keep every slot executable. */
+function labLanesYardstick(): NonNullable<LabRun['yardstick']> {
+  const yardstick = labYardstick(false)
+  return { ...yardstick, cblocks: yardstick.cblocks.map(cblock => {
+    const lanes = [1, 2, 3].map((proposer): LabYardstickLane => cblock.window === 4 && proposer === 3
+      ? { proposer, status: 'skipped', votes: { skip: 12 }, certificates: ['skip'] }
+      : { proposer, status: 'finalized', votes: { notar: 12, finalize: 12 }, certificates: ['notarization', 'slow_finalization'] })
+    return { ...cblock, lanes }
+  }) }
+}
 export const labRuns: LabRun[] = scenarios.map(scenario => {
   const skipped = ['last-look', 'equivocation', 'split-commitments'].includes(scenario.id)
   const slot = makeFixtureSlot(64, skipped ? 'skipped' : 'finalized', { crashedProposer: scenario.id === 'crash' ? 3 : undefined, skipReason: scenario.id === 'equivocation' ? 'equivocation' : 'disagreeing_vectors' })
@@ -369,26 +379,33 @@ export const labRunsByState: Record<LabRun['status'], LabRun> = {
   running: { ...labRuns[0]!, id: 'run-running', status: 'running', endedAt: null, outcome: null, evidence: [], yardstick: null },
   done: labRuns[0]!, failed_to_start: { ...labRuns[0]!, id: 'run-failed', status: 'failed_to_start', startedAt: null, endedAt: FIXTURE_TIME, outcome: null, evidence: [], yardstick: null, failure: 'The fixture sandbox could not acquire a runner.' },
 }
-/** Local agreement continues the split-commitment window; the lanes branch is not built yet. */
+/** Local agreement continues the split-commitment window; lanes isolate the faulty proposer. */
 export const windowContinuedEvidence: Evidence = { kind: 'window_continued', slot: 64, attackSlot: 64, proposer: 3,
   txId: null, description: 'The split commitment was resolved by local agreement; the window continued and finalized.',
   hashes: [], signatures: [], observedFragments: null, threshold: null, agreedSet: [1, 2, 3], finalized: true }
+export const laneSkippedEvidence: Evidence = { kind: 'lane_skipped', slot: 64, attackSlot: 64, proposer: 3,
+  txId: null, description: 'The attacker lane received a skip certificate; lanes 1 and 2 finalized and the window continued.',
+  hashes: [], signatures: [fixtureSignature('lane-3-skip-proof')], observedFragments: null, threshold: null,
+  agreedSet: [1, 2], finalized: true, skipCertificate: makeFixtureSlot(64, 'skipped').cblock.certificates[0]!, otherLanesFinalized: [1, 2] }
 const splitCommitmentRun = labRuns.find(run => run.scenario.id === 'split-commitments')!
 export const labRunsByProtocol: Record<LabProtocol, LabRun> = {
   today: splitCommitmentRun,
   agreement: { ...splitCommitmentRun, id: 'run-split-commitments-agreement', protocol: 'agreement',
     outcome: windowContinuedEvidence.description, evidence: [windowContinuedEvidence], yardstick: labYardstick(false) },
-  lanes: { ...splitCommitmentRun, id: 'run-split-commitments-lanes', protocol: 'lanes', status: 'failed_to_start',
-    startedAt: null, outcome: null, evidence: [], yardstick: null, failure: 'The lanes protocol is not built yet.' },
+  lanes: { ...splitCommitmentRun, id: 'run-split-commitments-lanes', protocol: 'lanes',
+    outcome: laneSkippedEvidence.description, evidence: [laneSkippedEvidence], yardstick: labLanesYardstick() },
 }
+export const labLanesCrashRun: LabRun = { ...labRuns.find(run => run.scenario.id === 'crash')!,
+  id: 'run-crash-lanes', protocol: 'lanes', yardstick: labLanesYardstick() }
 /** Every envelope keeps its own anchor; sequence orders a replay across overlapping slots. */
 export function makeLabReplay(run: LabRun): LabReplay {
-  const continues = run.protocol === 'agreement' && run.scenario.id === 'split-commitments'
+  const lanesSplit = run.protocol === 'lanes' && run.scenario.id === 'split-commitments'
+  const continues = (run.protocol === 'agreement' || lanesSplit) && run.scenario.id === 'split-commitments'
   const skipped = !continues && ['last-look', 'equivocation', 'split-commitments'].includes(run.scenario.id)
   const crash = run.scenario.id === 'crash'
   const count = crash || continues ? 16 : 4
   const slots = Array.from({ length: count }, (_, i) => makeFixtureSlot(64 + i, skipped ? 'skipped' : 'finalized', {
-    crashedProposer: crash ? 3 : undefined,
+    crashedProposer: crash || lanesSplit ? 3 : undefined,
     skipReason: run.scenario.id === 'equivocation' ? 'equivocation' : 'disagreeing_vectors',
   }))
   const timeline: { event: ProtocolEvent; offset: number }[] = []
@@ -399,6 +416,13 @@ export function makeLabReplay(run: LabRun): LabReplay {
   add('lab.updated', { ...run, status: 'running', endedAt: null, outcome: null, evidence: [], yardstick: null }, 0, null, 'stream')
   add('window.started', slots[0]!.window, 0, null, 'window')
   for (const slot of slots) {
+    if (lanesSplit) {
+      const healthy = makeFixtureSlot(slot.slot)
+      slot.window.proposers[2] = healthy.window.proposers[2]!
+      slot.blocks[2] = { ...healthy.blocks[2]!, status: 'dropped' }
+      slot.attestations = healthy.attestations
+      slot.blocks.forEach((block, index) => { block.attestation = slot.attestations[index]! })
+    }
     if (run.scenario.id === 'censorship') { slot.mergedOrder[0]!.sourceProposers = [3]; slot.mergedOrder[0]!.kind = 'plain'; slot.mergedOrder[0]!.n = 3; slot.mergedOrder[0]!.t = 1; slot.mergedOrder[0]!.fragmentIndices = [] }
     if (skipped && (run.scenario.id === 'equivocation' || run.scenario.id === 'split-commitments')) {
       const healthy = makeFixtureSlot(slot.slot)
@@ -407,7 +431,7 @@ export function makeLabReplay(run: LabRun): LabReplay {
       slot.window = healthy.window
       slot.skip!.disagreeingVectors = slot.attestations
     }
-    if (run.scenario.id === 'split-commitments' && (!continues || slot.slot === 64)) {
+    if (run.scenario.id === 'split-commitments' && (!continues || slot.slot === 64 || lanesSplit)) {
       const third = slot.blocks[2]!
       third.commitment!.sentUs = 54400
       third.commitment!.arrivals = third.commitment!.arrivals.filter(a => a.receiver === 1).map(a => ({ ...a, arrivedUs: 56400, relativeToStartUs: 6400, onTime: true }))
@@ -484,7 +508,7 @@ export function replayOffsetUs(event: ProtocolEvent, firstSlot = 64): number {
   if (event.anchor === 'consensus') return (Math.floor((event.slot ?? firstSlot) / 4) * 4 - firstSlot) * 50000 + event.atUs
   return event.atUs
 }
-export const labReplays = Object.fromEntries([...labRuns, labRunsByProtocol.agreement].map(run => [run.id, makeLabReplay(run)]))
+export const labReplays = Object.fromEntries([...labRuns, labRunsByProtocol.agreement, labRunsByProtocol.lanes, labLanesCrashRun].map(run => [run.id, makeLabReplay(run)]))
 export const specMap: z.infer<typeof SpecMap> = {
   paper: 'New Constellation v1.0 — Kniep and Wattenhofer, 2026-11-14', parameters: fixtureParameters,
   entries: [

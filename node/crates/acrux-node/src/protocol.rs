@@ -29,6 +29,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, RwLock};
+#[path="protocol_lanes.rs"]
+mod lane_protocol;
 
 /// Two minutes of 50 ms slots for followers catching up over an ordinary remote connection.
 const FOLLOWER_SLOTS: u64 = 2_400;
@@ -46,10 +48,12 @@ struct LocalSlot {
     payload: BTreeMap<usize, Vec<ValidatedTx>>,
     equivocation: bool,
     invalid_reason: Option<String>,
+    lane_execution_invalid: bool,
     executed: bool,
     agreed: Option<Vec<usize>>,
     /// The lab's control-plane decision, retained while Rotor supplies the selected data/keys.
     agreement: Option<crate::agreement::Agreement>,
+    lane_equivocation: BTreeSet<usize>,
     state_hash: Option<String>,
     /// Node zero's observed execution fees/time, published only with a durable checkpoint.
     burn: Option<crate::fee_burns::SlotBurn>,
@@ -85,6 +89,11 @@ struct Node {
     key: SigningKey,
     executor: Option<SvmExecutor>,
     votor: Votor,
+    lanes: Option<crate::lanes::Lanes>,
+    lane_votes: BTreeMap<(usize,Vec<u8>),SignedVote>,
+    lane_certificates: BTreeMap<(usize,u64,consensus::CertificateKind,Option<[u8;32]>),consensus::Certificate>,
+    lane_voted: BTreeSet<(usize,u64)>,
+    lane_proposed: BTreeMap<(usize,u64),BlockRef>,
     epoch_voting: crate::epoch_voting::EpochVoting,
     mempool: BTreeMap<String, ValidatedTx>,
     /// Transactions this node carried, by id: the slot, its role and the copy, until they execute.
@@ -512,6 +521,8 @@ pub(crate) fn observer_packet_slot(bytes: &[u8]) -> Option<u64> {
         Wire::Attest(attestation) => Some(attestation.slot),
         Wire::Vote(vote) => Some(vote.vote.slot * 4),
         Wire::Certificate { certificate,.. } => Some(certificate.slot * 4),
+        Wire::LaneVote { signed,.. } => Some(signed.vote.slot*4),
+        Wire::LaneCertificate { certificate,.. } => Some(certificate.slot*4),
         Wire::Handover { shreds,.. } => shreds.iter().map(|shred|shred.meta.slot).max(),
         Wire::Equivocation { first,.. } => Some(first.0.slot),
         Wire::Cblock(witness) => Some(witness.block.slot * 4),
@@ -834,6 +845,11 @@ impl Network {
                 key: keys[id].clone(),
                 executor: Some(executor),
                 votor,
+                lanes: config.fault.as_ref().is_some_and(|fault|fault.protocol=="lanes").then(||crate::lanes::Lanes::new(id,stakes.clone())).transpose()?,
+                lane_votes: BTreeMap::new(),
+                lane_certificates: BTreeMap::new(),
+                lane_voted: BTreeSet::new(),
+                lane_proposed: BTreeMap::new(),
                 epoch_voting: Default::default(),
                 mempool: BTreeMap::new(),
                 in_flight: BTreeMap::new(),
@@ -1320,7 +1336,8 @@ impl Network {
         })?[8..12]
             .to_vec();
         let receipt_tag=encode(&Envelope {from:0,body:Wire::CommitReceipt(CommitReceipt {slot:0,proposer:1,hash:[0;32]}),signature:vec![]})?[8..12].to_vec();
-        let attest_tag=if self.uses_local_agreement() {Some(encode(&Envelope{from:0,body:Wire::Attest(Attestation{slot:0,proposer:1,pi:vec![None;3],key:[0;32]}),signature:vec![]})?[8..12].to_vec())}else{None};
+        let lane_mode=self.uses_lanes();
+        let attest_tag=if self.uses_local_agreement()||lane_mode {Some(encode(&Envelope{from:0,body:Wire::Attest(Attestation{slot:0,proposer:1,pi:vec![None;3],key:[0;32]}),signature:vec![]})?[8..12].to_vec())}else{None};
         tokio::spawn(async move {
             while let Some(packet) = incoming.recv().await {
                 if packet.payload.get(8..12) != Some(commit_tag.as_slice()) && packet.payload.get(8..12)!=Some(receipt_tag.as_slice())
@@ -1358,7 +1375,8 @@ impl Network {
                             &&schedules.ids(attestation.slot/16).is_ok_and(|ids|ids[attestation.proposer-1]==envelope.from)
                     };
                     if !valid {tracing::warn!("Rejected agreement attester");continue}
-                    ingress_exchange.receive_attestation(packet.to,attestation.clone(),envelope.signature.clone(),packet.received_at);
+                    if lane_mode {ingress_exchange.receive_lane_attestation(packet.to,attestation.clone(),packet.received_at);}
+                    else {ingress_exchange.receive_attestation(packet.to,attestation.clone(),envelope.signature.clone(),packet.received_at);}
                     let destination=senders[packet.to].clone();
                     tokio::spawn(async move {let _=destination.send((packet,envelope)).await;});
                     continue;
@@ -1731,26 +1749,46 @@ impl Network {
                 "description":format!("The signed 2-of-3 agreement selected proposer blocks {agreed:?}; every cblock of the attacker's window finalized."),
                 "hashes":[],"signatures":[],"observedFragments":null,"threshold":null,"agreedSet":agreed,"finalized":true}))
         }else{None};
+        let lane_skipped=if fault.protocol=="lanes" {
+            self.nodes[0].lane_certificates.iter().find_map(|((lane,cblock,kind,_),certificate)| {
+                if *lane!=fault.attacker || *cblock/4!=w || *kind!=consensus::CertificateKind::Skip || !self.final_cblocks.contains_key(cblock) {return None}
+                let decision=self.nodes[0].lanes.as_ref().unwrap().decisions(*cblock)?;
+                let others=(1..=3).filter(|role|*role!=fault.attacker).collect::<Vec<_>>();
+                if decision.proposers!=others {return None}
+                let proofs=certificate.votes.iter().filter_map(|vote|self.nodes[0].lane_votes.get(&(*lane,encode(vote).unwrap()))).map(|proof|bs58::encode(&proof.signature).into_string()).collect::<Vec<_>>();
+                Some(json!({"kind":"lane_skipped","slot":cblock*4,"proposer":lane,"txId":null,
+                    "description":format!("Proposer {lane}'s lane has a skip certificate; lanes {others:?} finalized and their merged cblock finalized."),
+                    "hashes":decision.hashes.iter().flatten().map(hex::encode).collect::<Vec<_>>(),"signatures":proofs,"observedFragments":null,"threshold":null,
+                    "skipCertificate":view::certificate_json(certificate,&self.voting_set(*cblock).ok()?.0,&self.voting_set(*cblock).ok()?.1,self.consensus_time(0,*cblock),None),
+                    "otherLanesFinalized":others}))
+            })
+        }else{None};
         match fault.scenario.as_str() {
             "last-look" => {
                 if let Some(late) = self.exchange.omitted_commitments().into_iter().find(|o| o["slot"].as_u64().is_some_and(|s| s / 16 == w) && o["omittedProposers"].as_array().is_some_and(|p| p.contains(&json!(fault.attacker)))) {
                     evidence.push(json!({"kind":"late_block_dropped","slot":late["slot"],"proposer":fault.attacker,"txId":null,"description":format!("Proposer {} committed 28 ms late; its co-proposers attested it as late (deadline {} us after start), so its block can only be dropped.", fault.attacker, 20_000),"hashes":[],"signatures":[],"observedFragments":null,"threshold":null}));
                 }
-                if fault.protocol=="agreement" {
+                if fault.protocol=="lanes" {
+                    if let Some(lane_skipped)=lane_skipped.clone() {evidence.push(lane_skipped);}
+                } else if fault.protocol=="agreement" {
                     if let Some(continued)=continued.clone() {evidence.push(continued);}
                 } else if let Some(i) = skipped.first() {
                     evidence.push(skip(i * 4, "The late proposer's own attestation disagrees with its co-proposers' vectors, so no set is agreed and the cblock is skip-certified."));
                 }
             }
             "split-commitments" => {
-                if fault.protocol=="agreement" {
+                if fault.protocol=="lanes" {
+                    if let Some(lane_skipped)=lane_skipped.clone() {evidence.push(lane_skipped);}
+                } else if fault.protocol=="agreement" {
                     if let Some(continued)=continued {evidence.push(continued);}
                 } else if let Some(i) = skipped.first() {
                     evidence.push(skip(i * 4, "Co-proposer 1 attested the attacker's commitment and co-proposer 2 never received it: the vectors differ, no set is agreed, and the cblock is skip-certified."));
                 }
             }
             "equivocation" => {
-                if let Some(i) = skipped.first() {
+                if fault.protocol=="lanes" {
+                    if let Some(lane_skipped)=lane_skipped {evidence.push(lane_skipped);}
+                } else if let Some(i) = skipped.first() {
                     evidence.push(skip(i * 4, "Validators that saw the slashing proof cannot agree on the slot (Agreed (d)), and the cblock is skip-certified."));
                 }
             }
@@ -1777,11 +1815,14 @@ impl Network {
             other => anyhow::bail!("Unknown Fault Lab scenario {other}"),
         }
         let expected: &[&str] = match fault.scenario.as_str() {
+            "last-look" if fault.protocol=="lanes" => &["late_block_dropped", "lane_skipped"],
             "last-look" if fault.protocol=="agreement" => &["late_block_dropped", "window_continued"],
             "last-look" => &["late_block_dropped", "skip_certificate"],
             "censorship" => &["transaction_included"],
             "crash" => &["two_proposers_continue"],
+            "equivocation" if fault.protocol=="lanes" => &["slashing_proof", "lane_skipped"],
             "equivocation" => &["slashing_proof", "skip_certificate"],
+            "split-commitments" if fault.protocol=="lanes" => &["lane_skipped"],
             "split-commitments" if fault.protocol=="agreement" => &["window_continued"],
             "split-commitments" => &["skip_certificate"],
             _ => &["unreadable_fragment"],
@@ -1811,7 +1852,9 @@ impl Network {
                 }).collect::<BTreeSet<_>>();
                 let finalized = self.final_cblocks.get(&c);
                 let status = if self.skipped.contains(&c) { "skipped" } else if finalized.is_some() { "finalized" } else { "pending" };
-                json!({"cblock":c,"window":c/4,"status":status,"skipped":self.skipped.contains(&c),"votes":votes,"certificates":certificates,"finalizedUs":finalized})
+                let mut row=json!({"cblock":c,"window":c/4,"status":status,"skipped":self.skipped.contains(&c),"votes":votes,"certificates":certificates,"finalizedUs":finalized});
+                if fault.protocol=="lanes" {row["lanes"]=self.lane_yardstick(c);}
+                row
             }).collect::<Vec<_>>();
             json!({"attackerWindow":w,"slotsSkipped":skipped.len() * 4,"cblocks":cblocks})
         };
@@ -2059,6 +2102,11 @@ impl Network {
                 let below = finalized.slot.saturating_sub(held_cblocks).min(proof_floor.unwrap_or(u64::MAX));
                 if below > node.votor.pruned_below() {
                     node.votor.prune(below);
+                    if let Some(lanes)=&mut node.lanes {lanes.prune(below);}
+                    node.lane_votes.retain(|_,signed|signed.vote.slot>=below);
+                    node.lane_certificates.retain(|(_,slot,_,_),_|*slot>=below);
+                    node.lane_voted.retain(|(_,slot)|*slot>=below);
+                    node.lane_proposed.retain(|(_,slot),_|*slot>=below);
                     node.slots = node.slots.split_off(&(below * 4));
                     node.votes.retain(|_, v| v.vote.slot >= below);
                     node.seen_certificates = node.seen_certificates.split_off(&(below, consensus::CertificateKind::Notarization, None));
@@ -2381,6 +2429,7 @@ impl Network {
                     if let Some(a) = pile.iter().find(|a| a.index == shred.index) {
                         if a.root != shred.root || a.meta != shred.meta || a.data != shred.data {
                             local.equivocation = true;
+                            local.lane_equivocation.insert(q);
                             self.store.put(
                                 &format!("equivocation/block/{s}/{q}"),
                                 &json!({"first":a,"second":shred}),
@@ -2393,6 +2442,7 @@ impl Network {
                         .map_or(false, |a| a.root != shred.root || a.meta != shred.meta)
                     {
                         local.equivocation = true;
+                        local.lane_equivocation.insert(q);
                         self.store.put(
                             &format!("equivocation/block/{s}/{q}"),
                             &json!({"first":pile[0],"second":shred}),
@@ -2410,7 +2460,7 @@ impl Network {
                         let cipher=match cipher {
                             Ok(cipher)=>cipher,
                             Err(error)=>{
-                                local.invalid_reason=Some(error.to_string());local.equivocation=true;
+                                local.invalid_reason=Some(error.to_string());local.equivocation=true;local.lane_equivocation.insert(q);
                                 if origin>=12 {
                                     if let Some(server)=self.transport.external_server() {
                                         let key:[u8;32]=bs58::decode(&self.identities[origin]).into_vec()?.try_into().unwrap();
@@ -2472,6 +2522,7 @@ impl Network {
                 if let Some((_, prev, _)) = local.received.get(&c.proposer) {
                     if prev.hash != c.hash {
                         local.equivocation = true;
+                        local.lane_equivocation.insert(c.proposer);
                         step.persist.push((format!("equivocation/{s}/{}",c.proposer),json!({"first":prev,"second":c,"firstSignature":local.received[&c.proposer].2,"secondSignature":e.signature})));
                     }
                     if !step.persist.is_empty() {
@@ -2497,6 +2548,8 @@ impl Network {
                 if let Some((old, _)) = local.attest.get(&a.proposer) {
                     if old.pi != a.pi || old.key != a.key {
                         local.equivocation = true;
+                        if old.key!=a.key {local.lane_equivocation.insert(a.proposer);}
+                        for (role,(before,after)) in old.pi.iter().zip(&a.pi).enumerate() {if before!=after {local.lane_equivocation.insert(role+1);}}
                         self.store.put(&format!("equivocation/attestation/{s}/{}",a.proposer),&json!({"first":old,"second":a,"firstSignature":local.attest[&a.proposer].1,"secondSignature":e.signature}))?;
                     }
                     return Ok(());
@@ -2519,10 +2572,43 @@ impl Network {
                 let s = first.0.slot;
                 let local = self.nodes[id].slots.entry(s).or_default();
                 local.equivocation = true;
+                local.lane_equivocation.insert(first.0.proposer);
                 let mut evidence = self.lab_evidence.lock().unwrap();
                 if !evidence.iter().any(|e| e["kind"] == "slashing_proof") {
                     evidence.push(json!({"kind":"slashing_proof","slot":s,"proposer":first.0.proposer,"txId":null,"description":"Two commitments for one slot, both signed by the same proposer: a slashing proof. Agreement fails and the cblock is skipped.","hashes":[hex::encode(first.0.hash),hex::encode(second.0.hash)],"signatures":[bs58::encode(&first.1).into_string(),bs58::encode(&second.1).into_string()],"observedFragments":null,"threshold":null}));
                 }
+            }
+            Wire::LaneVote{lane,signed}=>{
+                ensure!(self.uses_lanes()&&(1..=3).contains(&lane),"Lane vote outside the lab lanes protocol");
+                let key=self.voter_key(signed.vote.slot,signed.vote.validator)?;
+                ensure!(self.identities.get(e.from).is_some_and(|identity|*identity==bs58::encode(key.as_bytes()).into_string()),"Wrong lane vote sender");
+                let message=lane_vote_message(lane,&signed.vote)?;
+                let digest=crypto::hash(&[key.as_bytes().as_slice(),&message,&signed.signature].concat());
+                if !verified_cached(digest) {crypto::verify_bytes(&key,&message,&signed.signature)?;remember_verified(digest);}
+                let encoded=encode(&signed.vote)?;
+                if self.nodes[id].lane_votes.contains_key(&(lane,encoded.clone())) {return Ok(())}
+                let actions=self.nodes[id].lanes.as_mut().unwrap().receive(lane,consensus::Message::Vote(signed.vote.clone()))?;
+                self.nodes[id].lane_votes.insert((lane,encoded),signed);
+                self.lane_actions(id,actions,&mut step)?;
+            }
+            Wire::LaneCertificate{lane,certificate,proofs}=>{
+                ensure!(self.uses_lanes()&&(1..=3).contains(&lane),"Lane certificate outside the lab lanes protocol");
+                let index=(lane,certificate.slot,certificate.kind,certificate.hash);
+                if self.nodes[id].lane_certificates.contains_key(&index) {return Ok(())}
+                ensure!(certificate.votes.len()==proofs.len(),"Lane certificate is missing signed votes");
+                self.nodes[id].lanes.as_ref().unwrap().validate_certificate(lane,&certificate)?;
+                for (vote,proof) in certificate.votes.iter().zip(&proofs) {
+                    ensure!(*vote==proof.vote,"Lane certificate proof differs from its vote");
+                    let key=self.voter_key(vote.slot,vote.validator)?;
+                    let message=lane_vote_message(lane,vote)?;
+                    let digest=crypto::hash(&[key.as_bytes().as_slice(),&message,&proof.signature].concat());
+                    if !verified_cached(digest) {crypto::verify_bytes(&key,&message,&proof.signature)?;remember_verified(digest);}
+                }
+                let actions=self.nodes[id].lanes.as_mut().unwrap().receive(lane,consensus::Message::Certificate(certificate.clone()))?;
+                for proof in &proofs {self.nodes[id].lane_votes.insert((lane,encode(&proof.vote)?),proof.clone());}
+                self.nodes[id].lane_certificates.insert(index,certificate.clone());
+                step.out.push(Outbox{from:id,to:(0..12).filter(|to|*to!=id&&*to!=e.from).collect(),body:Wire::LaneCertificate{lane,certificate,proofs}});
+                self.lane_actions(id,actions,&mut step)?;
             }
             Wire::Vote(signed) => {
                 if self.nodes[id].votes.contains_key(&encode(&signed.vote)?) {
@@ -2680,6 +2766,8 @@ impl Network {
                     if let Some((old, _)) = local.attest.get(&att.proposer) {
                         if old.pi != att.pi || old.key != att.key {
                             local.equivocation = true;
+                            if old.key!=att.key {local.lane_equivocation.insert(att.proposer);}
+                            for (role,(before,after)) in old.pi.iter().zip(&att.pi).enumerate() {if before!=after {local.lane_equivocation.insert(role+1);}}
                         }
                     } else {
                         local.attest.insert(att.proposer, (att, signature));
@@ -2690,8 +2778,11 @@ impl Network {
         self.dispatch(id, step).await
     }
     fn uses_local_agreement(&self)->bool {self.config.fault.as_ref().is_some_and(|fault|fault.protocol=="agreement")}
+    fn uses_lanes(&self)->bool {self.config.fault.as_ref().is_some_and(|fault|fault.protocol=="lanes")}
     async fn try_execute(&mut self, id: usize, w: u64) -> Result<()> {
         let local_agreement=self.uses_local_agreement();
+        let lane_mode=self.uses_lanes();
+        if lane_mode {self.try_lanes(id,w).await?;}
         let _phase = self.profile.measure(Some(id), "validator.scan");
         let certified_skip = self.nodes[id]
             .seen_certificates
@@ -2744,7 +2835,14 @@ impl Network {
                 .collect::<Vec<_>>();
             let agree_start = Instant::now();
             let equivocation=local.equivocation;
-            let agreed = if local_agreement {
+            let agreed = if lane_mode {
+                self.nodes[id].lanes.as_ref().unwrap().decisions(s/4).filter(|decision|!decision.proposers.is_empty()).and_then(|decision| {
+                    self.exchange.lane_snapshot(id,s).map(|inputs| {
+                        let pi=inputs.hashes.into_iter().enumerate().map(|(role,hash)|if decision.proposers.contains(&(role+1)){hash}else{None}).collect();
+                        (decision.proposers,pi)
+                    })
+                })
+            } else if local_agreement {
                 local.agreement.as_ref().filter(|_|!local.equivocation).map(|decision|(decision.proposers.clone(),decision.pi.clone()))
             } else {
                 crate::agreement::agreed(&attestations, equivocation).map(|accepted|(accepted,attestations[0].pi.clone()))
@@ -2755,7 +2853,7 @@ impl Network {
                 break;
             };
             let local=&self.nodes[id].slots[&s];
-            if s % 16 != 0 && self.nodes[id].slots[&(s - 1)].agreed.as_ref() != Some(&accepted) {
+            if !lane_mode && s % 16 != 0 && self.nodes[id].slots[&(s - 1)].agreed.as_ref() != Some(&accepted) {
                 break;
             }
             let mut payloads = vec![];
@@ -2870,6 +2968,7 @@ impl Network {
             if !complete {
                 if let Some(reason) = invalid_reason {
                     self.nodes[id].slots.get_mut(&s).unwrap().invalid_reason = Some(reason);
+                    if lane_mode {self.nodes[id].slots.get_mut(&s).unwrap().lane_execution_invalid=true;}
                 }
                 break;
             }
@@ -3290,6 +3389,7 @@ impl Network {
     }
     async fn try_vote(&mut self, id: usize, w: u64) -> Result<()> {
         let local_agreement=self.uses_local_agreement();
+        let lane_mode=self.uses_lanes();
         let _phase = self.profile.measure(Some(id), "validator.vote");
         for i in w * 4..w * 4 + 4 {
             // Timeouts insert their Skip vote immediately too, so they need the same
@@ -3301,7 +3401,10 @@ impl Network {
             }
             let now = Instant::now();
             let run = self.nodes[id].windows[&w];
-            let expired = elapsed(run.start) >= 750000 + (i - w * 4 + 1) * 200000 + 50000;
+            // Content consensus has its own deadlines. Execution cannot skip a
+            // cblock merely because those lane decisions are still in flight.
+            let expired = !lane_mode && elapsed(run.start) >= 750000 + (i - w * 4 + 1) * 200000 + 50000;
+            let all_lanes_skipped=lane_mode&&self.nodes[id].lanes.as_ref().unwrap().decisions(i).is_some_and(|decision|decision.proposers.is_empty());
             let slots = (i * 4..i * 4 + 4).collect::<Vec<_>>();
             if local_agreement {for slot in &slots {
                 if self.exchange.agreement_snapshot(id,*slot).is_some_and(|snapshot|snapshot.equivocation) {
@@ -3317,14 +3420,14 @@ impl Network {
                 });
             let disagreement = slots.iter().any(|s| {
                 self.nodes[id].slots.get(s).map_or(false, |x| {
-                    x.equivocation
+                    if lane_mode {x.lane_execution_invalid} else {x.equivocation
                         || x.invalid_reason.is_some()
                         || (!local_agreement && x.attest
                             .values()
                             .map(|(a, _)| &a.pi)
                             .collect::<BTreeSet<_>>()
                             .len()
-                            > 1)
+                            > 1)}
                 })
             });
             let mut step = Step::new();
@@ -3379,7 +3482,9 @@ impl Network {
                     .collect::<Vec<_>>();
                 // From the bridge's first slot the hash also commits to the cblock's outbox root,
                 // which Solana's light client proves outbox entries against.
-                let preimage = encode(&(i, parent, accepted, &state))?;
+                let preimage = if lane_mode {
+                    encode(&(b"acrux-lab-lanes-cblock-v1".as_slice(),i,parent,self.nodes[id].lanes.as_ref().unwrap().decisions(i).unwrap().hashes,&state))?
+                } else {encode(&(i, parent, accepted, &state))?};
                 let mut witness_outbox_root = None;
                 let hash = if self.bridge_open(i * 4) {
                     let mut outbox = self.outbox(id,i)?;
@@ -3457,7 +3562,7 @@ impl Network {
                 });
             } else if already_voted {
                 continue;
-            } else if expired || disagreement || run.skipped_from.is_some() {
+            } else if all_lanes_skipped || expired || disagreement || (run.skipped_from.is_some()&&(!lane_mode||self.nodes[id].lanes.as_ref().unwrap().decisions(i).is_some())) {
                 actions = self.nodes[id].votor.timeout(i)?;
                 self.nodes[id]
                     .windows

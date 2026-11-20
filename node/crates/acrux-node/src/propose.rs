@@ -457,6 +457,7 @@ impl Observer {
             epoch <= from / proposers.config.epoch_slots || proposers.admissions.contains_key(&epoch)
         };
         Ok(match wire {
+            Wire::LaneVote{..}|Wire::LaneCertificate{..}=>anyhow::bail!("Lab lane frames are not accepted by public observers"),
             Wire::Vote(vote) => known(vote.vote.slot),
             Wire::Certificate {certificate,..} => known(certificate.slot),
             Wire::Shreds(shreds) | Wire::Relay(shreds) => shreds.iter().all(|shred|known(shred.meta.slot / 4)),
@@ -489,6 +490,7 @@ impl Observer {
         crypto::verify_bytes(key, &bincode::serialize(&envelope.body)?, &envelope.signature).context("Invalid wire envelope signature")?;
         self.seen.insert(digest, slot);
         match envelope.body {
+            Wire::LaneVote{..}|Wire::LaneCertificate{..}=>anyhow::bail!("Lab lane frames are not accepted by public observers"),
             Wire::Shreds(shreds) | Wire::Relay(shreds) => for shred in shreds { self.shred(shred)?; },
             Wire::Commit(commitment) => {
                 self.commitment(commitment.clone(), None, Some(envelope.from))?;

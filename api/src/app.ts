@@ -8,7 +8,7 @@ import {
   type LabRun, type ProtocolEvent, type Transaction,
 } from '@acrux/contract'
 import {
-  facts, genesisShare, genesisShareGenesisOnly, hubEarnings, outsideHubEarnings, hubEarningsEmpty, faucetGrant, faucetStatus, fixtureErrors, hubs, labRuns, labRunsByState,
+  facts, genesisShare, genesisShareGenesisOnly, hubEarnings, outsideHubEarnings, hubEarningsEmpty, faucetGrant, faucetStatus, fixtureErrors, hubs, labRuns, labRunsByState, labRunsByProtocol, labLanesCrashRun,
   makeFixtureTransaction, makeLabReplay, makeSchedulePreview, registryConfig, scenarios, externalBlockTransaction,
   specMap, transactionsByState, replayRange, replaySlot, burnNoEpochs, burnPending, burnBurned, burnRunning, bridgeFixture, bridgeWaitingFixture, bridgeTransfersFixture,
 } from '@acrux/contract/fixtures'
@@ -174,8 +174,11 @@ export function createFixtureApi() {
     return c.json(paginate(rows, readQuery(c, PageQuery)))
   })
   app.post('/v1/lab/runs', async c => {
-    const input = await readJson(c, LabRunRequest), template = labRuns.find(run => run.scenario.id === input.scenario)!
-    return c.json(lab.start(template, input.seed ?? template.seed, c.get('scenario') === 'failed_to_start'), 201)
+    const input = await readJson(c, LabRunRequest)
+    const template = input.scenario === 'split-commitments'
+      ? labRunsByProtocol[input.protocol]
+      : input.protocol === 'lanes' && input.scenario === 'crash' ? labLanesCrashRun : labRuns.find(run => run.scenario.id === input.scenario)!
+    return c.json(lab.start(template, input.seed ?? template.seed, c.get('scenario') === 'failed_to_start', input.protocol), 201)
   })
   const readRun = (id: string, scenario: Scenario | null) => {
     const record = lab.get(id)

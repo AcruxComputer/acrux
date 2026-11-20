@@ -96,6 +96,7 @@ pub struct ExchangeEngine {
     slots: Mutex<BTreeMap<(usize, u64), Exchange>>,
     /// Lab-only signed agreement views, collected independently of SVM actor queues.
     agreement: Mutex<BTreeMap<(usize,u64),crate::agreement::Round>>,
+    lanes: Mutex<BTreeMap<(usize,u64),crate::lanes::Round>>,
     spreads: Mutex<SpreadMeasurements>,
     omitted: Mutex<Vec<serde_json::Value>>,
     commit_times: Mutex<BTreeMap<u64, Instant>>,
@@ -127,6 +128,7 @@ impl ExchangeEngine {
             gateway,
             slots: Mutex::new(BTreeMap::new()),
             agreement: Mutex::new(BTreeMap::new()),
+            lanes: Mutex::new(BTreeMap::new()),
             spreads: Mutex::new(SpreadMeasurements::default()),
             omitted: Mutex::new(Vec::new()),
             commit_times: Mutex::new(BTreeMap::new()),
@@ -153,6 +155,7 @@ impl ExchangeEngine {
             gateway,
             slots: Mutex::new(BTreeMap::new()),
             agreement: Mutex::new(BTreeMap::new()),
+            lanes: Mutex::new(BTreeMap::new()),
             spreads: Mutex::new(SpreadMeasurements::default()),
             omitted: Mutex::new(Vec::new()),
             commit_times: Mutex::new(BTreeMap::new()),
@@ -179,6 +182,12 @@ impl ExchangeEngine {
     }
     pub(crate) fn agreement_snapshot(&self,owner:usize,slot:u64)->Option<crate::agreement::Snapshot> {
         self.agreement.lock().unwrap().get_mut(&(owner,slot)).map(|round|round.snapshot(Instant::now()))
+    }
+    pub(crate) fn receive_lane_attestation(&self,owner:usize,attestation:Attestation,at:Instant) {
+        self.lanes.lock().unwrap().entry((owner,attestation.slot)).or_default().record(attestation,at);
+    }
+    pub(crate) fn lane_snapshot(&self,owner:usize,slot:u64)->Option<crate::lanes::Inputs> {
+        self.lanes.lock().unwrap().get_mut(&(owner,slot)).and_then(|round|round.snapshot(Instant::now()))
     }
 
     pub fn metrics_json(&self)->serde_json::Value { self.metrics.json() }
