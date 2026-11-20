@@ -384,6 +384,8 @@ pub struct SvmExecutor {
     /// Rule-owned minimum accounts enter committed state at the bridge activation slot.
     bridge_minimums: Option<(u64, Vec<MinimumWithdrawal>)>,
     native_cutover: Option<NativeCutover>,
+    /// SPL Token's native mint, placed from this slot so lamports wrap as they do on Solana.
+    native_mint_from: Option<u64>,
     stake_config: Option<StakeConfig>,
     admission_config: Option<AdmissionConfig>,
     fee_burn_config: Option<FeeBurnConfig>,
@@ -595,6 +597,7 @@ impl SvmExecutor {
             credits: vec![],
             bridge_minimums: None,
             native_cutover: None,
+            native_mint_from: None,
             stake_config: None,
             admission_config: None,
             fee_burn_config: None,
@@ -977,6 +980,31 @@ impl SvmExecutor {
 
     pub fn set_native_cutover(&mut self, rule: NativeCutover) {
         self.native_cutover = Some(rule);
+    }
+
+    pub fn set_native_mint_from(&mut self, slot: u64) {
+        self.native_mint_from = Some(slot);
+    }
+
+    /// Solana's native mint at `So11111111111111111111111111111111111111112`: 9 decimals, initialized,
+    /// no authorities, supply 0. Its rent joins the native reserve, so circulating ACRUX is unchanged.
+    fn apply_native_mint(&mut self, slot: u64) -> Result<()> {
+        if self.native_mint_from.is_none_or(|from| slot < from) { return Ok(()) }
+        let key = native_mint_id();
+        let mut data = vec![0u8; 82];
+        data[44] = 9;
+        data[45] = 1;
+        if self.svm.get_account(&key).is_some_and(|account| account.owner == spl_token_id() && account.data == data) { return Ok(()) }
+        let before = self.total_lamports()?;
+        let lamports = self.svm.get_account(&key).map_or(0, |account| account.lamports).max(self.rent_exempt_minimum(data.len()));
+        self.put(key, Account { lamports, data, owner: spl_token_id(), executable: false, rent_epoch: 0 })?;
+        if let (Some(bridge), Some(mut gate)) = (self.bridge, self.native_gate()?) {
+            let added = self.total_lamports()?.checked_sub(before).context("Native mint placement reduced lamports")?;
+            let reserve = u64::from_le_bytes(gate.data[64..72].try_into().unwrap()).checked_add(added).context("Native mint reserve overflow")?;
+            gate.data[64..72].copy_from_slice(&reserve.to_le_bytes());
+            self.put(bridge_native(&bridge), gate)?;
+        }
+        Ok(())
     }
 
     pub fn set_fee_burn_config(&mut self, rule: FeeBurnConfig) {
@@ -1840,6 +1868,7 @@ impl SvmExecutor {
         self.apply_placements(slot)?;
         self.apply_bridge_minimums(slot)?;
         self.apply_native_cutover(slot)?;
+        self.apply_native_mint(slot)?;
         self.apply_credits()?;
         self.prepare_fee_burn_epoch(slot)?;
         let mut merged = BTreeMap::<String, ExecutionItem>::new();
@@ -2246,6 +2275,10 @@ fn account_digest(key: &Pubkey, account: &Account) -> [u8; 32] {
 
 fn spl_token_id() -> Pubkey {
     Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap()
+}
+
+fn native_mint_id() -> Pubkey {
+    Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap()
 }
 
 fn spl_token_2022_id() -> Pubkey {
@@ -2928,6 +2961,27 @@ mod tests {
         assert_eq!(executor.svm.get_account(&configuration).unwrap(),live_configuration,"mutable placement state is not reset by a later slot");
         assert_eq!(executor.svm.get_account(&upgraded[0].0).unwrap(),donated_program_data,"donations do not trigger code re-placement");
         assert_eq!(loaded.balance(&alice.to_string()).unwrap(),21_000);
+    }
+
+    #[test]
+    fn native_mint_is_placed_from_its_slot_with_its_rent_in_the_native_reserve() {
+        let bridge = Pubkey::new_unique();
+        let mut executor = SvmExecutor::new([],&[]).unwrap();
+        executor.set_bridge(bridge);
+        executor.set_native_cutover(NativeCutover { slot:4,solana_mint:Pubkey::new_unique(),lamports_per_base_unit:1000 });
+        executor.set_native_mint_from(8);
+        for slot in 3..8 { executor.execute_slot(slot,vec![]).unwrap(); }
+        assert!(executor.svm.get_account(&native_mint_id()).is_none(),"no native mint before its slot");
+        let before = executor.native_supply().unwrap().unwrap();
+        executor.execute_slot(8,vec![]).unwrap();
+        let mint = executor.svm.get_account(&native_mint_id()).unwrap();
+        assert_eq!((mint.owner,mint.data.len(),mint.data[44],mint.data[45]),(spl_token_id(),82,9,1));
+        assert!(mint.data[..44].iter().chain(&mint.data[46..]).all(|byte| *byte == 0),"no authorities and supply 0");
+        let after = executor.native_supply().unwrap().unwrap();
+        assert_eq!(after.circulating_lamports,before.circulating_lamports,"its rent joins the reserve");
+        assert_eq!(after.reserve_lamports,before.reserve_lamports + mint.lamports);
+        executor.execute_slot(9,vec![]).unwrap();
+        assert_eq!(executor.native_supply().unwrap().unwrap().reserve_lamports,after.reserve_lamports,"placed once");
     }
 
     #[test]

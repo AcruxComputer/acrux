@@ -30,7 +30,7 @@ const responseFixtures = {
   Commitment: slot.blocks[0].commitment, Attestation: slot.attestations[0], ProposerBlock: slot.blocks[0],
   TxHeader: transaction.header, FragmentInclusion: transaction.fragments[0], MergedTransaction: slot.mergedOrder[0],
   Placement: slot.schedule.placements[0], ExecutionSchedule: slot.schedule, Skip: f.slotsByState.skipped.skip,
-  Vote: slot.cblock.votes[0], Certificate: slot.cblock.certificates[0], Cblock: slot.cblock, Slot: slot,
+  Vote: slot.cblock.votes[0], Certificate: slot.cblock.certificates[0], CblockLane: f.lanesActivatedSlot.cblock.lanes[0], Cblock: f.lanesActivatedSlot.cblock, Slot: f.lanesActivatedSlot,
   TxFees: { base: '5000', priority: '100', inclusion: '3000', burned: '2500', total: '8100' },
   Transaction: transaction, Counters: snapshot.counters, NetSnapshot: snapshot,
   Balance: f.makeFixtureBalance(), DemoMint: f.demoPool.mints[0], DemoPool: f.demoPool, Quote: quote,
@@ -142,6 +142,12 @@ const oldFacts = olderFacts.parse(withAdditions(s.Facts, f.factsWithOutside))
 assert.equal(Object.hasOwn(oldFacts, 'hashExchange'), false)
 assert.equal(Object.hasOwn(oldFacts, 'commitSpreadByLinkUs'), false)
 acceptsAdditions('older-shaped Facts fixture', s.Facts, oldFacts)
+const olderCblock = s.Cblock.omit({ lanes: true })
+const oldCblock = olderCblock.parse(withAdditions(s.Cblock, f.lanesActivatedSlot.cblock))
+assert.equal(Object.hasOwn(oldCblock, 'lanes'), false, 'An older-shaped Cblock reader strips additive lane data')
+acceptsAdditions('older-shaped Cblock fixture', s.Cblock, oldCblock)
+acceptsAdditions('pre-activation Slot fixture', s.Slot, f.lanesActivationFixture.before)
+
 // Old stored runs predate the optional protocol label; new requests default to today's branch.
 const { protocol: _protocol, ...olderRun } = f.labRuns[0]
 acceptsAdditions('older-shaped LabRun', s.LabRun, olderRun)
@@ -188,6 +194,7 @@ assert.equal(StreamCommand.safeParse({ version: 1, type: 'subscribe', filter: { 
 // A value a newer API adds to a response enum parses as its string; the same value in a request is refused.
 const future = 'future_value'
 const newerValues = [
+  ['CblockLane.status', s.CblockLane, { ...f.lanesActivatedSlot.cblock.lanes[0], status: future }],
   ['Evidence.kind', s.Evidence, { ...f.labRuns[0].evidence[0], kind: future }],
   ['LabRun.protocol', s.LabRun, { ...f.labRuns[0], protocol: future }],
   ['LabScenario.id', s.LabScenario, { ...f.scenarios[0], id: future }],
@@ -206,4 +213,4 @@ for (const [name, value] of [['LabRunRequest.protocol', { scenario: 'crash', pro
 assert.equal(s.BridgeTransfersQuery.safeParse({ kind: future }).success, false, 'BridgeTransfersQuery.kind refuses a value it does not know')
 console.log(JSON.stringify({ check: 'response-compatibility', responseObjects: objectResponses.length, auxiliaryResponses: 14,
   eventVariants: events.size, rpcResults: Object.keys(rpcMethods).length, nestedResponseObjects: objectSites,
-  strictRequestCases: requests.length, strictNestedRequests: 3, olderShapes: 4, newerEnumValues: newerValues.length, result: 'passed' }))
+  strictRequestCases: requests.length, strictNestedRequests: 3, olderShapes: 5, newerEnumValues: newerValues.length, result: 'passed' }))

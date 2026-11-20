@@ -1,10 +1,10 @@
-//! Fault Lab lanes: independent content decisions, followed by the existing SVM merge.
+//! Independent lane content certificates, followed by the existing SVM merge.
 //! The caller authenticates lane-tagged votes and certificate proofs before delivery.
 use crate::consensus::{
-    Action, Block, BlockRef, Certificate, CertificateKind, ConsensusError, Hash, Message, Votor,
+    Action, Block, BlockRef, Certificate, ConsensusError, Hash, Message, Votor,
     CONSENSUS_SLOTS_PER_WINDOW,
 };
-use std::{collections::BTreeMap, time::{Duration, Instant}};
+use std::{collections::{BTreeMap, BTreeSet}, time::{Duration, Instant}};
 
 type Result<T> = std::result::Result<T, ConsensusError>;
 
@@ -109,7 +109,19 @@ pub(crate) struct AcceptedLanes {
     pub(crate) hashes: Vec<Option<Hash>>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct StakeSet {
+    own: Option<usize>,
+    stakes: Vec<u64>,
+}
+
 pub(crate) struct Lanes {
+    windows: BTreeMap<u64, Window>,
+    stake_sets: BTreeMap<u64, StakeSet>,
+}
+
+struct Window {
+    anchor: Option<BlockRef>,
     lanes: Vec<Lane>,
 }
 
@@ -117,112 +129,204 @@ struct Lane {
     votor: Votor,
     blocks: BTreeMap<BlockRef, Block>,
     decisions: BTreeMap<u64, Option<Hash>>,
+    ready: BTreeMap<u64, Option<Hash>>,
+    certified: BTreeSet<BlockRef>,
     parents: BTreeMap<u64, Option<BlockRef>>,
 }
 
 impl Lanes {
-    pub(crate) fn new(own: usize, stakes: Vec<u64>) -> Result<Self> {
+    pub(crate) fn new(own: Option<usize>, stakes: Vec<u64>) -> Result<Self> {
+        Self::validate_stakes(own, &stakes)?;
+        Ok(Self {
+            windows: BTreeMap::new(),
+            stake_sets: BTreeMap::from([(0, StakeSet { own, stakes })]),
+        })
+    }
+
+    pub(crate) fn install_stakes(&mut self, from: u64, own: Option<usize>, stakes: Vec<u64>) -> Result<()> {
+        Self::validate_stakes(own, &stakes)?;
+        let set = StakeSet { own, stakes };
+        if self.stake_sets.get(&from) == Some(&set) {
+            return Ok(());
+        }
+        if self.stake_sets.contains_key(&from) {
+            return Err(ConsensusError("an installed lane validator set is immutable".into()));
+        }
+        let mut sets = self.stake_sets.clone();
+        sets.insert(from, set);
+        for (first, window) in &mut self.windows {
+            let (effective_from, effective) = sets.range(..=*first).next_back().unwrap();
+            for lane in &mut window.lanes {
+                if lane.votor.own_at(*first) != effective.own || lane.votor.stakes_at(*first) != effective.stakes {
+                    lane.votor.install_stakes(*effective_from, effective.own, effective.stakes.clone())?;
+                }
+            }
+        }
+        self.stake_sets = sets;
+        Ok(())
+    }
+
+    pub(crate) fn own_at(&self, cblock: u64) -> Option<usize> {
+        self.stake_sets.range(..=cblock).next_back().unwrap().1.own
+    }
+
+    pub(crate) fn stakes_at(&self, cblock: u64) -> &[u64] {
+        &self.stake_sets.range(..=cblock).next_back().unwrap().1.stakes
+    }
+
+    /// Each window's content chains start on its selected execution parent.
+    /// The execution Votor still requires that parent's NC before voting on a child.
+    /// Reusing an existing window cannot replace its anchor or reset observed votes.
+    pub(crate) fn ensure_window(&mut self, first: u64, parent: Option<BlockRef>) -> Result<()> {
+        if first % CONSENSUS_SLOTS_PER_WINDOW != 0 {
+            return Err(ConsensusError("lane window must begin on a consensus window boundary".into()));
+        }
+        if let Some(window) = self.windows.get(&first) {
+            if window.anchor != parent {
+                return Err(ConsensusError("lane window execution anchor is immutable".into()));
+            }
+            return Ok(());
+        }
+        let set = &self.stake_sets.range(..=first).next_back().unwrap().1;
         let mut lanes = Vec::with_capacity(3);
         for _ in 0..3 {
-            let mut votor = Votor::new(own, stakes.clone())?;
-            // The execution Votor owns Network's clock. These notifications only
-            // initialize the independent content chains' parent bookkeeping.
-            let actions = votor.genesis();
+            let mut votor = Votor::new(set.own.unwrap_or(0), set.stakes.clone())?;
+            if set.own.is_none() {
+                votor.install_stakes(0, None, set.stakes.clone())?;
+            }
+            let actions = votor.start_window(first, parent)?;
             let mut lane = Lane {
                 votor,
                 blocks: BTreeMap::new(),
                 decisions: BTreeMap::new(),
+                ready: BTreeMap::new(),
+                certified: BTreeSet::new(),
                 parents: BTreeMap::new(),
             };
             lane.observe(&actions)?;
             lanes.push(lane);
         }
-        Ok(Self { lanes })
+        self.windows.insert(first, Window { anchor: parent, lanes });
+        Ok(())
     }
 
     pub(crate) fn local_block(&mut self, lane: usize, block: Block) -> Result<Vec<(usize, Action)>> {
-        let state = self.lane_mut(lane)?;
+        if block.parent != self.parent(lane, block.id.slot) {
+            return Err(ConsensusError("lane block differs from its pinned certified parent".into()));
+        }
+        let state = self.lane_mut(lane, block.id.slot)?;
         let actions = state.votor.local_block(block.clone())?;
-        state.blocks.insert(block.id, block);
+        let id = block.id;
+        state.blocks.insert(id, block);
+        state.pin_certified(id);
         state.observe(&actions)?;
         Ok(actions.into_iter().map(|action| (lane, action)).collect())
     }
 
     pub(crate) fn timeout(&mut self, lane: usize, cblock: u64) -> Result<Vec<(usize, Action)>> {
-        let state = self.lane_mut(lane)?;
+        let state = self.lane_mut(lane, cblock)?;
         let actions = state.votor.timeout(cblock)?;
         state.observe(&actions)?;
         Ok(actions.into_iter().map(|action| (lane, action)).collect())
     }
 
     pub(crate) fn receive(&mut self, lane: usize, message: Message) -> Result<Vec<(usize, Action)>> {
-        let received_skip = match &message {
-            Message::Certificate(certificate) if certificate.kind == CertificateKind::Skip => {
-                Some(certificate.slot)
-            }
-            _ => None,
+        let (cblock, certificate) = match &message {
+            Message::Vote(vote) => (vote.slot, None),
+            Message::Certificate(certificate) => (certificate.slot, Some(certificate.clone())),
         };
-        let state = self.lane_mut(lane)?;
+        let state = self.lane_mut(lane, cblock)?;
         let actions = state.votor.receive(message)?;
         // A received certificate need not be emitted again as SendCertificate.
-        // Votor has validated every vote before this decision is recorded.
-        if let Some(slot) = received_skip {
-            state.decide(slot, None)?;
+        // Its votes have all passed Votor validation before it affects readiness.
+        if let Some(certificate) = certificate {
+            state.observe_certificate(&certificate)?;
         }
         state.observe(&actions)?;
         Ok(actions.into_iter().map(|action| (lane, action)).collect())
     }
 
     pub(crate) fn validate_certificate(&self, lane: usize, certificate: &Certificate) -> Result<()> {
-        self.lane(lane)?.votor.validate_certificate(certificate)
+        self.lane(lane, certificate.slot)?.votor.validate_certificate(certificate)
     }
 
     /// Outer null means pending; inner null means the lane is skip-certified.
     pub(crate) fn decision(&self, lane: usize, cblock: u64) -> Option<Option<Hash>> {
-        self.lane(lane).ok()?.decisions.get(&cblock).copied()
+        self.lane(lane, cblock).ok()?.decisions.get(&cblock).copied()
     }
 
-    /// No execution may start until every lane has reached its own decision.
-    pub(crate) fn decisions(&self, cblock: u64) -> Option<AcceptedLanes> {
-        let hashes = self.lanes.iter().map(|lane| lane.decisions.get(&cblock).copied())
+    /// Outer null is pending; an inner null is backed by a Skip certificate.
+    /// A non-null readiness choice is pinned after both its certificate and its
+    /// locally validated block are known, independently of later finalization.
+    pub(crate) fn readiness(&self, lane: usize, cblock: u64) -> Option<Option<Hash>> {
+        self.lane(lane, cblock).ok()?.ready.get(&cblock).copied()
+    }
+
+    /// The provisional execution/handover barrier needs a certificate per lane.
+    /// This does not replace the execution Votor's voting and finality checks.
+    pub(crate) fn ready(&self, cblock: u64) -> Option<AcceptedLanes> {
+        let window = self.windows.get(&(cblock / CONSENSUS_SLOTS_PER_WINDOW * CONSENSUS_SLOTS_PER_WINDOW))?;
+        let hashes = window.lanes.iter().map(|lane| lane.ready.get(&cblock).copied())
             .collect::<Option<Vec<_>>>()?;
         let proposers = hashes.iter().enumerate()
             .filter_map(|(index, hash)| hash.map(|_| index + 1)).collect();
         Some(AcceptedLanes { proposers, hashes })
     }
 
-    /// Inside a window, the caller first distinguishes a pending predecessor from
-    /// a skip using decision(). A skipped lane stays skipped until the next window.
+    /// Final decisions remain distinct from speculative NC-or-Skip readiness.
+    pub(crate) fn decisions(&self, cblock: u64) -> Option<AcceptedLanes> {
+        let window = self.windows.get(&(cblock / CONSENSUS_SLOTS_PER_WINDOW * CONSENSUS_SLOTS_PER_WINDOW))?;
+        let hashes = window.lanes.iter().map(|lane| lane.decisions.get(&cblock).copied())
+            .collect::<Option<Vec<_>>>()?;
+        let proposers = hashes.iter().enumerate()
+            .filter_map(|(index, hash)| hash.map(|_| index + 1)).collect();
+        Some(AcceptedLanes { proposers, hashes })
+    }
+
+    /// Inside a window, first distinguish a pending predecessor from a skip using
+    /// readiness(). A new window uses its own execution anchor instead.
     pub(crate) fn parent(&self, lane: usize, cblock: u64) -> Option<BlockRef> {
-        let state = self.lane(lane).ok()?;
+        let state = self.lane(lane, cblock).ok()?;
         if cblock % CONSENSUS_SLOTS_PER_WINDOW == 0 {
             state.parents.get(&cblock).copied().flatten()
         } else {
-            state.decisions.get(&(cblock - 1)).copied().flatten()
+            state.ready.get(&(cblock - 1)).copied().flatten()
                 .map(|hash| BlockRef { slot: cblock - 1, hash })
         }
     }
 
     pub(crate) fn prune(&mut self, below: u64) {
-        for lane in &mut self.lanes {
-            // A wholly skipped lane still needs its skip chain until its first
-            // accepted block; Votor cannot discard that genesis ancestry yet.
-            let below = lane.votor.finalized().map_or(0, |last| below.min(last.slot));
-            lane.votor.prune(below);
-            lane.blocks.retain(|id, _| id.slot >= below);
-            lane.decisions = lane.decisions.split_off(&below);
-            lane.parents = lane.parents.split_off(&(below / CONSENSUS_SLOTS_PER_WINDOW * CONSENSUS_SLOTS_PER_WINDOW));
+        self.windows.retain(|first, _| first.saturating_add(CONSENSUS_SLOTS_PER_WINDOW) > below);
+        for window in self.windows.values_mut() {
+            for lane in &mut window.lanes {
+                let below = lane.votor.finalized().map_or(lane.votor.pruned_below(), |last| below.min(last.slot))
+                    .max(lane.votor.pruned_below());
+                lane.votor.prune(below);
+                lane.blocks.retain(|id, _| id.slot >= below);
+                lane.decisions = lane.decisions.split_off(&below);
+                lane.ready = lane.ready.split_off(&below);
+                lane.certified.retain(|id| id.slot >= below);
+            }
         }
     }
 
-    fn lane(&self, lane: usize) -> Result<&Lane> {
-        lane.checked_sub(1).and_then(|index| self.lanes.get(index))
-            .ok_or_else(|| ConsensusError("Unknown proposer lane".into()))
+    fn validate_stakes(own: Option<usize>, stakes: &[u64]) -> Result<()> {
+        if stakes.is_empty() || stakes.contains(&0) || own.is_some_and(|own| own >= stakes.len()) {
+            return Err(ConsensusError("lane validator set must contain positive stake and a valid own index".into()));
+        }
+        Ok(())
     }
 
-    fn lane_mut(&mut self, lane: usize) -> Result<&mut Lane> {
-        lane.checked_sub(1).and_then(|index| self.lanes.get_mut(index))
-            .ok_or_else(|| ConsensusError("Unknown proposer lane".into()))
+    fn lane(&self, lane: usize, cblock: u64) -> Result<&Lane> {
+        self.windows.get(&(cblock / CONSENSUS_SLOTS_PER_WINDOW * CONSENSUS_SLOTS_PER_WINDOW))
+            .and_then(|window| lane.checked_sub(1).and_then(|index| window.lanes.get(index)))
+            .ok_or_else(|| ConsensusError("proposer lane window is not initialized".into()))
+    }
+
+    fn lane_mut(&mut self, lane: usize, cblock: u64) -> Result<&mut Lane> {
+        self.windows.get_mut(&(cblock / CONSENSUS_SLOTS_PER_WINDOW * CONSENSUS_SLOTS_PER_WINDOW))
+            .and_then(|window| lane.checked_sub(1).and_then(|index| window.lanes.get_mut(index)))
+            .ok_or_else(|| ConsensusError("proposer lane window is not initialized".into()))
     }
 }
 
@@ -230,9 +334,7 @@ impl Lane {
     fn observe(&mut self, actions: &[Action]) -> Result<()> {
         for action in actions {
             match action {
-                Action::SendCertificate(certificate) if certificate.kind == CertificateKind::Skip => {
-                    self.decide(certificate.slot, None)?;
-                }
+                Action::SendCertificate(certificate) => self.observe_certificate(certificate)?,
                 Action::Finalized(block) => self.finalize(*block)?,
                 Action::ParentReady { window_first_slot, parent } => {
                     self.parents.insert(*window_first_slot, *parent);
@@ -241,6 +343,24 @@ impl Lane {
             }
         }
         Ok(())
+    }
+
+    fn observe_certificate(&mut self, certificate: &Certificate) -> Result<()> {
+        if let Some(hash) = certificate.hash {
+            let id = BlockRef { slot: certificate.slot, hash };
+            self.certified.insert(id);
+            self.pin_certified(id);
+        } else {
+            self.ready.entry(certificate.slot).or_insert(None);
+            self.decide(certificate.slot, None)?;
+        }
+        Ok(())
+    }
+
+    fn pin_certified(&mut self, id: BlockRef) {
+        if self.certified.contains(&id) && self.blocks.contains_key(&id) {
+            self.ready.entry(id.slot).or_insert(Some(id.hash));
+        }
     }
 
     fn decide(&mut self, cblock: u64, hash: Option<Hash>) -> Result<()> {
@@ -281,12 +401,101 @@ impl Lane {
 mod tests {
     use super::*;
     use crate::execution::{ExecutionItem, SvmExecutor};
-    use crate::consensus::{Vote, VoteKind};
+    use crate::consensus::{CertificateKind, Vote, VoteKind};
     use solana_sdk::{
         compute_budget::ComputeBudgetInstruction, hash::Hash as SolanaHash,
         pubkey::Pubkey, signature::{Keypair, Signer}, system_instruction, transaction::Transaction,
     };
     use std::str::FromStr;
+
+    fn genesis_lanes(own: usize) -> Lanes {
+        let mut lanes = Lanes::new(Some(own), vec![1; 12]).unwrap();
+        lanes.ensure_window(0, None).unwrap();
+        lanes
+    }
+
+    #[test]
+    fn notarized_last_lanes_open_handover_before_finality_and_pin_the_parent() {
+        let mut lanes = genesis_lanes(0);
+        for cblock in 0..4 {
+            for lane in 1..=2 {
+                let parent = lanes.parent(lane, cblock);
+                if cblock == 1 {
+                    let wrong = Block {
+                        id: BlockRef { slot: cblock, hash: [99; 32] },
+                        parent: Some(BlockRef { slot: cblock - 1, hash: [98; 32] }),
+                    };
+                    assert!(lanes.local_block(lane, wrong).is_err(),
+                        "an unfinalized notarized predecessor cannot be replaced by another parent");
+                }
+                let block = Block {
+                    id: BlockRef { slot: cblock, hash: [(lane as u8) * 16 + cblock as u8; 32] }, parent,
+                };
+                lanes.local_block(lane, block.clone()).unwrap();
+                for validator in 1..=7 {
+                    lanes.receive(lane, Message::Vote(Vote {
+                        validator, slot: cblock, hash: Some(block.id.hash), kind: VoteKind::Notar,
+                    })).unwrap();
+                }
+                assert_eq!(lanes.readiness(lane, cblock), Some(Some(block.id.hash)));
+                assert!(lanes.decision(lane, cblock).is_none(), "8/12 notar stake has not finalized the lane");
+            }
+            assert!(lanes.ready(cblock).is_none(), "the third lane still needs a certificate");
+            lanes.timeout(3, cblock).unwrap();
+            for validator in 1..=7 {
+                lanes.receive(3, Message::Vote(Vote {
+                    validator, slot: cblock, hash: None, kind: VoteKind::Skip,
+                })).unwrap();
+            }
+        }
+        let handover = lanes.ready(3).unwrap();
+        assert_eq!(handover.proposers, vec![1, 2]);
+        assert_eq!(handover.hashes, vec![Some([19; 32]), Some([35; 32]), None]);
+        assert!(lanes.decisions(3).is_none(), "handover does not wait for lane finalization");
+        let conflicting = Certificate {
+            kind: CertificateKind::NotarFallback, slot: 3, hash: Some([97; 32]),
+            votes: (0..8).map(|validator| Vote {
+                validator, slot: 3, hash: Some([97; 32]), kind: VoteKind::NotarFallback,
+            }).collect(),
+        };
+        lanes.receive(1, Message::Certificate(conflicting)).unwrap();
+        let competing = Block {
+            id: BlockRef { slot: 3, hash: [97; 32] }, parent: lanes.parent(1, 3),
+        };
+        lanes.local_block(1, competing).unwrap();
+        assert_eq!(lanes.ready(3), Some(handover), "a competing validated weak header cannot replace a pinned ready header");
+
+        // Starting the next slot clock early does not grant its execution vote.
+        // The first cblock of that next window still needs its real parent NC.
+        let mut execution = Votor::new(0, vec![1; 12]).unwrap();
+        execution.genesis();
+        let mut previous = None;
+        for slot in 0..4 {
+            let block = Block { id: BlockRef { slot, hash: [slot as u8 + 40; 32] }, parent: previous };
+            execution.local_block(block.clone()).unwrap();
+            previous = Some(block.id);
+        }
+        let parent = previous.unwrap();
+        let child = Block { id: BlockRef { slot: 4, hash: [50; 32] }, parent: Some(parent) };
+        let before = execution.local_block(child.clone()).unwrap();
+        assert!(!before.iter().any(|action| matches!(action,
+            Action::SendVote(vote) if vote.slot == 4 && vote.kind == VoteKind::Notar)),
+            "lane readiness and a local checkpoint alone cannot authorize a child execution Notar");
+        let wrong = Block { id: BlockRef { slot: 4, hash: [51; 32] },
+            parent: Some(BlockRef { slot: 3, hash: [52; 32] }) };
+        let rejected = execution.local_block(wrong).unwrap();
+        assert!(!rejected.iter().any(|action| matches!(action,
+            Action::SendVote(vote) if vote.slot == 4 && vote.kind == VoteKind::Notar)));
+        let mut authorized = Vec::new();
+        for validator in 1..=7 {
+            authorized.extend(execution.receive(Message::Vote(Vote {
+                validator, slot: 3, hash: Some(parent.hash), kind: VoteKind::Notar,
+            })).unwrap());
+        }
+        assert!(authorized.iter().any(|action| matches!(action,
+            Action::SendVote(vote) if vote.slot == 4 && vote.kind == VoteKind::Notar && vote.hash == Some(child.id.hash))),
+            "the existing main-parent notarization unlocks exactly the matching child");
+    }
 
     #[test]
     fn silent_lane_skips_on_two_other_null_attestations_without_waiting() {
@@ -307,7 +516,7 @@ mod tests {
             Some(Inputs { hashes: two.clone() }),
             "the healthy lanes can proceed as soon as both matching rows arrive");
 
-        let mut voters = (0..12).map(|own| Lanes::new(own, vec![1; 12]).unwrap()).collect::<Vec<_>>();
+        let mut voters = (0..12).map(|own| genesis_lanes(own)).collect::<Vec<_>>();
         let mut skip_votes = Vec::new();
         for voter in voters.iter_mut().take(8) {
             assert!(missing.missing(3));
@@ -340,7 +549,7 @@ mod tests {
         mixed.record(row(2, two.clone()), first + Duration::from_millis(1));
         assert!(!mixed.missing(3), "a null/hash pair is not evidence of a silent lane");
         assert!(mixed.snapshot(first + Duration::from_millis(1)).is_none());
-        let mut mixed_voter = Lanes::new(0, vec![1; 12]).unwrap();
+        let mut mixed_voter = genesis_lanes(0);
         let early = if mixed.missing(3) { mixed_voter.timeout(3, 0).unwrap() } else { vec![] };
         assert!(early.is_empty(), "a null/hash pair emits no early Skip vote");
         let mut owner_and_other = Round::default();
@@ -400,7 +609,7 @@ mod tests {
             Some(Inputs { hashes: vec![Some([1; 32]), None, None] }),
             "a duplicate hash conflict invalidates only its changed column");
 
-        let mut lanes = Lanes::new(0, vec![1; 12]).unwrap();
+        let mut lanes = genesis_lanes(0);
         let blocks = [
             Block { id: BlockRef { slot: 0, hash: [1; 32] }, parent: None },
             Block { id: BlockRef { slot: 0, hash: [2; 32] }, parent: None },

@@ -193,6 +193,10 @@ pub async fn follow(url: &str, genesis: &str) -> Result<()> {
             continue;
         }
         for c in chain.into_iter().rev() {
+            let lane_cblock = if replay.lanes_active(c * 4) {
+                let raw = &fetched[&(c * 4 + 3)]["blocks"]["laneCblock"];
+                Some(replay.check_lane_cblock(raw)?)
+            } else { None };
             for s in c * 4..c * 4 + 4 {
                 let entry = fetched.get(&s).with_context(|| format!("slot {s} was not fetched"))?;
                 let view = &entry["view"];
@@ -202,7 +206,14 @@ pub async fn follow(url: &str, genesis: &str) -> Result<()> {
                     let actual = view["window"]["proposers"].as_array().context("proposers")?.iter().map(|proposer| proposer["identity"].as_str().context("proposer identity")).collect::<Result<Vec<_>>>()?;
                     ensure!(expected.proposers.iter().map(String::as_str).eq(actual), "slot {s}: proposers differ from the finalized stake schedule");
                 }
-                check_slot(view, &blocks["attestations"]).with_context(|| format!("slot {s}"))?;
+                if let Some(parsed) = &lane_cblock {
+                    let accepted = &parsed.accepted[(s % 4) as usize];
+                    ensure!(accepted.0 == s && serde_json::to_value(&accepted.1)? == view["agreedSet"], "slot {s}: lane accepted set differs from its cblock");
+                    let pi: Vec<Option<[u8;32]>> = read_hash_vector(&blocks["pi"])?;
+                    ensure!(pi == accepted.2, "slot {s}: lane commitments differ from its cblock");
+                    if s%4==3 {ensure!(view["stateHash"].as_str()==Some(parsed.state.as_str()), "slot {s}: execution state differs from its certified preimage");}
+                }
+                check_slot(view, &blocks["attestations"], lane_cblock.as_ref().map(|_| &blocks["pi"])).with_context(|| format!("slot {s}"))?;
                 let recipients = view["window"]["proposers"].as_array().context("proposers")?.iter()
                     .map(|p| Ok((p["index"].as_u64().context("proposer index")? as u8, p["identity"].as_str().context("proposer identity")?.to_owned())))
                     .collect::<Result<Vec<_>>>()?;
@@ -267,6 +278,14 @@ fn validate_proposer_config(config: &crate::protocol::ProposerConfig, genesis: &
 
 pub(crate) fn load_follow_snapshot(mut snapshot: Value, genesis: &crate::genesis::Genesis, programs: &[crate::execution::GenesisProgram]) -> Result<(Replay, u64, String)> {
     let last = snapshot["consensusSlot"].as_u64().context("snapshot consensusSlot")?;
+    let lanes_from = genesis.bridge.as_ref().and_then(|bridge|bridge.lanes_from_slot);
+    match snapshot.get("lanesFromSlot") {
+        Some(value) => ensure!((value.is_null() && lanes_from.is_none()) || value.as_u64().is_some_and(|from|Some(from)==lanes_from), "Snapshot lanes activation differs from the local rule"),
+        None => {
+            let last_slot=last.checked_mul(4).and_then(|slot|slot.checked_add(3)).context("Snapshot slot overflow")?;
+            ensure!(lanes_from.is_none_or(|from|last_slot<from), "Snapshot is missing its active lanes rule");
+        }
+    }
     ensure!(snapshot["anchor"]["consensusSlot"].as_u64() == Some(last), "snapshot anchor names another cblock");
     let state: crate::execution::ExecutorSnapshot = serde_json::from_value(snapshot["executor"].take())?;
     let start_hash = state.state_hash.clone();
@@ -287,7 +306,7 @@ pub(crate) fn load_follow_snapshot(mut snapshot: Value, genesis: &crate::genesis
     if let Some(bridge) = &genesis.bridge {
         executor.set_bridge(bridge.program);
         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
-        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); }
+        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); }
         if let Some(fee_burn) = bridge.fee_burn_activation()? { executor.set_fee_burn_config(fee_burn); }
         if let Some((from_slot, genesis_stake_lamports)) = stake_rule {
             let identities = config.as_ref().context("Public proposer configuration is missing")?.identities.iter().map(|identity| identity.parse()).collect::<std::result::Result<Vec<_>, _>>()?;
@@ -300,7 +319,7 @@ pub(crate) fn load_follow_snapshot(mut snapshot: Value, genesis: &crate::genesis
     if let Some(proposers) = &mut proposers {
         for (epoch, weights) in executor.stake_schedule_snapshots(&executor.checkpoint())? { proposers.learn(epoch, weights)?; }
     }
-    let mut replay = Replay { executor, threshold: serde_json::from_value(snapshot["threshold"].take())?, window: None, proposers };
+    let mut replay = Replay { executor, threshold: serde_json::from_value(snapshot["threshold"].take())?, window: None, proposers, bridge:genesis.bridge.clone() };
     replay.learn_finalized()?;
     Ok((replay, last, start_hash))
 }
@@ -310,6 +329,7 @@ pub(crate) struct Replay {
     threshold: crate::threshold::ThresholdCache,
     window: Option<u64>,
     pub(crate) proposers: Option<crate::protocol::ProposerSchedules>,
+    bridge: Option<crate::genesis::BridgeConfig>,
 }
 
 #[derive(Clone)]
@@ -326,8 +346,60 @@ impl Replay {
             executor: crate::execution::SvmExecutor::new(Vec::<(String,u64)>::new(), &[])?,
             threshold: crate::threshold::ThresholdCache::new(2400)?,
             window: None,
-            proposers: Some(proposers),
+            proposers: Some(proposers), bridge:None,
         })
+    }
+    pub(crate) fn lanes_active(&self, slot: u64) -> bool {
+        self.bridge.as_ref().and_then(|bridge|bridge.lanes_from_slot).is_some_and(|from|slot >= from)
+    }
+    pub(crate) fn check_lane_cblock(&self, raw: &Value) -> Result<crate::cblock_format::Parsed> {
+        let preimage = B64.decode(raw["preimage"].as_str().context("Missing lane cblock preimage")?)?;
+        let parsed = crate::cblock_format::decode(&preimage,true)?;
+        ensure!(self.lanes_active(parsed.cblock * 4), "Lane proof before activation");
+        let hash = read_hash(raw["hash"].as_str().context("Missing lane cblock hash")?)?;
+        let root = raw["outboxRoot"].as_str().map(read_hash).transpose()?;
+        ensure!(root.is_some() == self.bridge.as_ref().is_some_and(|bridge|parsed.cblock*4 >= bridge.from_slot), "Wrong lane bridge commitment domain");
+        let actual = root.map_or_else(||crypto::hash(&preimage), |root|crypto::hash(&[preimage.as_slice(),&root].concat()));
+        ensure!(actual == hash, "Lane cblock preimage hash mismatch");
+        let (members,stakes) = self.proposers.as_ref().context("Missing finalized proposer configuration")?.voting_set(parsed.cblock)?;
+        let verifier = crate::consensus::Votor::new(0,stakes)?;
+        let check = |value:&Value, lane:Option<usize>| -> Result<crate::consensus::Certificate> {
+            let certificate: crate::consensus::Certificate = serde_json::from_value(value["certificate"].clone())?;
+            let proofs: Vec<crate::types::SignedVote> = serde_json::from_value(value["proofs"].clone())?;
+            ensure!(certificate.slot == parsed.cblock && proofs.len() == certificate.votes.len(), "Lane certificate names another cblock or omits signatures");
+            verifier.validate_certificate(&certificate)?;
+            for (vote,proof) in certificate.votes.iter().zip(proofs) {
+                ensure!(vote == &proof.vote, "Certificate signature belongs to another vote");
+                let identity = members.get(vote.validator).context("Unknown epoch vote signer")?;
+                let key = ed25519_dalek::VerifyingKey::from_bytes(&bs58::decode(identity).into_vec()?.try_into().map_err(|_|anyhow::anyhow!("Invalid vote signer"))?)?;
+                let message = match lane {Some(lane)=>crate::types::lane_vote_message(lane,vote,self.bridge.as_ref())?,None=>crate::types::vote_message(vote,self.bridge.as_ref())?};
+                crypto::verify_bytes(&key,&message,&proof.signature)?;
+            }
+            Ok(certificate)
+        };
+        let execution = check(&raw["execution"],None)?;
+        ensure!(matches!(execution.kind,crate::consensus::CertificateKind::FastFinalization|crate::consensus::CertificateKind::Finalization) && execution.hash == Some(hash), "Missing execution finality over the lane cblock");
+        let hashes = parsed.lane_hashes.as_ref().context("Lane hashes missing from cblock")?;
+        let lanes = raw["lanes"].as_array().context("Lane certificate proofs")?;
+        ensure!(lanes.len() == 3, "A cblock must decide all three lanes");
+        for (index,value) in lanes.iter().enumerate() {
+            let lane = index+1;
+            ensure!(value["lane"].as_u64() == Some(lane as u64), "Lane proofs must be in proposer order");
+            let certificate = check(value,Some(lane))?;
+            ensure!(certificate.hash == hashes[index], "Lane certificate hash differs from the execution commitment");
+            if let Some(hash) = hashes[index] {
+                ensure!(certificate.kind != crate::consensus::CertificateKind::Skip, "Accepted lane has a skip certificate");
+                let block: crate::consensus::Block = serde_json::from_value(value["block"].clone())?;
+                ensure!(if parsed.cblock%4==0 {block.parent==parsed.parent}else{block.parent.is_some_and(|parent|parent.slot.checked_add(1)==Some(parsed.cblock))}, "Lane block parent differs from its window chain");
+                let commitments = value["commitments"].as_array().context("Lane slot commitments")?.iter().map(|hash|read_hash(hash.as_str().context("Lane commitment hash")?)).collect::<Result<Vec<_>>>()?;
+                let commitments: [crate::consensus::Hash;4] = commitments.try_into().map_err(|_|anyhow::anyhow!("A lane needs four slot commitments"))?;
+                ensure!(block.id.slot == parsed.cblock && block.id.hash == hash && crate::cblock_format::lane_hash(lane,parsed.cblock,block.parent,&commitments)? == hash, "Lane block preimage mismatch");
+                for (offset,commitment) in commitments.iter().enumerate() {ensure!(parsed.accepted[offset].2[index] == Some(*commitment), "Lane slot commitment differs from accepted preimage");}
+            } else {
+                ensure!(certificate.kind == crate::consensus::CertificateKind::Skip, "Omitted lane lacks its skip certificate");
+            }
+        }
+        Ok(parsed)
     }
     pub(crate) fn checkpoint(&self) -> ReplayCheckpoint {
         ReplayCheckpoint {executor:self.executor.checkpoint(),threshold:self.threshold.clone(),window:self.window,proposers:self.proposers.clone()}
@@ -361,9 +433,15 @@ impl Replay {
             self.window = Some(w);
         }
         let attestations = blocks["attestations"].as_array().context("attestations")?;
-        let pi = attestations.first().context("no attestation")?["pi"].as_array().context("pi")?.iter()
+        let canonical = if self.lanes_active(s) { &blocks["pi"] } else { &attestations.first().context("no attestation")?["pi"] };
+        let pi = canonical.as_array().context("pi")?.iter()
             .map(|h| h.as_str().map(|h| Ok::<[u8; 32], anyhow::Error>(hex::decode(h)?.try_into().map_err(|_| anyhow::anyhow!("hash"))?)).transpose())
             .collect::<Result<Vec<_>>>()?;
+        if self.lanes_active(s) {
+            let roles=blocks["blocks"].as_array().context("Lane blocks")?.iter().map(|block|block["proposer"].as_u64().context("Lane block proposer")).collect::<Result<Vec<_>>>()?;
+            let expected=pi.iter().enumerate().filter_map(|(index,hash)|hash.map(|_|index as u64+1)).collect::<Vec<_>>();
+            ensure!(roles==expected,"Lane block data differs from the certified accepted set");
+        }
         let mut payloads = vec![];
         let mut fragments = vec![];
         let mut credits: Vec<crate::execution::BridgeCredit> = vec![];
@@ -446,15 +524,15 @@ impl Replay {
     }
 }
 
-pub(crate) fn check_slot(slot: &Value, signed_attestations: &Value) -> Result<()> {
-    check_slot_agreement(slot, signed_attestations)?;
+pub(crate) fn check_slot(slot: &Value, signed_attestations: &Value, canonical_pi: Option<&Value>) -> Result<()> {
+    check_slot_agreement(slot, signed_attestations,canonical_pi)?;
     if slot["slot"].as_u64().unwrap() % 4 == 3 {
         let certificates = slot["cblock"]["certificates"].as_array().context("certificates")?;
         ensure!(certificates.iter().any(|c| matches!(c["kind"].as_str(), Some("fast_finalization" | "slow_finalization")) && c["stakeShare"].as_f64() >= c["threshold"].as_f64()), "no finalization certificate");
     }
     Ok(())
 }
-pub(crate) fn check_slot_agreement(slot: &Value, signed_attestations: &Value) -> Result<()> {
+pub(crate) fn check_slot_agreement(slot: &Value, signed_attestations: &Value, canonical_pi: Option<&Value>) -> Result<()> {
     let proposers = slot["window"]["proposers"].as_array().context("proposers")?;
     let mut attestations = vec![];
     for a in signed_attestations.as_array().context("attestations")? {
@@ -463,7 +541,7 @@ pub(crate) fn check_slot_agreement(slot: &Value, signed_attestations: &Value) ->
         let attestation = Attestation {
             slot: slot["slot"].as_u64().unwrap(),
             proposer: index,
-            pi: a["pi"].as_array().context("pi")?.iter().map(|h| h.as_str().map(|h| hex::decode(h).map(|b| b.try_into().unwrap())).transpose()).collect::<Result<_, _>>()?,
+            pi: read_hash_vector(&a["pi"])?,
             key: B64.decode(a["key"].as_str().context("key")?)?.try_into().map_err(|_| anyhow::anyhow!("key length"))?,
         };
         let key = ed25519_dalek::VerifyingKey::from_bytes(&bs58::decode(identity).into_vec()?.try_into().map_err(|_| anyhow::anyhow!("identity"))?)?;
@@ -471,10 +549,26 @@ pub(crate) fn check_slot_agreement(slot: &Value, signed_attestations: &Value) ->
         crypto::verify_bytes(&key, &bincode::serialize(&crate::types::Wire::Attest(attestation.clone()))?, &signature).context("attestation signature")?;
         attestations.push(attestation);
     }
-    let agreed = agreement::agreed(&attestations, false).context("the attestations do not agree")?;
+    let agreed = if let Some(pi) = canonical_pi {
+        let pi = read_hash_vector(pi)?;
+        let accepted = pi.iter().enumerate().filter_map(|(index,hash)|hash.map(|_|index+1)).collect::<Vec<_>>();
+        ensure!(!accepted.is_empty(), "Execution cblock has no accepted lanes");
+        for role in &accepted {
+            let owner = attestations.iter().find(|attestation|attestation.proposer == *role).context("Accepted lane owner has no signed key release")?;
+            ensure!(owner.pi[*role-1] == pi[*role-1], "Accepted lane differs from its owner's signed commitment");
+        }
+        accepted
+    } else {agreement::agreed(&attestations, false).context("the attestations do not agree")?};
     let claimed: Vec<usize> = serde_json::from_value(slot["agreedSet"].clone())?;
     ensure!(agreed == claimed, "agreed set {claimed:?} differs from the attestations' {agreed:?}");
     Ok(())
+}
+
+fn read_hash(text: &str) -> Result<[u8;32]> { hex::decode(text)?.try_into().map_err(|_|anyhow::anyhow!("Invalid hash length")) }
+fn read_hash_vector(value:&Value)->Result<Vec<Option<[u8;32]>>> {
+    let values = value.as_array().context("Commitment vector")?;
+    ensure!(values.len() == 3, "Expected three commitment columns");
+    values.iter().map(|hash|if hash.is_null(){Ok(None)}else{Ok(Some(read_hash(hash.as_str().context("Commitment hash")?)?))}).collect()
 }
 
 /// Anchor's instruction discriminator.
@@ -633,7 +727,7 @@ pub async fn import(url: &str, store: &str, genesis: &str) -> Result<()> {
     if let Some(bridge) = &genesis.bridge {
         executor.set_bridge(bridge.program);
         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
-        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); }
+        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); }
         if let Some(fee_burn) = bridge.fee_burn_activation()? { executor.set_fee_burn_config(fee_burn); }
         if let Some((from_slot, genesis_stake_lamports)) = bridge.stake_activation()? {
             let config: crate::protocol::ProposerConfig = serde_json::from_value(snapshot.get("proposerConfig").context("Public proposer configuration is missing")?.clone())?;

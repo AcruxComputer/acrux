@@ -298,7 +298,7 @@ pub async fn run_gateway(
 }
 
 /// The `@acrux/contract` version whose shapes the gateway answers in.
-pub const CONTRACT_VERSION: &str = "0.1.33";
+pub const CONTRACT_VERSION: &str = "0.1.35";
 
 async fn health(State(state): State<SharedGateway>) -> Json<Value> {
     let state = state.read().await;
@@ -1403,9 +1403,11 @@ fn follower_view(view: &Value) -> Value {
         .map(|p| json!({"index": p["index"], "identity": p["identity"]})).collect::<Vec<_>>();
     let certificates = view["cblock"]["certificates"].as_array().into_iter().flatten()
         .map(|c| json!({"kind": c["kind"], "stakeShare": c["stakeShare"], "threshold": c["threshold"]})).collect::<Vec<_>>();
-    json!({"slot": view["slot"], "stateHash": view["stateHash"], "agreedSet": view["agreedSet"],
+    let mut result=json!({"slot": view["slot"], "stateHash": view["stateHash"], "agreedSet": view["agreedSet"],
         "window": {"proposers": proposers}, "cblock": {"consensusSlot": view["cblock"]["consensusSlot"],
-            "parent": view["cblock"]["parent"], "certificates": certificates}})
+            "parent": view["cblock"]["parent"], "certificates": certificates}});
+    if let Some(lanes)=view["cblock"].get("lanes") {result["cblock"]["lanes"]=lanes.clone();}
+    result
 }
 
 async fn metrics(State(state): State<SharedGateway>) -> impl IntoResponse {

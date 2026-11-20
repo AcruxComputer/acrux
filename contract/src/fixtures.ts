@@ -3,7 +3,7 @@ import type { z } from 'zod'
 import { toBase58, toBase64 } from './encoding.js'
 import { PROTOCOL_PARAMETERS, errors } from './schemas.js'
 import type { ScenarioId, Balance, GenesisShare, HubEarnings, Bridge, BridgeTransfer, Burn, BurnEpoch, DemoPool, Evidence, Facts, FaucetPolicy, FaucetStatus, FaucetGrant, LabScenario, RegistryConfig, SchedulePreview, SpecMap } from './schemas.js'
-import type { HashExchangePair, HashExchange as HashExchangeView, HubHashExchange, Cblock, Certificate, ExecutionSchedule, Hub, LabProtocol, LabRun, LabYardstickLane, Member, MergedTransaction, NetSnapshot, Parameters, Proposer, Slot, Transaction, Window } from './schemas.js'
+import type { HashExchangePair, HashExchange as HashExchangeView, HubHashExchange, Cblock, CblockLane, Certificate, ExecutionSchedule, Hub, LabProtocol, LabRun, LabYardstickLane, Member, MergedTransaction, NetSnapshot, Parameters, Proposer, Slot, Transaction, Window } from './schemas.js'
 import type { ApiErrorBody } from './errors.js'
 import type { LabReplay, ProtocolEvent } from './events.js'
 
@@ -331,6 +331,13 @@ export const transactionsByState = Object.fromEntries((['unknown', 'sent', 'part
 export const externalBlockSlot = slotsByState.external
 export const externalBlockTransaction: Transaction = { ...makeFixtureTransaction('finalized', externalBlockSlot.slot), receivers: externalBlockSlot.window.proposers }
 export const externalBlockFixture = { slot: externalBlockSlot, transaction: externalBlockTransaction }
+/** Additive /net read model: the same slot surface before and after lanes activation. */
+export const lanesActivatedSlot = makeFixtureSlot(112, 'finalized', { externalProposer: 1, crashedProposer: 3 })
+lanesActivatedSlot.cblock.lanes = [1, 2, 3].map((proposer): CblockLane => proposer === 3
+  ? { proposer, status: 'skipped', votes: { skip: 12 }, certificates: ['skip'] }
+  : { proposer, status: 'finalized', votes: { notar: 12, finalize: 12 }, certificates: ['notarization', 'slow_finalization'] })
+export const lanesActivationFixture = { before: externalBlockSlot, after: lanesActivatedSlot }
+
 export const scenarios: z.infer<typeof LabScenario>[] = [
   { id: 'last-look', title: 'Last look', description: 'A proposer delays its commitment until the others reveal their keys.', seed: 'acrux-last-look-1', parameters: { attacker: 3, commitmentDelayUs: 28000 }, lemma: 'Lemma 2.3 — Proposal hiding', expectedOutcome: 'The late proposal is dropped and disagreeing vectors produce a skip certificate.' },
   { id: 'censorship', title: 'Censorship', description: 'Two proposers omit a transaction carried by the third.', seed: 'acrux-censorship-1', parameters: { censoringProposers: '1,2', honestProposer: 3 }, lemma: 'Lemma 2.2 — Selective-censorship resistance', expectedOutcome: 'The honest proposer’s transaction enters the agreed xblock and finalizes.' },

@@ -1,4 +1,4 @@
-// R22 / Build 6 step 5: nine fresh Fault Lab runs and the silent-lane finalization timing check.
+// R24 / early lanes window handover: nine fresh Fault Lab runs and the silent-lane finalization timing check.
 // Usage from backend, after the coordinated release build:
 // node node/scripts/lab-agreement-check.mjs
 // Only twelve loopback QUIC ports 5062..5073 are used; lab opens no HTTP listeners.
@@ -19,8 +19,8 @@ const backend = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const nodeDir = join(backend, 'node'), target = join(nodeDir, 'target')
 const binary = join(target, 'release', process.platform === 'win32' ? 'acrux.exe' : 'acrux')
 const sourceGenesis = join(backend, 'chain/genesis/acrux-net.json')
-const reportPath = join(nodeDir, 'reports/r22-early-skip.json')
-assert.equal(process.argv.length, 2, 'R22 runs all nine fresh cases; the seed and scenarios stay fixed.')
+const reportPath = join(nodeDir, 'reports/r24-handover.json')
+assert.equal(process.argv.length, 2, 'R24 runs all nine fresh cases; the seed and scenarios stay fixed.')
 const seed = 'acrux-r20-agreement', basePort = 5062, attackerWindow = 4
 const cases = ['split-commitments', 'crash', 'censorship'].flatMap(scenario => ['today', 'agreement', 'lanes'].map(protocol => ({ scenario, protocol })))
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -172,7 +172,7 @@ async function preserveFailedEvents(dir, item, started) {
     if (error.code !== 'ENOENT') throw error
     return { unavailable: 'The failed lab process produced no events.jsonl.' }
   }
-  const output = join(dirname(reportPath), `r22-${item.scenario}-${item.protocol}-${started}-events.jsonl.gz`)
+  const output = join(dirname(reportPath), `r24-${item.scenario}-${item.protocol}-${started}-events.jsonl.gz`)
   await mkdir(dirname(output), { recursive: true })
   await pipeline(createReadStream(input), createGzip(), createWriteStream(output, { flags: 'wx' }))
   return { path: relative(backend, output).split(sep).join('/'), compression: 'gzip',
@@ -260,7 +260,7 @@ async function runOnce({ scenario, protocol }, genesis, env, binarySha256) {
 try {
   await access(binary)
   await freePorts()
-  root = await mkdtemp(join(target, 'r22-early-skip-'))
+  root = await mkdtemp(join(target, 'r24-handover-'))
   const genesis = JSON.parse(await readFile(sourceGenesis, 'utf8'))
   for (const program of genesis.programs) program.path = resolve(backend, 'chain', program.path)
   const genesisPath = join(root, 'genesis.json')
@@ -276,14 +276,14 @@ try {
   const startedAt = new Date().toISOString()
   const runs = []
   for (const requested of cases) runs.push(await runOnce(requested, genesisPath, env, binarySha256))
-  const report = { check: 'r22-early-skip', startedAt, finishedAt: new Date().toISOString(),
+  const report = { check: 'r24-handover', startedAt, finishedAt: new Date().toISOString(),
     version, binary: relative(backend, binary).split(sep).join('/'), binarySha256,
     executedCases: 9, reusedCases: 0, seed, basePort, trafficPerSecond: 50, runSeconds: 12, attackerWindow,
     crashTimingRequirement: { protocol: 'lanes', comparison: 'Each window4 cblock finalizedUs <= median of all four finalized window3 cblocks + 100000 us', missingMeasurements: 'Unavailable and failed; no zero or partial baseline' },
     comparedWindows: [3, 4, 5], passed: runs.every(item => item.problems.length === 0), runs }
   await mkdir(dirname(reportPath), { recursive: true })
   await writeFile(reportPath, JSON.stringify(report, null, 2) + '\n')
-  event('lab_early_skip_report', { report: relative(backend, reportPath).split(sep).join('/'), runs: runs.length, passed: report.passed })
+  event('lab_lanes_net_report', { report: relative(backend, reportPath).split(sep).join('/'), runs: runs.length, passed: report.passed })
   assert.ok(report.passed, `Lab comparison failed; inspect ${relative(backend, reportPath)}. All nine cases ran once from fresh stores; no historical baseline was reused.`)
 } finally {
   await stopOwned()

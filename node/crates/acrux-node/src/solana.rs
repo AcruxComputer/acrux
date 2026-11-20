@@ -72,6 +72,22 @@ pub fn now() -> i64 {
 }
 
 impl SolanaIndex {
+    /// Remove provisional execution when its certified lane inputs change.
+    pub fn rollback_from(&mut self, from: u64) -> Vec<(String, Executed)> {
+        let mut removed = Vec::new();
+        while self.by_slot.back().is_some_and(|(slot, _)| *slot >= from) {
+            let (_, signature) = self.by_slot.pop_back().unwrap();
+            if let Some(executed) = self.transactions.remove(&signature) {
+                removed.push((signature, executed));
+            }
+        }
+        self.by_address.retain(|_, list| {
+            list.retain(|(slot, _)| *slot < from);
+            !list.is_empty()
+        });
+        removed
+    }
+
     pub fn record(&mut self, signature: String, executed: Executed) {
         let Ok(tx) = bincode::deserialize::<VersionedTransaction>(&executed.bytes) else { return };
         for key in tx.message.static_account_keys() {

@@ -55,6 +55,7 @@ pub mod types;
 pub mod view;
 pub mod exchange;
 pub mod agreement;
+pub mod cblock_format;
 mod lanes;
 pub mod submission;
 pub mod observer;

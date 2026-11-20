@@ -9,7 +9,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use redb::{Database, Durability, ReadableTable, TableDefinition};
 use serde_json::{json, Value};
 use solana_sdk::signature::read_keypair_file;
-use std::{collections::{BTreeMap, BTreeSet}, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet, VecDeque}, time::Duration};
 
 const MAX_WIRE_BYTES: u64 = 1024 * 1024;
 // Proposer payloads use 38,000-byte chunks and early blocks append one empty final slice.
@@ -20,16 +20,18 @@ const MAX_PENDING_SLOTS: usize = 2400;
 const MAX_SEEN_ENVELOPES: usize = 100_000;
 const MAX_PENDING_MATERIAL_BYTES: usize = 64 * 1024 * 1024;
 
-type Accepted = (u64, Option<Vec<usize>>, Vec<Option<[u8; 32]>>);
-type Preimage = (u64, Option<BlockRef>, Vec<Accepted>, String);
+type Accepted = crate::cblock_format::Accepted;
 
 const AUTHORED_SLOTS: TableDefinition<&str, u64> = TableDefinition::new("authored_through");
 const VOTE_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("consensus_votes");
+const LANE_VOTE_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("lane_consensus_votes");
 #[derive(Serialize, Deserialize)]
 struct KeptVote { vote: crate::consensus::Vote, envelope: Vec<u8> }
 #[derive(Serialize, Deserialize)]
 struct VoteState { finalized: BlockRef, votes: Vec<KeptVote> }
-struct VoteJournal { db: Database, chain: String, state: VoteState }
+#[derive(Serialize, Deserialize)]
+struct KeptLaneVote { lane: usize, vote: crate::consensus::Vote, envelope: Vec<u8> }
+struct VoteJournal { db: Database, chain: String, state: VoteState, lane_votes: Vec<KeptLaneVote> }
 impl VoteJournal {
     fn open(identity: &str, chain: String, anchor: BlockRef) -> Result<Self> {
         // Database's exclusive file lock also prevents two processes signing with this identity.
@@ -40,10 +42,15 @@ impl VoteJournal {
             let value = table.get(chain.as_str())?;
             value.map(|value|decode(value.value())).transpose()?.unwrap_or(VoteState {finalized:anchor,votes:vec![]})
         };
+        let lane_votes = {
+            let table = write.open_table(LANE_VOTE_JOURNALS)?;
+            let value = table.get(chain.as_str())?;
+            value.map(|value|decode(value.value())).transpose()?.unwrap_or_default()
+        };
         write.commit()?;
         ensure!(anchor.slot >= state.finalized.slot && (anchor.slot != state.finalized.slot || anchor.hash == state.finalized.hash),
             "Snapshot is older than or conflicts with this identity's finalized vote journal");
-        let mut journal = Self {db,chain,state};
+        let mut journal = Self {db,chain,state,lane_votes};
         journal.finalize(anchor)?;
         Ok(journal)
     }
@@ -79,18 +86,41 @@ impl VoteJournal {
         self.state.votes.push(KeptVote {vote,envelope});
         self.save()
     }
+    fn existing_lane(&self, lane: usize, vote: &crate::consensus::Vote) -> Result<Option<Vec<u8>>> {
+        use crate::consensus::VoteKind;
+        ensure!((1..=3).contains(&lane) && vote.slot > self.state.finalized.slot, "Refusing a lane vote at or below the durable finalized anchor");
+        for kept in self.lane_votes.iter().filter(|kept|kept.lane == lane && kept.vote.slot == vote.slot) {
+            let old = &kept.vote;
+            ensure!(old.validator == vote.validator, "This identity's epoch lane index changed after signing");
+            let initial = matches!(old.kind,VoteKind::Notar|VoteKind::Skip) && matches!(vote.kind,VoteKind::Notar|VoteKind::Skip);
+            let final_phase = old.kind == VoteKind::Finalize && vote.kind == VoteKind::Finalize;
+            ensure!(!(initial || final_phase) || (old.kind == vote.kind && old.hash == vote.hash), "Refusing to equivocate against this identity's durable lane vote journal");
+            if old == vote { return Ok(Some(kept.envelope.clone())) }
+        }
+        Ok(None)
+    }
+    fn record_lane(&mut self, lane: usize, vote: crate::consensus::Vote, envelope: Vec<u8>) -> Result<()> {
+        ensure!(self.existing_lane(lane,&vote)?.is_none(), "Lane vote was already durably signed");
+        ensure!(envelope.len() <= 2048 && self.lane_votes.len() < MAX_PENDING_SLOTS * 3, "Unfinalized lane vote journal exceeded its bound");
+        self.lane_votes.push(KeptLaneVote {lane,vote,envelope});
+        self.save()
+    }
     fn finalize(&mut self, anchor: BlockRef) -> Result<()> {
         ensure!(anchor.slot >= self.state.finalized.slot && (anchor.slot != self.state.finalized.slot || anchor.hash == self.state.finalized.hash), "Finalized vote journal moved backward or changed its hash");
         self.state.finalized = anchor;
         self.state.votes.retain(|kept|kept.vote.slot > anchor.slot);
+        self.lane_votes.retain(|kept|kept.vote.slot > anchor.slot);
         self.save()
     }
     fn save(&self) -> Result<()> {
         let bytes = bincode::serialize(&self.state)?;
         ensure!(bytes.len() as u64 <= MAX_WIRE_BYTES, "Unfinalized vote journal exceeded its byte bound");
+        let lane_bytes = bincode::serialize(&self.lane_votes)?;
+        ensure!(lane_bytes.len() as u64 <= MAX_WIRE_BYTES, "Unfinalized lane vote journal exceeded its byte bound");
         let mut write = self.db.begin_write()?;
         write.set_durability(Durability::Immediate);
         { write.open_table(VOTE_JOURNALS)?.insert(self.chain.as_str(),bytes.as_slice())?; }
+        { write.open_table(LANE_VOTE_JOURNALS)?.insert(self.chain.as_str(),lane_bytes.as_slice())?; }
         write.commit()?;
         Ok(())
     }
@@ -123,8 +153,9 @@ struct Slot {
     attestations: BTreeMap<usize, (Attestation, Vec<u8>)>,
     commitments: BTreeMap<usize, Commitment>,
     equivocation: bool,
+    lane_equivocation: BTreeSet<usize>,
 }
-struct Witness { wire: CblockWitness, accepted: Vec<Accepted> }
+struct Witness { wire: CblockWitness, accepted: Vec<Accepted>, lane_hashes:Option<Vec<Option<[u8;32]>>> }
 #[derive(Clone)]
 struct Finalized { block: BlockRef, kind: &'static str, share: f64, threshold: f64 }
 struct Observer {
@@ -132,11 +163,19 @@ struct Observer {
     anchor: BlockRef,
     keys: Vec<VerifyingKey>,
     votor: Votor,
+    lanes: crate::lanes::Lanes,
+    lane_floor: u64,
+    lane_windows: BTreeMap<u64,std::time::Instant>,
+    lane_rounds: BTreeMap<u64,crate::lanes::Round>,
+    lane_proposed: BTreeMap<(usize,u64),crate::consensus::Block>,
+    lane_voted: BTreeSet<(usize,u64)>,
+    lane_certificates: BTreeMap<(usize,u64,CertificateKind,Option<[u8;32]>),(Certificate,Vec<SignedVote>)>,
     signer: SigningKey,
     journal: VoteJournal,
     identity: String,
     hub: String,
     checkpoints: BTreeMap<BlockRef, cli::ReplayCheckpoint>,
+    execution_registered: BTreeSet<BlockRef>,
     outgoing: Vec<Vec<u8>>,
     epoch_updates: BTreeMap<u64, (crate::execution::AdmissionSnapshot, Vec<solana_sdk::pubkey::Pubkey>)>,
     reported_epoch: Option<u64>,
@@ -146,6 +185,8 @@ struct Observer {
     member_metrics: crate::external_proposer::MemberMetrics,
     certified: BTreeSet<BlockRef>,
     window_notices: BTreeMap<u64,(Option<BlockRef>,u64)>,
+    abandoned_windows: BTreeSet<u64>,
+    execution_parents: BTreeMap<u64,Option<BlockRef>>,
     bridge: Option<crate::genesis::BridgeConfig>,
     slots: BTreeMap<u64, Slot>,
     witnesses: BTreeMap<BlockRef, Witness>,
@@ -174,7 +215,8 @@ impl Observer {
             .context("Invalid consensus vote signature")
     }
     fn actions(&mut self, actions: Vec<crate::consensus::Action>) -> Result<()> {
-        for action in actions {
+        let mut actions=VecDeque::from(actions);
+        while let Some(action)=actions.pop_front() {
             match action {
                 crate::consensus::Action::SendVote(vote) => {
                     ensure!(self.votor.own_at(vote.slot) == Some(vote.validator), "Consensus emitted a vote for another epoch member");
@@ -193,12 +235,102 @@ impl Observer {
                     self.outgoing.push(envelope);
                     println!("vote {:?} cblock {} epoch {}",vote.kind,vote.slot,self.epoch(vote.slot));
                 }
+                crate::consensus::Action::ParentReady {window_first_slot,parent}=>{
+                    let window=window_first_slot/4;
+                    if let Some(known)=self.execution_parents.insert(window,parent) {ensure!(known==parent,"Execution consensus changed its selected window parent");}
+                    if self.lanes_active(window_first_slot) && self.window_notices.get(&window).is_some_and(|(announced,_)|*announced!=parent) {
+                        actions.extend(self.abandon_window(window)?);
+                    }
+                }
                 // A locally formed certificate may still include our unsent queued vote. Wait
                 // for the node's signed certificate before advancing the durable final anchor.
                 crate::consensus::Action::SendCertificate(_) => {},
                 _ => {},
             }
         }
+        Ok(())
+    }
+    fn abandon_window(&mut self,window:u64)->Result<Vec<crate::consensus::Action>> {
+        let mut actions=vec![];
+        if self.abandoned_windows.insert(window) {
+            // Never replace signed proposals: the ordinary Skip chain repairs a
+            // provisional parent or lane selection that did not become canonical.
+            for cblock in window*4..window*4+4 {
+                if cblock>self.anchor.slot {actions.extend(self.votor.timeout(cblock)?);}
+            }
+        }
+        Ok(actions)
+    }
+    fn lanes_active(&self, cblock:u64)->bool { cblock.checked_mul(4).is_some_and(|slot|self.replay.lanes_active(slot)) }
+    fn lane_actions(&mut self, actions:Vec<(usize,crate::consensus::Action)>)->Result<()> {
+        for (lane,action) in actions {
+            if let crate::consensus::Action::SendVote(vote)=action {
+                ensure!(vote.slot >= self.lane_floor && self.lanes.own_at(vote.slot)==Some(vote.validator), "Lane vote is outside this member's resumed window");
+                if matches!(vote.kind,crate::consensus::VoteKind::Notar|crate::consensus::VoteKind::Skip) {self.lane_voted.insert((lane,vote.slot));}
+                if let Some(envelope)=self.journal.existing_lane(lane,&vote)? {self.outgoing.push(envelope);continue}
+                let signature=crypto::sign_bytes(&self.signer,&crate::types::lane_vote_message(lane,&vote,self.bridge.as_ref())?);
+                let body=Wire::LaneVote {lane,signed:SignedVote {vote:vote.clone(),signature}};
+                let from=self.replay.proposers.as_ref().context("Missing proposer configuration")?.catalog.iter().position(|identity|identity==&self.identity).context("Admitted member absent from catalog")?;
+                let signature=crypto::sign_bytes(&self.signer,&bincode::serialize(&body)?);
+                let envelope=bincode::serialize(&Envelope {from,body,signature})?;
+                self.journal.record_lane(lane,vote.clone(),envelope.clone())?;
+                self.outgoing.push(envelope);
+                println!("lane vote {:?} proposer {lane} cblock {} epoch {}",vote.kind,vote.slot,self.epoch(vote.slot));
+            }
+        }
+        Ok(())
+    }
+    fn verify_lane_vote(&self,lane:usize,signed:&SignedVote)->Result<()> {
+        ensure!((1..=3).contains(&lane) && self.lanes_active(signed.vote.slot), "Lane vote before activation or invalid proposer");
+        crypto::verify_bytes(self.vote_identity(signed.vote.slot,signed.vote.validator)?,&crate::types::lane_vote_message(lane,&signed.vote,self.bridge.as_ref())?,&signed.signature)
+    }
+    fn sealed_lane_hash(&self,slot:u64,lane:usize)->Result<Option<[u8;32]>> {
+        let Some(state)=self.slots.get(&slot) else{return Ok(None)};
+        let Some((owner,_))=state.attestations.get(&lane) else{return Ok(None)};
+        let piles=state.slices.iter().filter(|((role,_),_)|*role==lane).map(|(_,pile)|pile).collect::<Vec<_>>();
+        let Some(last)=piles.last() else{return Ok(None)};
+        if !last.meta.final_slice || piles.iter().any(|pile|pile.cipher.is_none()) {return Ok(None)}
+        ensure!(piles.iter().enumerate().all(|(index,pile)|pile.meta.slice==index as u32 && pile.meta.final_slice==(index+1==piles.len())), "Noncontiguous lane slices");
+        let parent=last.meta.parent.map(|(slot,hash)|BlockRef {slot,hash});
+        let expected=if slot%16==0 {self.window_notices.get(&(slot/16)).context("Missing lane window anchor")?.0}else{None};
+        ensure!(parent==expected,"Lane block has a stale execution parent");
+        let mut roots=vec![];
+        for pile in &piles {
+            ensure!(crypto::hash(&owner.key)==pile.meta.key_hash,"Released lane key mismatch");
+            crypto::decrypt_slice(&owner.key,slot,lane,pile.meta.slice,pile.cipher.as_ref().unwrap())?;
+            roots.push(pile.root);
+        }
+        Ok(Some(crypto::hash(&bincode::serialize(&crate::types::BlockCommitment {slot,proposer:lane,key_hash:last.meta.key_hash,parent,roots})?)))
+    }
+    fn try_content(&mut self)->Result<()> {
+        let windows=self.lane_windows.iter().map(|(window,start)|(*window,*start)).collect::<Vec<_>>();
+        for (window,start) in windows {
+            if self.abandoned_windows.contains(&window) {continue}
+            for cblock in window*4..window*4+4 {for lane in 1..=3 {
+            if self.lanes.decision(lane,cblock).is_some() || self.lane_proposed.contains_key(&(lane,cblock)) || self.lane_voted.contains(&(lane,cblock)) {continue}
+            let mut skip=false;
+            if cblock%4!=0 {match self.lanes.decision(lane,cblock-1).or_else(||self.lanes.readiness(lane,cblock-1)) {None=>continue,Some(None)=>skip=true,Some(Some(_))=>{}}}
+            if !skip && (cblock*4..cblock*4+4).any(|slot|self.lane_rounds.get(&slot).is_some_and(|round|round.missing(lane))) {skip=true}
+            let mut hashes=vec![];
+            let mut pending=false;
+            if !skip {for slot in cblock*4..cblock*4+4 {
+                if self.slots.get(&slot).is_some_and(|state|state.lane_equivocation.contains(&lane)) {skip=true;break}
+                let Some(inputs)=self.lane_rounds.get_mut(&slot).and_then(|round|round.snapshot(std::time::Instant::now())) else{pending=true;break};
+                let Some(expected)=inputs.hashes[lane-1] else{skip=true;break};
+                match self.sealed_lane_hash(slot,lane) {Ok(Some(actual)) if actual==expected=>hashes.push(actual),Ok(None)=>{pending=true;break},_=>{skip=true;break}}
+            }}
+            let expired=std::time::Instant::now().saturating_duration_since(start).as_micros()>=u128::from(1_000_000+(cblock%4)*200_000);
+            if pending && !expired {continue}
+            let actions=if skip || (pending&&expired) {self.lanes.timeout(lane,cblock)?} else {
+                let parent=self.lanes.parent(lane,cblock);
+                let hashes:[crate::consensus::Hash;4]=hashes.try_into().map_err(|_|anyhow::anyhow!("Incomplete lane cblock"))?;
+                let hash=crate::cblock_format::lane_hash(lane,cblock,parent,&hashes)?;
+                let block=crate::consensus::Block {id:BlockRef {slot:cblock,hash},parent};
+                self.lane_proposed.insert((lane,cblock),block.clone());
+                self.lanes.local_block(lane,block)?
+            };
+            self.lane_actions(actions)?;
+        }}}
         Ok(())
     }
     fn epoch(&self, cblock: u64) -> u64 { cblock * 4 / self.bridge.as_ref().map_or(432_000, |bridge|bridge.epoch_slots) }
@@ -226,8 +358,10 @@ impl Observer {
             // The bootstrap epoch inherits the legacy set. Its hashed marker can finalize
             // after its first wire votes; an identical inherited set needs no replacement.
             if self.votor.stakes_at(from) != stakes || self.votor.own_at(from) != own {
-                self.votor.install_stakes(from,own,stakes)?;
+                self.votor.install_stakes(from,own,stakes.clone())?;
+                self.lanes.install_stakes(from,own,stakes)?;
             }
+            if self.lanes.stakes_at(from) != self.votor.stakes_at(from) || self.lanes.own_at(from) != own {self.lanes.install_stakes(from,own,self.votor.stakes_at(from).to_vec())?;}
         }
         if let Some(server)=self.control.as_ref().and_then(|link|link.server.as_ref()) {
             server.set_catalog(self.keys.iter().enumerate().map(|(id,key)|(id,key.to_bytes())).collect())?;
@@ -268,6 +402,7 @@ impl Observer {
                 // Only authenticated conflicting shreds are equivocation evidence.
                 crypto::verify_shred(&shred, &self.keys[id])?;
                 state.equivocation = true;
+                state.lane_equivocation.insert(shred.meta.proposer);
                 return Ok(())
             }
             // Repeated relay copies and unused parity do not enter reconstruction twice.
@@ -299,7 +434,7 @@ impl Observer {
         }
         Ok(())
     }
-    fn attest(&mut self, attestation: Attestation, signature: Vec<u8>, from: Option<usize>) -> Result<()> {
+    fn attest(&mut self, attestation: Attestation, signature: Vec<u8>, from: Option<usize>, received_at:std::time::Instant) -> Result<()> {
         if attestation.slot / 4 <= self.anchor.slot { return Ok(()) }
         let id = self.proposer(attestation.slot, attestation.proposer)?;
         ensure!(from.is_none_or(|from| from == id), "Attestation sent by another proposer");
@@ -308,9 +443,14 @@ impl Observer {
             .is_some_and(|(known, _)| known.pi == attestation.pi && known.key == attestation.key) { return Ok(()) }
         crypto::verify_bytes(&self.keys[id], &bincode::serialize(&Wire::Attest(attestation.clone()))?, &signature)
             .context("Invalid attestation signature")?;
+        if self.lanes_active(attestation.slot/4) {self.lane_rounds.entry(attestation.slot).or_default().record(attestation.clone(),received_at);}
         let state = self.slots.entry(attestation.slot).or_default();
         if let Some((known, _)) = state.attestations.get(&attestation.proposer) {
-            if known.pi != attestation.pi || known.key != attestation.key { state.equivocation = true; }
+            if known.pi != attestation.pi || known.key != attestation.key {
+                state.equivocation = true;
+                if known.key!=attestation.key {state.lane_equivocation.insert(attestation.proposer);}
+                for (column,(before,after)) in known.pi.iter().zip(&attestation.pi).enumerate() {if before!=after {state.lane_equivocation.insert(column+1);}}
+            }
         } else { state.attestations.insert(attestation.proposer, (attestation, signature)); }
         Ok(())
     }
@@ -323,7 +463,7 @@ impl Observer {
         }
         let state = self.slots.entry(commitment.slot).or_default();
         if let Some(known) = state.commitments.get(&commitment.proposer) {
-            if known.hash != commitment.hash || known.key_hash != commitment.key_hash { state.equivocation = true; }
+            if known.hash != commitment.hash || known.key_hash != commitment.key_hash { state.equivocation = true; state.lane_equivocation.insert(commitment.proposer); }
         } else { state.commitments.insert(commitment.proposer, commitment); }
         Ok(())
     }
@@ -362,14 +502,15 @@ impl Observer {
     fn witness(&mut self, wire: CblockWitness, from: usize) -> Result<()> {
         ensure!(from == 0, "Cblock witness is not from the execution representative");
         if wire.block.slot <= self.anchor.slot { return Ok(()) }
-        let (slot, parent, accepted, state): Preimage = decode(&wire.preimage)?;
+        let parsed=crate::cblock_format::decode(&wire.preimage,self.lanes_active(wire.block.slot))?;
+        let (slot,parent,accepted,state,lane_hashes)=(parsed.cblock,parsed.parent,parsed.accepted,parsed.state,parsed.lane_hashes);
         ensure!(slot == wire.block.slot && parent == wire.parent, "Cblock witness names another preimage");
         ensure!(parent.is_some_and(|parent| parent.slot < slot), "Cblock parent does not precede its child");
         ensure!(slot <= (u64::MAX - 3) / 4 && accepted.len() == 4 && wire.state_hashes.len() == 4, "Invalid cblock slot range");
         for (offset, (execution_slot, agreed, pi)) in accepted.iter().enumerate() {
             ensure!(*execution_slot == slot * 4 + offset as u64 && pi.len() == 3, "Invalid accepted-slot preimage");
             let roles = agreed.as_ref().context("Cblock contains a slot without agreement")?;
-            ensure!(roles.len() >= 2 && roles.len() <= 3 && roles.windows(2).all(|pair| pair[0] < pair[1])
+            ensure!(roles.len() >= (if lane_hashes.is_some(){1}else{2}) && roles.len() <= 3 && roles.windows(2).all(|pair| pair[0] < pair[1])
                 && roles.iter().all(|role| (1..=3).contains(role) && pi[*role - 1].is_some()), "Invalid agreed proposer set");
             hash32(&wire.state_hashes[offset])?;
         }
@@ -381,7 +522,7 @@ impl Observer {
         ensure!(hash == wire.block.hash, "Cblock preimage does not hash to its signed block");
         if let Some(known) = self.witnesses.get(&wire.block) {
             ensure!(known.wire.preimage == wire.preimage && known.wire.state_hashes == wire.state_hashes, "Conflicting cblock witnesses");
-        } else { self.witnesses.insert(wire.block, Witness { wire, accepted }); }
+        } else { self.witnesses.insert(wire.block, Witness { wire, accepted, lane_hashes }); }
         Ok(())
     }
     fn recipient_ready(&self,to:usize)->Result<bool> {
@@ -412,23 +553,42 @@ impl Observer {
         } else { self.envelope(envelope,digest,packet.slot,received_at,packet.to)?; }
         loop {
             self.start_windows()?;
+            self.try_content()?;
             self.speculate()?;
+            self.register_ready()?;
             self.replay_ready()?;
             if !self.drain_pending()? { return Ok(()) }
         }
     }
+    fn parent_ready(&self,parent:BlockRef)->bool {
+        if self.certified.contains(&parent)||parent==self.anchor {return true}
+        // Content certificates may start the clock before execution notarization.
+        // The actual parent still needs its locally reproduced state and outbox.
+        let base_certified=self.window_notices.get(&(parent.slot/4)).is_some_and(|(base,_)|base.is_none_or(|base|self.certified.contains(&base)||base==self.anchor));
+        parent.slot%4==3 && self.lanes_active(parent.slot) && base_certified && self.checkpoints.contains_key(&parent)
+            && self.witnesses.get(&parent).and_then(|witness|witness.lane_hashes.as_ref())
+                .is_some_and(|hashes|self.lanes.decisions(parent.slot).or_else(||self.lanes.ready(parent.slot)).is_some_and(|ready|ready.hashes==*hashes))
+    }
     fn start_windows(&mut self)->Result<()> {
+        let notices=self.window_notices.iter().filter(|(number, (parent,_))|!self.abandoned_windows.contains(*number)&&parent.is_some_and(|parent|self.parent_ready(parent)))
+            .map(|(number,(parent,unix_us))|(*number,*parent,*unix_us)).collect::<Vec<_>>();
+        for (number,parent,unix_us) in &notices {
+            if !self.lane_windows.contains_key(number) && number*4 >= self.lane_floor && self.lanes_active(number*4) {
+                let start=crate::external_proposer::host_instant(*unix_us)?;
+                self.lanes.ensure_window(number*4,*parent)?;
+                self.lane_windows.insert(*number,start);
+            }
+        }
         let Some(proposers)=&self.replay.proposers else{return Ok(())};
         let Some(member)=&mut self.member else{return Ok(())};
-        for (number,(parent,unix_us)) in &self.window_notices {
-            if !parent.is_some_and(|parent|self.certified.contains(&parent)||parent==self.anchor) {continue}
+        for (number,parent,unix_us) in notices {
             if self.votor.own_at(number*4).is_none() {continue}
-            let window=proposers.window(*number)?;
+            let window=proposers.window(number)?;
             if window.hub_code!=self.hub||!window.proposers.contains(&self.identity){continue}
-            let ids=proposers.ids(*number)?;
+            let ids=proposers.ids(number)?;
             let (identities,stakes)=proposers.voting_set(number*4)?;
-            let view=crate::view::window_json(*number,&window,&identities,&stakes,None,&proposers.config.identities);
-            member.start_window(*number,*parent,*unix_us,ids,view,proposers.catalog.clone())?;
+            let view=crate::view::window_json(number,&window,&identities,&stakes,None,&proposers.config.identities);
+            member.start_window(number,parent,unix_us,ids,view,proposers.catalog.clone())?;
         }
         Ok(())
     }
@@ -443,7 +603,13 @@ impl Observer {
         Ok(Some(inbox))
     }
     async fn member_tick(&mut self)->Result<()> {
+        self.start_windows()?;
+        self.try_content()?;
+        self.speculate()?;
+        self.register_ready()?;
+        self.replay_ready()?;
         if let Some(member)=&mut self.member {
+            if member.current_slot().is_some_and(|slot|self.abandoned_windows.contains(&(slot/16))) {return Ok(())}
             let journal=&mut self.journal;
             member.tick(&self.replay.executor,|slot|journal.reserve_author(slot)).await?;
         }
@@ -457,7 +623,8 @@ impl Observer {
             epoch <= from / proposers.config.epoch_slots || proposers.admissions.contains_key(&epoch)
         };
         Ok(match wire {
-            Wire::LaneVote{..}|Wire::LaneCertificate{..}=>anyhow::bail!("Lab lane frames are not accepted by public observers"),
+            Wire::LaneVote{signed,..}=>{ensure!(self.lanes_active(signed.vote.slot),"Lane frame before activation");known(signed.vote.slot)&&(signed.vote.slot<self.lane_floor||self.lane_windows.contains_key(&(signed.vote.slot/4)))},
+            Wire::LaneCertificate{certificate,..}=>{ensure!(self.lanes_active(certificate.slot),"Lane frame before activation");known(certificate.slot)&&(certificate.slot<self.lane_floor||self.lane_windows.contains_key(&(certificate.slot/4)))},
             Wire::Vote(vote) => known(vote.vote.slot),
             Wire::Certificate {certificate,..} => known(certificate.slot),
             Wire::Shreds(shreds) | Wire::Relay(shreds) => shreds.iter().all(|shred|known(shred.meta.slot / 4)),
@@ -490,7 +657,25 @@ impl Observer {
         crypto::verify_bytes(key, &bincode::serialize(&envelope.body)?, &envelope.signature).context("Invalid wire envelope signature")?;
         self.seen.insert(digest, slot);
         match envelope.body {
-            Wire::LaneVote{..}|Wire::LaneCertificate{..}=>anyhow::bail!("Lab lane frames are not accepted by public observers"),
+            Wire::LaneVote{lane,signed}=>{
+                self.verify_lane_vote(lane,&signed)?;
+                ensure!(self.keys[envelope.from]==*self.vote_identity(signed.vote.slot,signed.vote.validator)?,"Lane envelope belongs to another epoch member");
+                if self.lane_windows.contains_key(&(signed.vote.slot/4)) {
+                    let actions=self.lanes.receive(lane,crate::consensus::Message::Vote(signed.vote))?;
+                    self.lane_actions(actions)?;
+                }
+            },
+            Wire::LaneCertificate{lane,certificate,proofs}=>{
+                ensure!((1..=3).contains(&lane)&&self.lanes_active(certificate.slot),"Lane certificate before activation");
+                self.votor.validate_certificate(&certificate)?;
+                ensure!(proofs.len()==certificate.votes.len(),"Lane certificate omitted signatures");
+                for (vote,proof) in certificate.votes.iter().zip(&proofs) {ensure!(vote==&proof.vote,"Lane certificate signature belongs to another vote");self.verify_lane_vote(lane,proof)?;}
+                self.lane_certificates.insert((lane,certificate.slot,certificate.kind,certificate.hash),(certificate.clone(),proofs));
+                if self.lane_windows.contains_key(&(certificate.slot/4)) {
+                    let actions=self.lanes.receive(lane,crate::consensus::Message::Certificate(certificate))?;
+                    self.lane_actions(actions)?;
+                }
+            },
             Wire::Shreds(shreds) | Wire::Relay(shreds) => for shred in shreds { self.shred(shred)?; },
             Wire::Commit(commitment) => {
                 self.commitment(commitment.clone(), None, Some(envelope.from))?;
@@ -510,7 +695,7 @@ impl Observer {
                     }
                 }
             },
-            Wire::Attest(attestation) => self.attest(attestation, envelope.signature, Some(envelope.from))?,
+            Wire::Attest(attestation) => self.attest(attestation, envelope.signature, Some(envelope.from),received_at)?,
             Wire::Vote(vote) => {
                 self.verify_vote(&vote)?;
                 ensure!(self.keys[envelope.from] == *self.vote_identity(vote.vote.slot,vote.vote.validator)?, "Vote envelope belongs to another epoch member");
@@ -520,7 +705,7 @@ impl Observer {
             Wire::Certificate { certificate, proofs } => self.certificate(certificate, proofs)?,
             Wire::Handover { shreds, attestations, .. } => {
                 for shred in shreds { self.shred(shred)?; }
-                for (attestation, signature) in attestations { self.attest(attestation, signature, None)?; }
+                for (attestation, signature) in attestations { self.attest(attestation, signature, None,received_at)?; }
             }
             Wire::Equivocation { first, second } => {
                 ensure!(first.0.slot == second.0.slot && first.0.proposer == second.0.proposer && first.0.hash != second.0.hash, "Invalid equivocation proof");
@@ -536,11 +721,14 @@ impl Observer {
             },
             Wire::WindowStart {number,parent,started_at_unix_us} => {
                 let proposers=self.replay.proposers.as_ref().context("Missing proposer configuration")?;
-                let window=proposers.window(number)?;
+                proposers.window(number)?;
                 ensure!(envelope.from==proposers.window_representative(number)?,"Window notice is not from the fixed hub representative");
-                if window.hub_code==self.hub && window.proposers.contains(&self.identity) && self.votor.own_at(number*4).is_some() {
-                    if let Some(known)=self.window_notices.get(&number) {ensure!(*known==(parent,started_at_unix_us),"Conflicting window notice");}
+                if let Some(known)=self.window_notices.get(&number) {ensure!(*known==(parent,started_at_unix_us),"Conflicting window notice");}
                     self.window_notices.insert(number,(parent,started_at_unix_us));
+                // A certificate may precede its notice on the pull stream. Reapply
+                // that already authenticated local notification before any startup.
+                if let Some(parent)=self.execution_parents.get(&number).copied() {
+                    self.actions(vec![crate::consensus::Action::ParentReady {window_first_slot:number*4,parent}])?;
                 }
             },
             Wire::ExchangeMetrics {..} => {},
@@ -560,12 +748,14 @@ impl Observer {
     fn slot_blocks(&self, accepted: &Accepted) -> Result<Option<Value>> {
         let (slot, agreed, pi) = accepted;
         let Some(state) = self.slots.get(slot) else { return Ok(None) };
-        ensure!(!state.equivocation, "Finalized slot {slot} contains proposer equivocation");
+        let lane_mode=self.lanes_active(slot/4);
+        ensure!(if lane_mode {agreed.as_ref().is_some_and(|roles|roles.iter().all(|role|!state.lane_equivocation.contains(role)))}else{!state.equivocation}, "Finalized slot {slot} contains proposer equivocation");
         let mut attestations = vec![];
         let mut blocks = vec![];
         for role in agreed.as_ref().context("No agreed set")? {
             let Some((attestation, signature)) = state.attestations.get(role) else { return Ok(None) };
-            ensure!(&attestation.pi == pi, "Slot {slot}'s attestation differs from the cblock preimage");
+            if !lane_mode {ensure!(&attestation.pi == pi, "Slot {slot}'s attestation differs from the cblock preimage");}
+            ensure!(attestation.pi[*role-1]==pi[*role-1],"Accepted lane commitment differs from its owner attestation");
             if let Some(commitment) = state.commitments.get(role) {
                 ensure!(Some(commitment.hash) == pi[*role - 1] && commitment.key_hash == crypto::hash(&attestation.key), "Slot {slot}'s signed commitment differs from its attestation");
             }
@@ -574,10 +764,10 @@ impl Observer {
             if !last.meta.final_slice || piles.iter().any(|pile| pile.cipher.is_none()) { return Ok(None) }
             ensure!(piles.iter().enumerate().all(|(i, pile)| pile.meta.slice == i as u32 && (pile.meta.final_slice == (i + 1 == piles.len()))), "Slot {slot} has a noncontiguous slice list");
             ensure!(piles.iter().map(|pile| pile.meta.encrypted_len as u64).sum::<u64>() <= MAX_CIPHER_BYTES, "Block exceeds the payload bound");
-            attestations.push(json!({"proposer":role,"pi":pi.iter().map(|hash|hash.map(hex::encode)).collect::<Vec<_>>(),"key":B64.encode(attestation.key),"signature":bs58::encode(signature).into_string()}));
+            attestations.push(json!({"proposer":role,"pi":attestation.pi.iter().map(|hash|hash.map(hex::encode)).collect::<Vec<_>>(),"key":B64.encode(attestation.key),"signature":bs58::encode(signature).into_string()}));
             blocks.push(json!({"proposer":role,"slices":piles.iter().map(|pile|json!({"meta":pile.meta,"root":hex::encode(pile.root),"cipher":B64.encode(pile.cipher.as_ref().unwrap())})).collect::<Vec<_>>()}));
         }
-        Ok(Some(json!({"attestations":attestations,"blocks":blocks})))
+        Ok(Some(json!({"attestations":attestations,"blocks":blocks,"pi":pi.iter().map(|hash|hash.map(hex::encode)).collect::<Vec<_>>()})))
     }
     fn outbox(&self, block: BlockRef) -> Result<()> {
         let Some(root) = self.witnesses[&block].wire.outbox_root else { return Ok(()) };
@@ -612,28 +802,94 @@ impl Observer {
             let mut ready = None;
             for (block,witness) in self.witnesses.iter().filter(|(block,_)| !self.checkpoints.contains_key(block)) {
                 let Some(parent) = witness.wire.parent else { continue };
+                if self.abandoned_windows.contains(&(block.slot/4)) {continue}
+                if let Some(hashes)=&witness.lane_hashes {
+                    if block.slot>=self.lane_floor {
+                        if self.lanes.decisions(block.slot).or_else(||self.lanes.ready(block.slot)).is_none_or(|decision|decision.hashes!=*hashes) {continue}
+                    } else {
+                        // A reconnect inside a window does not vote content from an incomplete
+                        // history. Its already-finalized execution certificate authenticates the
+                        // barrier, while signed lane certificates authenticate each content hash.
+                        if !self.finalized.contains_key(&block.slot) {continue}
+                        let complete=hashes.iter().enumerate().all(|(index,hash)|self.lane_certificates.keys().any(|(lane,slot,kind,known)|*lane==index+1&&*slot==block.slot&&known==hash&&if hash.is_none(){*kind==CertificateKind::Skip}else{*kind!=CertificateKind::Skip}));
+                        if !complete {continue}
+                    }
+                }
                 let Some(checkpoint) = self.checkpoints.get(&parent) else { continue };
                 let blocks = witness.accepted.iter().map(|accepted|self.slot_blocks(accepted)).collect::<Result<Vec<_>>>()?;
                 if blocks.iter().any(Option::is_none) { continue }
-                ready = Some((*block,parent,checkpoint.clone(),blocks));
+                ready = Some((*block,checkpoint.clone(),blocks));
                 break;
             }
-            let Some((block,parent,checkpoint,blocks)) = ready else { return Ok(()) };
+            let Some((block,checkpoint,blocks)) = ready else { return Ok(()) };
             self.replay.restore(checkpoint)?;
             self.status(block.slot);
             for (offset,blocks) in blocks.into_iter().enumerate() {
                 let blocks = blocks.unwrap();
                 let (view,recipients) = self.view(block,offset,None)?;
-                cli::check_slot_agreement(&view,&blocks["attestations"])?;
+                cli::check_slot_agreement(&view,&blocks["attestations"],self.lanes_active(block.slot).then_some(&blocks["pi"]))?;
                 let slot = block.slot * 4 + offset as u64;
                 let state = self.replay.apply(slot,&recipients,&blocks).with_context(||format!("re-executing slot {slot}"))?;
                 ensure!(view["stateHash"].as_str() == Some(state.as_str()), "Slot {slot}: re-executed state differs from the signed cblock");
             }
             self.outbox(block)?;
             self.checkpoints.insert(block,self.replay.checkpoint());
-            let actions = self.votor.local_block(crate::consensus::Block {id:block,parent:Some(parent)})?;
+            if !self.lanes_active(block.slot) {
+                let parent=self.witnesses[&block].wire.parent;
+                let actions=self.votor.local_block(crate::consensus::Block {id:block,parent})?;
+                self.execution_registered.insert(block);
+                self.actions(actions)?;
+            }
+            // This checkpoint can start the next window, but execution consensus
+            // still waits for actual final content decisions, exactly as in R23.
+        }
+    }
+    fn discard_speculation(&mut self,block:BlockRef)->Result<()> {
+        let parent=self.witnesses[&block].wire.parent.context("Speculative cblock lost its parent")?;
+        let restore=self.checkpoints.get(&parent).context("Speculative parent checkpoint disappeared")?.clone();
+        let mut discarded=BTreeSet::from([block]);
+        loop {
+            let descendants=self.witnesses.iter().filter(|(candidate,witness)|self.checkpoints.contains_key(candidate)&&!discarded.contains(candidate)&&witness.wire.parent.is_some_and(|parent|discarded.contains(&parent)))
+                .map(|(candidate,_)|*candidate).collect::<Vec<_>>();
+            if descendants.is_empty() {break}
+            discarded.extend(descendants);
+        }
+        for candidate in &discarded {
+            ensure!(!self.journal.state.votes.iter().any(|kept|kept.vote.slot==candidate.slot&&kept.vote.hash==Some(candidate.hash)&&matches!(kept.vote.kind,crate::consensus::VoteKind::Notar|crate::consensus::VoteKind::Finalize)), "A finalized lane repair conflicts with an execution vote already signed");
+        }
+        self.checkpoints.retain(|candidate,_|!discarded.contains(candidate));
+        self.execution_registered.retain(|candidate|!discarded.contains(candidate));
+        self.replay.restore(restore)?;
+        // Keep the current window and every signed vote intact. Only children
+        // already announced on a discarded execution parent must be skipped.
+        let children=self.window_notices.iter().filter(|(_, (parent,_))|parent.is_some_and(|parent|discarded.contains(&parent)))
+            .map(|(window,_)|*window).collect::<Vec<_>>();
+        for window in children {
+            let actions=self.abandon_window(window)?;
             self.actions(actions)?;
         }
+        Ok(())
+    }
+    fn register_ready(&mut self)->Result<()> {
+        let candidates=self.witnesses.iter().filter(|(block,_)|self.checkpoints.contains_key(block)&&!self.execution_registered.contains(block))
+            .map(|(block,witness)|(*block,witness.wire.parent,witness.lane_hashes.clone())).collect::<Vec<_>>();
+        for (block,parent,hashes) in candidates {
+            if !self.checkpoints.contains_key(&block) {continue}
+            if self.abandoned_windows.contains(&(block.slot/4)) {continue}
+            if let Some(hashes)=hashes {
+                if block.slot>=self.lane_floor {
+                    let Some(decisions)=self.lanes.decisions(block.slot) else{continue};
+                    if decisions.hashes!=hashes {
+                        self.discard_speculation(block)?;
+                        continue;
+                    }
+                }
+            }
+            let actions=self.votor.local_block(crate::consensus::Block {id:block,parent})?;
+            self.execution_registered.insert(block);
+            self.actions(actions)?;
+        }
+        Ok(())
     }
     fn replay_ready(&mut self) -> Result<()> {
         loop {
@@ -650,7 +906,7 @@ impl Observer {
                 }
                 if missing { continue }
                 let block = *chain.last().context("Empty finalized extension")?;
-                if let Some(checkpoint) = self.checkpoints.get(&block) { ready = Some((block,finality.clone(),checkpoint.clone())); break }
+                if let Some(checkpoint) = self.checkpoints.get(&block).filter(|_|self.execution_registered.contains(&block)) { ready = Some((block,finality.clone(),checkpoint.clone())); break }
             }
             let Some((block,finality,checkpoint)) = ready else { return Ok(()) };
             self.replay.restore(checkpoint)?;
@@ -658,7 +914,7 @@ impl Observer {
                 let accepted = &self.witnesses[&block].accepted[offset];
                 let blocks = self.slot_blocks(accepted)?.context("Finalized block data disappeared")?;
                 let (view,_) = self.view(block,offset,Some(&finality))?;
-                cli::check_slot(&view,&blocks["attestations"])?;
+                cli::check_slot(&view,&blocks["attestations"],self.lanes_active(block.slot).then_some(&blocks["pi"]))?;
                 self.checked += 1;
                 let slot = accepted.0;
                 let state = &self.witnesses[&block].wire.state_hashes[offset];
@@ -669,14 +925,23 @@ impl Observer {
             self.learn_finalized()?;
             self.checkpoints.insert(block,self.replay.checkpoint());
             self.checkpoints.retain(|known,_|known.slot >= block.slot);
+            self.execution_registered.retain(|known|known.slot >= block.slot);
             self.buffered_bytes -= self.slots.iter().filter(|(slot,_)| **slot / 4 <= block.slot).map(|(_,slot)|slot.buffered_bytes).sum::<usize>();
             self.slots.retain(|slot,_| *slot / 4 > block.slot);
             self.witnesses.retain(|known,_| known.slot > block.slot);
             self.finalized.retain(|slot,_| *slot > block.slot);
             self.seen.retain(|_,slot| *slot / 4 > block.slot);
             self.votor.prune(block.slot.saturating_sub(8));
+            self.lanes.prune(block.slot.saturating_sub(8));
+            self.lane_rounds.retain(|slot,_|*slot/4>block.slot);
+            self.lane_proposed.retain(|(_,slot),_|*slot>block.slot);
+            self.lane_voted.retain(|(_,slot)|*slot>block.slot);
+            self.lane_certificates.retain(|(_,slot,_,_),_|*slot>block.slot);
+            self.lane_windows.retain(|window,_|*window>=block.slot/4);
             self.certified.retain(|known|known.slot>=block.slot.saturating_sub(8));
             self.window_notices.retain(|number,_|*number>=block.slot/4);
+            self.abandoned_windows.retain(|window|*window>=block.slot/4);
+            self.execution_parents.retain(|window,_|*window>=block.slot/4);
             self.speculate()?;
         }
     }
@@ -767,7 +1032,7 @@ async fn session(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_p
     let member_metrics=crate::external_proposer::MemberMetrics::default();
     let link=crate::member_link::MemberLink::new(control.clone(),peer_server);
     if let Some(input)=peer_ingress {link.receive(input,fast_lane.clone());}
-    let mut observer = Observer {checkpoints:BTreeMap::from([(anchor,replay.checkpoint())]),replay,anchor,keys,votor,signer,journal,identity,hub:hub.to_owned(),outgoing:vec![],epoch_updates:BTreeMap::new(),reported_epoch:None,control:Some(link.clone()),member:None,fast_lane:fast_lane.clone(),member_metrics:member_metrics.clone(),certified:BTreeSet::from([anchor]),window_notices:BTreeMap::new(),bridge:genesis.bridge.clone(),slots:BTreeMap::new(),witnesses:BTreeMap::new(),finalized:BTreeMap::new(),seen:BTreeMap::new(),pending:BTreeMap::new(),checked:0,buffered_bytes:0};
+    let mut observer = Observer {checkpoints:BTreeMap::from([(anchor,replay.checkpoint())]),execution_registered:BTreeSet::from([anchor]),replay,anchor,keys,votor,lanes:crate::lanes::Lanes::new(None,vec![100_000_000;12])?,lane_floor:(last/4+1)*4,lane_windows:BTreeMap::new(),lane_rounds:BTreeMap::new(),lane_proposed:BTreeMap::new(),lane_voted:BTreeSet::new(),lane_certificates:BTreeMap::new(),signer,journal,identity,hub:hub.to_owned(),outgoing:vec![],epoch_updates:BTreeMap::new(),reported_epoch:None,control:Some(link.clone()),member:None,fast_lane:fast_lane.clone(),member_metrics:member_metrics.clone(),certified:BTreeSet::from([anchor]),window_notices:BTreeMap::new(),abandoned_windows:BTreeSet::new(),execution_parents:BTreeMap::new(),bridge:genesis.bridge.clone(),slots:BTreeMap::new(),witnesses:BTreeMap::new(),finalized:BTreeMap::new(),seen:BTreeMap::new(),pending:BTreeMap::new(),checked:0,buffered_bytes:0};
     observer.learn_finalized()?;
     observer.votor.resume(anchor);
     observer.status(last);
@@ -814,7 +1079,7 @@ async fn session(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_p
                     observer.packet_at(packet,&recipients,received_at)?;
                     for envelope in observer.outgoing.drain(..) { control.send_envelope(&envelope).await?; }
                 },
-                _=member_tick.tick()=>observer.member_tick().await?,
+                _=member_tick.tick()=>{observer.member_tick().await?;for envelope in observer.outgoing.drain(..){control.send_envelope(&envelope).await?;}},
                 request=async{match &mut rpc_requests{Some(receiver)=>receiver.recv().await,None=>std::future::pending().await}}=>{
                     if let Some(request)=request {
                         let slot=observer.member.as_ref().and_then(|member|member.current_slot()).unwrap_or(0).max(observer.anchor.slot*4+3);
@@ -861,15 +1126,15 @@ mod tests {
         let anchor = BlockRef {slot:127,hash:[1;32]};
         let journal = VoteJournal {
             db:Database::builder().create_with_backend(redb::backends::InMemoryBackend::new()).unwrap(),
-            chain:"admission-order-check".into(),state:VoteState {finalized:anchor,votes:vec![]},
+            chain:"admission-order-check".into(),state:VoteState {finalized:anchor,votes:vec![]},lane_votes:vec![],
         };
         let mut votor = Votor::new(0,vec![100_000_000;12]).unwrap();
         votor.install_stakes(0,None,vec![100_000_000;12]).unwrap();
         votor.resume(anchor);
         let mut observer = Observer {
-            checkpoints:BTreeMap::from([(anchor,replay.checkpoint())]),replay,anchor,
-            keys:signers.iter().map(SigningKey::verifying_key).collect(),votor,signer,journal,identity,
-            hub:"FRA".into(),outgoing:vec![],epoch_updates:BTreeMap::new(),reported_epoch:None,control:None,member:None,fast_lane:crate::external_proposer::FastLane::default(),member_metrics:crate::external_proposer::MemberMetrics::default(),certified:BTreeSet::from([anchor]),window_notices:BTreeMap::new(),bridge:None,
+            checkpoints:BTreeMap::from([(anchor,replay.checkpoint())]),execution_registered:BTreeSet::from([anchor]),replay,anchor,
+            keys:signers.iter().map(SigningKey::verifying_key).collect(),votor,lanes:crate::lanes::Lanes::new(None,vec![100_000_000;12]).unwrap(),lane_floor:128,lane_windows:BTreeMap::new(),lane_rounds:BTreeMap::new(),lane_proposed:BTreeMap::new(),lane_voted:BTreeSet::new(),lane_certificates:BTreeMap::new(),signer,journal,identity,
+            hub:"FRA".into(),outgoing:vec![],epoch_updates:BTreeMap::new(),reported_epoch:None,control:None,member:None,fast_lane:crate::external_proposer::FastLane::default(),member_metrics:crate::external_proposer::MemberMetrics::default(),certified:BTreeSet::from([anchor]),window_notices:BTreeMap::new(),abandoned_windows:BTreeSet::new(),execution_parents:BTreeMap::new(),bridge:None,
             slots:BTreeMap::new(),witnesses:BTreeMap::new(),finalized:BTreeMap::new(),seen:BTreeMap::new(),
             pending:BTreeMap::new(),checked:0,buffered_bytes:0,
         };

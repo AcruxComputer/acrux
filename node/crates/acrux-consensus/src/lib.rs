@@ -195,6 +195,8 @@ impl Votor {
         self.stake_sets.range(..=slot).next_back().expect("genesis stake set").1
     }
     pub fn own_at(&self, slot: u64) -> Option<usize> { self.stake_set(slot).own }
+    /// A locally assembled block may still be waiting for its parent's certificate.
+    pub fn initial_vote(&self, slot: u64) -> Option<&Vote> { self.initial.get(&slot) }
     pub fn stakes_at(&self, slot: u64) -> &[u64] { &self.stake_set(slot).stakes }
 
     /// Call once at startup. Genesis is the sole parent that needs no certificate.
@@ -227,6 +229,29 @@ impl Votor {
             window_first_slot: first,
             parent: Some(finalized),
         }]
+    }
+
+    /// Starts an independent content window on a caller-validated execution
+    /// anchor. The execution Votor still certifies that parent before child
+    /// execution votes; this creates no execution certificate for earlier slots.
+    pub fn start_window(&mut self, first: u64, parent: Option<BlockRef>) -> Result<Vec<Action>> {
+        if self.started {
+            return Err(ConsensusError("consensus window is already started".into()));
+        }
+        if first % CONSENSUS_SLOTS_PER_WINDOW != 0 || first.checked_add(CONSENSUS_SLOTS_PER_WINDOW).is_none()
+            || parent.is_some_and(|parent| parent.slot >= first)
+        {
+            return Err(ConsensusError("invalid consensus window anchor".into()));
+        }
+        self.started = true;
+        self.floor = first;
+        self.pruned_below = first;
+        self.next_window = first + CONSENSUS_SLOTS_PER_WINDOW;
+        if let Some(parent) = parent {
+            self.blocks.insert(parent, Block { id: parent, parent: None });
+            self.finalized = Some(parent);
+        }
+        Ok(vec![Action::ParentReady { window_first_slot: first, parent }])
     }
 
     pub fn finalized(&self) -> Option<BlockRef> {
@@ -414,7 +439,7 @@ impl Votor {
             .any(|((_, kind, hash), _)| *hash == Some(id.hash) && *kind != CertificateKind::Skip)
     }
     fn skipped(&self, slot: u64) -> bool {
-        (slot < self.floor && self.finalized.is_some_and(|f| slot > f.slot))
+        (slot < self.floor && self.finalized.is_none_or(|f| slot > f.slot))
             || self.certificates
             .contains_key(&(slot, CertificateKind::Skip, None))
     }

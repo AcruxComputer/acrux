@@ -371,9 +371,9 @@ A validator that falls more than two windows behind catches up: it executes and 
 A sandbox of twelve validators runs for 12 s with the scenario's fault in window 4 and writes `events.jsonl` (every protocol event of windows 3 to 5, appended live) and `outcome.json` (protocol, status, outcome, evidence and yardstick). The yardstick keeps node zero's status, votes, certificate kinds and finalization time for every cblock of those three windows. The API runs it per lab run and keeps both in Postgres.
 
 `--protocol today|agreement|lanes` belongs only to `lab run`; it defaults to
-`today`. Public
-`net up`, RPC followers and outside proposers keep the existing unanimous rule.
-There is no activation slot or public-net protocol setting.
+`today`. On the public net, `lanesFromSlot` in the bridge rule selects Lanes from
+that window boundary. Without it, the unanimous rule remains. Lab Lanes use the
+same path from slot zero; Lab agreement remains a sandbox comparison.
 
 `agreement` uses one signed 2-of-3 quorum per block hash. Null entries do not
 contradict a hash; conflicting hashes still prevent agreement. The local view
@@ -387,7 +387,8 @@ too. A node missing a chosen block or key waits for the existing
 Rotor slices and key-release attestations. Validators execute and vote through
 the same merge and Votor paths.
 
-`lanes` runs three independent content Votors, one per proposer role. A lane
+`lanes` runs three independent content Votors per window, one per proposer role,
+anchored on that window's certified execution parent. A lane
 checks only its proposer's attestation column: at least two signed rows, the
 owner's released key, and the same non-null hash in every received row after
 all three rows or two global message flights. A split commitment therefore
@@ -403,12 +404,26 @@ collection bound. If attestations are missing, the existing skip timeout remains
 the fallback. All decisions use the same authenticated attestations delivered to
 validators; they do not inspect the scenario or a local crash flag.
 
-Execution waits for every lane's finalization or skip certificate, then uses the
-existing SortTxs, tracks and SVM execution on accepted blocks only. The existing
-execution Votor certifies the merged state and advances the window clock. Its
-deadline cannot skip a cblock while content decisions are still pending. Lab
-cblock preimages commit to the accepted lane hashes in proposer order; public
-cblock encodings are unchanged. A lane skipped inside a window stays skipped
+The existing SortTxs, tracks and SVM merge run speculatively once every lane has
+a notarization or skip certificate and its selected data is locally validated.
+Each certified choice is pinned. Execution votes still wait for the lanes' final
+decisions to match those choices, as in R23; execution finality and bridge
+certificates keep their existing thresholds. The next window can start on the
+last cblock's three lane certificates and its reproduced execution checkpoint,
+without waiting for the additional execution-certificate round. Its child votes
+still require that actual execution parent's certificate. At most one window
+can lead that certificate. If a lane later skips, its cblock is replayed from
+the preceding checkpoint using the final lane choices. Children already sealed
+on the discarded checkpoint are abandoned through ordinary Skip votes and
+checkpoint repair; signed proposals are never replaced. A conflicting execution
+parent likewise abandons the speculative child window. A cblock's execution deadline cannot skip it while content
+decisions are still pending. The
+cblock preimages start with the cblock slot, followed by the execution parent,
+the four accepted slot records, the end state hash and the accepted lane hashes
+in proposer order. Before activation, the original preimage and vote encodings
+remain unchanged. The existing execution Votor certifies the merged hash, so
+Solana's unchanged bridge program verifies it and releases withdrawals as before.
+A lane skipped inside a window stays skipped
 until its next window, as Votor's parent rule requires. Other lanes continue,
 and their accepted set may change between cblocks in the same window.
 
@@ -540,6 +555,32 @@ loopback ports 5041?5043, validator QUIC 5062?5073 and external QUIC 5074. It
 checks at least 1,000 matching finalized slots, actual link RTT, rejection of a
 bad challenge signature and disconnection of a non-reading peer while finality
 keeps advancing. Its child processes and unique temporary store are cleaned.
+
+## Lanes activation
+
+`lanesFromSlot` is optional in the bridge rule and has no implicit activation.
+It must be a sixteen-slot window boundary at or after `fromSlot`. The host rule
+sets it to **6,480,000**, the first slot of bridge epoch 15. The native, stake
+and admission slots remain 4,752,000, 5,184,000 and 5,616,000.
+
+Before that slot, hashes, execution votes and wire encodings keep the legacy
+rule. From it, hosted validators and admitted outside members vote in three
+content lanes with the epoch's fixed stake set, then certify merged execution.
+Lane signatures include the chain tag and lane domain; pre-activation lane
+frames are refused. The existing authenticated pull-history link carries them.
+Its small-envelope bound is 128 per second for the execution Votor and three
+lanes; peer count, history and byte bounds are unchanged.
+
+RPC followers verify signed lane and execution certificates from compact
+follower pages. Outside members do the same on the wire. After reconnecting
+inside a window, a member verifies that window but resumes lane voting at the
+next boundary; both execution and lane votes are saved before sending, in the
+same journal database. `Cblock.lanes` is absent before activation and includes
+each lane's proposer, status and vote counts afterwards.
+
+`deploy/pack-release.sh` packs the host's bridge rule by default as
+`chain/bridge.json`; an explicit third argument selects a local rule. Ship that
+rule with CLI 0.4.35. Solana's `acrux_bridge` program and its IDL do not change.
 
 ## Admission at the bridge epoch boundary
 
@@ -799,6 +840,25 @@ with default traffic and checks continued finalization and responsive API reads
 after the net's fifteen-second warm-up.
 
 ## Measured
+
+Window-handover measurements are separate from the Windows smoke check. Build
+the Linux node with `deploy/Dockerfile --target build`, copy `/acrux` to
+`dist-pack/acrux-linux-0.4.35/acrux` (outside `node/target/release`), then run from
+a mounted `backend/` in `node:22-bookworm-slim` with `--network none`:
+
+```sh
+node node/scripts/lanes-handover-pace.mjs --binary /backend/dist-pack/acrux-linux-0.4.35/acrux
+```
+
+It measures two fresh nets for 60 seconds after 15 seconds of warm-up, then
+split-commitments and crash on agreement and lanes for three fixed seeds. The
+same bridge/domain/empty deposit source is used in both net runs. Reports retain
+slot pace across windows, the median last-slot-to-next-window gap, cblock
+finality p50/p90 and missing observations. Linux exits nonzero if the aggregate
+paired lanes pace falls below 98% of agreement's or cannot be measured,
+or any of the twelve Lab runs fails its scenario evidence or exits abnormally. The
+Windows invocation uses `--binary node/target/release/acrux.exe` and writes a
+separate smoke report; it makes no Linux performance claim. Allow 5 to 7 minutes.
 
 `acrux node propose` from a desktop about 290 ms from the host (CLI 0.4.23, 2026-11-19 UTC):
 links to the four FRA co-proposers at a 291 to 296 ms round trip, 3,172 finalized slots

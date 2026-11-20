@@ -39,9 +39,11 @@ pub struct CblockWitness {
     pub state_hashes: Vec<String>,
     pub outbox_root: Option<[u8; 32]>,
 }
-/// Lab lane votes cannot be replayed into another lane or the public execution Votor.
-pub(crate) fn lane_vote_message(lane:usize,vote:&consensus::Vote)->anyhow::Result<Vec<u8>> {
-    let mut message=b"acrux-lab-lane-v1".to_vec();
+/// Lane votes are bound to the chain and cannot be replayed into another lane or execution.
+pub(crate) fn lane_vote_message(lane:usize,vote:&consensus::Vote,bridge:Option<&crate::genesis::BridgeConfig>)->anyhow::Result<Vec<u8>> {
+    let mut message=vec![];
+    if let Some(bridge)=bridge.filter(|rule|vote.slot>=rule.from_slot.div_ceil(4)) {message.extend_from_slice(&bridge.chain_tag());}
+    message.extend_from_slice(b"acrux-lane-v1");
     message.extend(bincode::serialize(&(lane as u8,vote))?);
     Ok(message)
 }
@@ -235,7 +237,7 @@ mod vote_tests {
     use crate::{crypto, genesis::BridgeConfig};
 
     fn rule(chain_id: &str) -> BridgeConfig {
-        BridgeConfig { program: solana_sdk::pubkey::Pubkey::new_unique(), from_slot: 400, epoch_slots: 432_000, chain_id: chain_id.into(), min_withdrawal: Default::default(), native_from_slot: None, native_mint: None, native_scale: None, stake_from_slot: None, genesis_stake_lamports: None, fee_burn_from_slot: None, admission_from_slot: None }
+        BridgeConfig { program: solana_sdk::pubkey::Pubkey::new_unique(), from_slot: 400, epoch_slots: 432_000, chain_id: chain_id.into(), min_withdrawal: Default::default(), native_from_slot: None, native_mint: None, native_scale: None, stake_from_slot: None, genesis_stake_lamports: None, fee_burn_from_slot: None, admission_from_slot: None, lanes_from_slot:None, native_mint_from_slot:None }
     }
 
     #[test]

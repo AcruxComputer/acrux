@@ -591,8 +591,9 @@ async fn serve(server: Weak<ExternalServer>, incoming: quinn::Incoming, permit: 
                     }
                     ClientFrame::Envelope(envelope) => {
                         envelopes += 1;
-                        if envelopes > 32 {
-                            refused("member envelope rate exceeded", &"32 envelopes per second");
+                        // One execution Votor and three content lanes share this bounded path.
+                        if envelopes > 128 {
+                            refused("member envelope rate exceeded", &"128 envelopes per second for execution and three lanes");
                             bail!("member envelope rate exceeded")
                         }
                         (None,envelope)

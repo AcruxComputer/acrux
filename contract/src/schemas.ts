@@ -58,7 +58,10 @@ export const Vote = z.object({ consensusSlot: Count, validator: Address, kind: o
 export type Vote = z.infer<typeof Vote>
 export const Certificate = z.object({ consensusSlot: Count, kind: openEnum(['notarization', 'notar_fallback', 'fast_finalization', 'slow_finalization', 'skip']), stakeShare: z.number().min(0).max(1), threshold: z.number().min(0).max(1), hash: Hash.nullable(), signers: z.array(Address), atUs: Count, linkedConsensusSlot: Count.nullable() })
 export type Certificate = z.infer<typeof Certificate>
-export const Cblock = z.object({ consensusSlot: Count, slots: z.array(SlotNumber), parent: z.object({ consensusSlot: Count, hash: Hash }).nullable(), hash: Hash.nullable(), stateHash: Hash.nullable(), votes: z.array(Vote), certificates: z.array(Certificate), status: openEnum(['pending', 'notarized', 'finalized', 'skipped']), finalizedUs: Count.nullable() })
+/** One proposer lane after the configured lanes boundary; counts use cblock vote kind names. */
+export const CblockLane = z.object({ proposer: ProposerIndex, status: openEnum(['finalized', 'skipped', 'pending']), votes: z.record(z.string(), Count), certificates: z.array(z.string()) })
+export type CblockLane = z.infer<typeof CblockLane>
+export const Cblock = z.object({ consensusSlot: Count, slots: z.array(SlotNumber), parent: z.object({ consensusSlot: Count, hash: Hash }).nullable(), hash: Hash.nullable(), stateHash: Hash.nullable(), votes: z.array(Vote), certificates: z.array(Certificate), status: openEnum(['pending', 'notarized', 'finalized', 'skipped']), finalizedUs: Count.nullable(), lanes: z.array(CblockLane).optional() })
 export type Cblock = z.infer<typeof Cblock>
 // Block and execution times are slot-relative; these two deadlines are window ParentReady-relative.
 export const Slot = z.object({ slot: SlotNumber, wallTime: Timestamp, window: Window, consensusSlot: Count, status: openEnum(['pending', 'executed', 'finalized', 'skipped']), blocks: z.array(ProposerBlock), attestations: z.array(Attestation), agreedSet: z.array(ProposerIndex).nullable(), skip: Skip.nullable(), mergedOrder: z.array(MergedTransaction), schedule: ExecutionSchedule.nullable(), stateHash: Hash.nullable(), xblockHash: Hash.nullable(), cblock: Cblock, executedUs: Count.nullable(), attestationDeadlineUs: Count, consensusTimeoutUs: Count })
@@ -132,7 +135,7 @@ export const LabProtocol = z.enum(['today', 'agreement', 'lanes'])
 export type LabProtocol = z.infer<typeof LabProtocol>
 export const LabRunRequest = z.strictObject({ scenario: ScenarioId, seed: z.string().min(1).max(128).optional(), protocol: LabProtocol.default('today') })
 /** One proposer's consensus lane; vote counters use the same kind names as the cblock totals. */
-export const LabYardstickLane = z.object({ proposer: ProposerIndex, status: openEnum(['finalized', 'skipped', 'pending']), votes: z.record(z.string(), Count), certificates: z.array(z.string()) })
+export const LabYardstickLane = CblockLane
 export type LabYardstickLane = z.infer<typeof LabYardstickLane>
 /** One cblock of the window before the attack, the attacker's window and the one after, as node zero recorded it. `votes` counts votes by kind; `finalizedUs` is the time from the cblock's start to finalized. */
 export const LabYardstickCblock = z.object({ cblock: Count, window: Count, status: z.string(), skipped: z.boolean(), votes: z.record(z.string(), Count), certificates: z.array(z.string()), finalizedUs: Count.nullable(), lanes: z.array(LabYardstickLane).optional() })

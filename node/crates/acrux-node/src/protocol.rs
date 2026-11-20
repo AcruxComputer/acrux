@@ -81,6 +81,7 @@ struct WindowRun {
     parent: Option<BlockRef>,
     next_slot: usize,
     skipped_from: Option<u64>,
+    lane_parent_abandoned: bool,
 }
 use crate::proposer::EarlyBlock;
 
@@ -93,7 +94,11 @@ struct Node {
     lane_votes: BTreeMap<(usize,Vec<u8>),SignedVote>,
     lane_certificates: BTreeMap<(usize,u64,consensus::CertificateKind,Option<[u8;32]>),consensus::Certificate>,
     lane_voted: BTreeSet<(usize,u64)>,
-    lane_proposed: BTreeMap<(usize,u64),BlockRef>,
+    lane_proposed: BTreeMap<(usize,u64),consensus::Block>,
+    lane_commitments: BTreeMap<(usize,u64),Vec<[u8;32]>>,
+    lane_witnesses: BTreeMap<u64,crate::types::CblockWitness>,
+    lane_registered: BTreeSet<u64>,
+    lane_selections: BTreeMap<u64,crate::lanes::AcceptedLanes>,
     epoch_voting: crate::epoch_voting::EpochVoting,
     mempool: BTreeMap<String, ValidatedTx>,
     /// Transactions this node carried, by id: the slot, its role and the copy, until they execute.
@@ -799,7 +804,7 @@ impl Network {
                     if let Some(bridge) = genesis.as_ref().and_then(|g| g.bridge.as_ref()) {
                         executor.set_bridge(bridge.program);
                         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
-                        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); }
+                        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); }
                         if let Some(fee_burn) = bridge.fee_burn_activation()? { executor.set_fee_burn_config(fee_burn); }
                         if let Some(admission)=bridge.admission_config(&admission_genesis)? {executor.set_admission_config(admission);}
                         if let Some((from_slot, genesis_stake_lamports)) = bridge.stake_activation()? {
@@ -816,7 +821,7 @@ impl Network {
                     if let Some(bridge) = genesis.as_ref().and_then(|g| g.bridge.as_ref()) {
                         executor.set_bridge(bridge.program);
                         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
-                        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); }
+                        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); }
                         if let Some(fee_burn) = bridge.fee_burn_activation()? { executor.set_fee_burn_config(fee_burn); }
                         if let Some(admission)=bridge.admission_config(&admission_genesis)? {executor.set_admission_config(admission);}
                         if let Some((from_slot, genesis_stake_lamports)) = bridge.stake_activation()? {
@@ -839,17 +844,22 @@ impl Network {
             // Node zero's canonical execution supplies the local read model; the other
             // validators and followers need only the unchanged account state.
             if id==0 && earnings.is_some() {executor.set_earnings(proposer_config.epoch_slots,saved_earnings.clone())?;}
+            let lanes=(config.fault.as_ref().is_some_and(|fault|fault.protocol=="lanes") || (config.fault.is_none() && genesis.as_ref().and_then(|g|g.bridge.as_ref()).and_then(|rule|rule.lanes_from_slot).is_some())).then(||crate::lanes::Lanes::new(Some(id),stakes.clone())).transpose()?;
             let genesis = executor.checkpoint();
             nodes.push(Node {
                 id,
                 key: keys[id].clone(),
                 executor: Some(executor),
                 votor,
-                lanes: config.fault.as_ref().is_some_and(|fault|fault.protocol=="lanes").then(||crate::lanes::Lanes::new(id,stakes.clone())).transpose()?,
+                lanes,
                 lane_votes: BTreeMap::new(),
                 lane_certificates: BTreeMap::new(),
                 lane_voted: BTreeSet::new(),
                 lane_proposed: BTreeMap::new(),
+                lane_commitments: BTreeMap::new(),
+                lane_witnesses: BTreeMap::new(),
+                lane_registered: BTreeSet::new(),
+                lane_selections: BTreeMap::new(),
                 epoch_voting: Default::default(),
                 mempool: BTreeMap::new(),
                 in_flight: BTreeMap::new(),
@@ -967,7 +977,7 @@ impl Network {
             gateway.clone(), persistence.clone(), identities.clone(), exchange.clone(), profile.clone(),
         );
         if let Some(receiver)=external_ingress {
-            tokio::spawn(member_votes(receiver,transport.clone(),proposers.clone(),gateway.clone(),observer.clone(),genesis.as_ref().and_then(|g|g.bridge.as_ref()).map(|rule|rule.chain_tag())));
+            tokio::spawn(member_votes(receiver,transport.clone(),proposers.clone(),gateway.clone(),observer.clone(),genesis.as_ref().and_then(|g|g.bridge.clone())));
         }
         let bridge_deposits = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
         let bridge_prunes = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
@@ -1057,6 +1067,11 @@ impl Network {
         let schedules=self.proposers.read().unwrap();
         let node=&mut self.nodes[id];
         node.epoch_voting.install(&mut node.votor,&schedules,&self.identities[id])?;
+        if let Some(lanes)=&mut node.lanes {for (epoch,snapshot) in &schedules.admissions {
+            let from=epoch*(schedules.config.epoch_slots/4);
+            let own=snapshot.members.iter().position(|member|member.identity.to_string()==self.identities[id]);
+            lanes.install_stakes(from,own,snapshot.members.iter().map(|member|member.stake).collect())?;
+        }}
         Ok(node.epoch_voting.ready(&schedules,cblock))
     }
     fn validator_set_json(&self,epoch:u64)->Result<Value> {
@@ -1336,12 +1351,13 @@ impl Network {
         })?[8..12]
             .to_vec();
         let receipt_tag=encode(&Envelope {from:0,body:Wire::CommitReceipt(CommitReceipt {slot:0,proposer:1,hash:[0;32]}),signature:vec![]})?[8..12].to_vec();
-        let lane_mode=self.uses_lanes();
-        let attest_tag=if self.uses_local_agreement()||lane_mode {Some(encode(&Envelope{from:0,body:Wire::Attest(Attestation{slot:0,proposer:1,pi:vec![None;3],key:[0;32]}),signature:vec![]})?[8..12].to_vec())}else{None};
+        let lane_from=self.lanes_from_slot();
+        let local_agreement=self.uses_local_agreement();
+        let attest_tag=if local_agreement||lane_from.is_some() {Some(encode(&Envelope{from:0,body:Wire::Attest(Attestation{slot:0,proposer:1,pi:vec![None;3],key:[0;32]}),signature:vec![]})?[8..12].to_vec())}else{None};
         tokio::spawn(async move {
             while let Some(packet) = incoming.recv().await {
                 if packet.payload.get(8..12) != Some(commit_tag.as_slice()) && packet.payload.get(8..12)!=Some(receipt_tag.as_slice())
-                    && !attest_tag.as_ref().is_some_and(|tag|packet.payload.get(8..12)==Some(tag.as_slice())) {
+                    && !attest_tag.as_ref().is_some_and(|tag|packet.payload.get(8..12)==Some(tag.as_slice()) && (local_agreement || lane_from.is_some_and(|from|packet.payload.get(12..20).is_some_and(|bytes|u64::from_le_bytes(bytes.try_into().unwrap())>=from)))) {
                     if data_txs[packet.to].send(packet).is_err() {
                         return;
                     }
@@ -1375,7 +1391,7 @@ impl Network {
                             &&schedules.ids(attestation.slot/16).is_ok_and(|ids|ids[attestation.proposer-1]==envelope.from)
                     };
                     if !valid {tracing::warn!("Rejected agreement attester");continue}
-                    if lane_mode {ingress_exchange.receive_lane_attestation(packet.to,attestation.clone(),packet.received_at);}
+                    if lane_from.is_some_and(|from|attestation.slot>=from) {ingress_exchange.receive_lane_attestation(packet.to,attestation.clone(),packet.received_at);}
                     else {ingress_exchange.receive_attestation(packet.to,attestation.clone(),envelope.signature.clone(),packet.received_at);}
                     let destination=senders[packet.to].clone();
                     tokio::spawn(async move {let _=destination.send((packet,envelope)).await;});
@@ -1926,7 +1942,8 @@ impl Network {
             let schedules=self.proposers.read().unwrap();
             self.identities=schedules.catalog.clone();schedules.config.admission_from_slot.is_some()
         };
-        if admission_enabled {for id in self.active.clone() {
+        let lane_active=self.active.first().and_then(|id|self.nodes[*id].windows.keys().next_back()).is_some_and(|window|self.uses_lanes(window*16));
+        if admission_enabled || lane_active {for id in self.active.clone() {
             let pending={
                 let schedules=self.proposers.read().unwrap();
                 let node=&mut self.nodes[id];
@@ -1994,7 +2011,9 @@ impl Network {
                 .take(2)
                 .copied()
                 .filter(|w| {
-                    !(w * 4..w * 4 + 4).all(|i| self.nodes[id].voted.contains(&i))
+                    (self.uses_lanes(w*16) && (w*4..w*4+4).any(|i|self.nodes[id].executed_blocks.contains_key(&i) && !self.nodes[id].lane_registered.contains(&i) && !self.nodes[id].seen_certificates.contains(&(i,consensus::CertificateKind::Skip,None))))
+                        || (self.nodes[id].windows[w].lane_parent_abandoned && (w*4..w*4+4).any(|i|self.nodes[id].votor.own_at(i).is_some() && self.nodes[id].votor.initial_vote(i).is_none()))
+                        || !(w * 4..w * 4 + 4).all(|i| self.nodes[id].voted.contains(&i))
                         || (w * 4..w * 4 + 4).any(|i| {
                             !self.nodes[id].executed_blocks.contains_key(&i)
                                 && (i * 4..i * 4 + 4).all(|s| {
@@ -2107,6 +2126,10 @@ impl Network {
                     node.lane_certificates.retain(|(_,slot,_,_),_|*slot>=below);
                     node.lane_voted.retain(|(_,slot)|*slot>=below);
                     node.lane_proposed.retain(|(_,slot),_|*slot>=below);
+                    node.lane_commitments.retain(|(_,slot),_|*slot>=below);
+                    node.lane_witnesses=node.lane_witnesses.split_off(&below);
+                    node.lane_registered=node.lane_registered.split_off(&below);
+                    node.lane_selections=node.lane_selections.split_off(&below);
                     node.slots = node.slots.split_off(&(below * 4));
                     node.votes.retain(|_, v| v.vote.slot >= below);
                     node.seen_certificates = node.seen_certificates.split_off(&(below, consensus::CertificateKind::Notarization, None));
@@ -2154,7 +2177,15 @@ impl Network {
         number: u64,
         parent: Option<BlockRef>,
     ) -> Result<()> {
-        if self.nodes[id].windows.contains_key(&number) {
+        if let Some(run)=self.nodes[id].windows.get(&number) {
+            if self.uses_lanes(number*16) && run.parent!=parent {
+                // A provisional handover never replaces a signed proposal. The
+                // execution Votor selected another certified parent, so skip
+                // this unnotarized speculative window and repair on that chain.
+                let run=self.nodes[id].windows.get_mut(&number).unwrap();
+                run.lane_parent_abandoned=true;
+                run.skipped_from.get_or_insert(number*4);
+            }
             return Ok(());
         }
         if !self.schedule_ready(number) {
@@ -2169,6 +2200,7 @@ impl Network {
                 parent,
                 next_slot: 0,
                 skipped_from: None,
+                lane_parent_abandoned: false,
             },
         );
         let w = self.window_json(number)?;
@@ -2183,7 +2215,7 @@ impl Network {
         if self.config.peer_port.is_some() {
             let schedules=self.proposers.read().unwrap();
             if schedules.window_representative(number)?==id {
-                let targets=schedules.ids(number)?.into_iter().filter(|target|*target>=12).collect::<Vec<_>>();
+                let targets=if self.uses_lanes(number*16) {(0..schedules.catalog.len()).collect()} else {schedules.ids(number)?.into_iter().filter(|target|*target>=12).collect::<Vec<_>>()};
                 if !targets.is_empty() {
                     let started_at_unix_us=SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64
                         - Instant::now().saturating_duration_since(start).as_micros() as u64;
@@ -2237,7 +2269,8 @@ impl Network {
         });
         for s in number * 16..number * 16 + 16 {
             let wall = utc(self.wall + offset(start, self.origin) / 1000 + (s % 16) * 50);
-            let v = view::pending_slot(s, w.clone(), wall);
+            let mut v = view::pending_slot(s, w.clone(), wall);
+            if id==0 && self.uses_lanes(s) {v["cblock"]["lanes"]=self.lane_yardstick(s/4);}
             self.nodes[id].slots.entry(s).or_default();
             if id == 0 {
                 self.slot_views.insert(s, v.clone());
@@ -2345,10 +2378,16 @@ impl Network {
     }
     async fn receive(&mut self, packet: Received, e: Envelope) -> Result<()> {
         self.identities=self.proposers.read().unwrap().catalog.clone();
-        let cblock=match &e.body {Wire::Vote(signed)=>Some(signed.vote.slot),Wire::Certificate{certificate,..}=>Some(certificate.slot),_=>None};
+        let cblock=match &e.body {Wire::Vote(signed)|Wire::LaneVote{signed,..}=>Some(signed.vote.slot),Wire::Certificate{certificate,..}|Wire::LaneCertificate{certificate,..}=>Some(certificate.slot),_=>None};
         if let Some(cblock)=cblock {
+            if matches!(&e.body,Wire::LaneVote{..}|Wire::LaneCertificate{..}) {ensure!(self.uses_lanes(cblock*4),"Lane frame before activation");}
             if cblock<self.nodes[packet.to].votor.pruned_below() {return Ok(())}
             if !self.sync_voting(packet.to,cblock)? {
+                self.nodes[packet.to].epoch_voting.hold(cblock,packet)?;
+                return Ok(());
+            }
+            if matches!(&e.body,Wire::LaneVote{..}|Wire::LaneCertificate{..}) && !self.nodes[packet.to].windows.contains_key(&(cblock/4)) {
+                ensure!(self.uses_lanes(cblock*4),"Lane frame before activation");
                 self.nodes[packet.to].epoch_voting.hold(cblock,packet)?;
                 return Ok(());
             }
@@ -2579,10 +2618,13 @@ impl Network {
                 }
             }
             Wire::LaneVote{lane,signed}=>{
-                ensure!(self.uses_lanes()&&(1..=3).contains(&lane),"Lane vote outside the lab lanes protocol");
+                ensure!(self.uses_lanes(signed.vote.slot*4)&&(1..=3).contains(&lane),"Lane vote before lanes activation");
+                let first=signed.vote.slot/4*4;
+                let parent=self.nodes[id].windows[&(signed.vote.slot/4)].parent;
+                self.nodes[id].lanes.as_mut().unwrap().ensure_window(first,parent)?;
                 let key=self.voter_key(signed.vote.slot,signed.vote.validator)?;
                 ensure!(self.identities.get(e.from).is_some_and(|identity|*identity==bs58::encode(key.as_bytes()).into_string()),"Wrong lane vote sender");
-                let message=lane_vote_message(lane,&signed.vote)?;
+                    let message=lane_vote_message(lane,&signed.vote,self.genesis.as_ref().and_then(|g|g.bridge.as_ref()))?;
                 let digest=crypto::hash(&[key.as_bytes().as_slice(),&message,&signed.signature].concat());
                 if !verified_cached(digest) {crypto::verify_bytes(&key,&message,&signed.signature)?;remember_verified(digest);}
                 let encoded=encode(&signed.vote)?;
@@ -2592,7 +2634,10 @@ impl Network {
                 self.lane_actions(id,actions,&mut step)?;
             }
             Wire::LaneCertificate{lane,certificate,proofs}=>{
-                ensure!(self.uses_lanes()&&(1..=3).contains(&lane),"Lane certificate outside the lab lanes protocol");
+                ensure!(self.uses_lanes(certificate.slot*4)&&(1..=3).contains(&lane),"Lane certificate before lanes activation");
+                let first=certificate.slot/4*4;
+                let parent=self.nodes[id].windows[&(certificate.slot/4)].parent;
+                self.nodes[id].lanes.as_mut().unwrap().ensure_window(first,parent)?;
                 let index=(lane,certificate.slot,certificate.kind,certificate.hash);
                 if self.nodes[id].lane_certificates.contains_key(&index) {return Ok(())}
                 ensure!(certificate.votes.len()==proofs.len(),"Lane certificate is missing signed votes");
@@ -2600,7 +2645,7 @@ impl Network {
                 for (vote,proof) in certificate.votes.iter().zip(&proofs) {
                     ensure!(*vote==proof.vote,"Lane certificate proof differs from its vote");
                     let key=self.voter_key(vote.slot,vote.validator)?;
-                    let message=lane_vote_message(lane,vote)?;
+                    let message=lane_vote_message(lane,vote,self.genesis.as_ref().and_then(|g|g.bridge.as_ref()))?;
                     let digest=crypto::hash(&[key.as_bytes().as_slice(),&message,&proof.signature].concat());
                     if !verified_cached(digest) {crypto::verify_bytes(&key,&message,&proof.signature)?;remember_verified(digest);}
                 }
@@ -2778,11 +2823,16 @@ impl Network {
         self.dispatch(id, step).await
     }
     fn uses_local_agreement(&self)->bool {self.config.fault.as_ref().is_some_and(|fault|fault.protocol=="agreement")}
-    fn uses_lanes(&self)->bool {self.config.fault.as_ref().is_some_and(|fault|fault.protocol=="lanes")}
+    fn lanes_from_slot(&self)->Option<u64> {match &self.config.fault {Some(fault)=>(fault.protocol=="lanes").then_some(0),None=>self.genesis.as_ref().and_then(|g|g.bridge.as_ref()).and_then(|rule|rule.lanes_from_slot)}}
+    fn uses_lanes(&self,slot:u64)->bool {self.lanes_from_slot().is_some_and(|from|slot>=from)}
     async fn try_execute(&mut self, id: usize, w: u64) -> Result<()> {
         let local_agreement=self.uses_local_agreement();
-        let lane_mode=self.uses_lanes();
-        if lane_mode {self.try_lanes(id,w).await?;}
+        let lane_mode=self.uses_lanes(w*16);
+        if lane_mode {
+            self.reconcile_lane_execution(id,w).await?;
+            if self.nodes[id].windows[&w].lane_parent_abandoned {return Ok(())}
+            self.try_lanes(id,w).await?;
+        }
         let _phase = self.profile.measure(Some(id), "validator.scan");
         let certified_skip = self.nodes[id]
             .seen_certificates
@@ -2836,12 +2886,9 @@ impl Network {
             let agree_start = Instant::now();
             let equivocation=local.equivocation;
             let agreed = if lane_mode {
-                self.nodes[id].lanes.as_ref().unwrap().decisions(s/4).filter(|decision|!decision.proposers.is_empty()).and_then(|decision| {
-                    self.exchange.lane_snapshot(id,s).map(|inputs| {
-                        let pi=inputs.hashes.into_iter().enumerate().map(|(role,hash)|if decision.proposers.contains(&(role+1)){hash}else{None}).collect();
-                        (decision.proposers,pi)
-                    })
-                })
+                match self.selected_lane_inputs(id,s/4).filter(|decision|!decision.proposers.is_empty()) {
+                    Some(decision)=>Some((decision.proposers,self.canonical_lane_pi(id,s)?)),None=>None,
+                }
             } else if local_agreement {
                 local.agreement.as_ref().filter(|_|!local.equivocation).map(|decision|(decision.proposers.clone(),decision.pi.clone()))
             } else {
@@ -2852,6 +2899,10 @@ impl Network {
             let Some((accepted,pi)) = agreed else {
                 break;
             };
+            if lane_mode {
+                let selected=self.selected_lane_inputs(id,s/4).context("Missing selected lane inputs")?;
+                self.nodes[id].lane_selections.entry(s/4).or_insert(selected);
+            }
             let local=&self.nodes[id].slots[&s];
             if !lane_mode && s % 16 != 0 && self.nodes[id].slots[&(s - 1)].agreed.as_ref() != Some(&accepted) {
                 break;
@@ -3254,8 +3305,29 @@ impl Network {
                 }
             }
             self.nodes[id].last_executed = Some(s);
+            let comparison=if lane_mode {
+                let prefix=(w*4..=s/4).map(|cblock|self.selected_lane_inputs(id,cblock).map(|ready|ready.hashes).context("Speculative ancestry has no lane certificates")).collect::<Result<Vec<_>>>()?;
+                Some(crypto::hash(&encode(&(self.nodes[id].windows[&w].parent,prefix))?))
+            }else{None};
             {
                 let mut checks = self.state_checks.lock().unwrap();
+                if let Some(candidate)=comparison {
+                    // Different certified provisional branches can legitimately
+                    // differ until execution consensus selects and repairs one.
+                    // Identical ancestry must still execute deterministically.
+                    let floor=s.saturating_sub(FOLLOWER_SLOTS);
+                    if checks.lane_pending.first_key_value().is_some_and(|((slot,_),_)|*slot<floor) {checks.lane_pending=checks.lane_pending.split_off(&(floor,[0;32]));}
+                    for ((slot,key),(_,voters)) in checks.lane_pending.range_mut((s,[0;32])..=(s,[255;32])) {if *slot==s && *key!=candidate {*voters&=!(1u16<<id);}}
+                    if checks.completed.get(&s).is_some_and(|hash|*hash!=execution.state_hash) {checks.completed.remove(&s);}
+                    let entry=checks.lane_pending.entry((s,candidate)).or_insert((execution.state_hash.clone(),0));
+                    if entry.0!=execution.state_hash {checks.mismatches+=1;return Err(anyhow::anyhow!("State hash divergence for identical lane ancestry at slot {s}"))}
+                    entry.1|=1u16<<id;
+                    if entry.1==4095 {
+                        let hash=entry.0.clone();
+                        if checks.completed.insert(s,hash).is_none(){checks.checked+=1;}
+                        while checks.completed.len()>FOLLOWER_SLOTS as usize {checks.completed.pop_first();}
+                    }
+                }else{
                 let entry = checks
                     .pending
                     .entry(s)
@@ -3272,6 +3344,7 @@ impl Network {
                             while checks.completed.len()>FOLLOWER_SLOTS as usize {checks.completed.pop_first();}
                         checks.pending.remove(&s);
                     }
+                }
                 }
             }
             if s % 4 == 3 {
@@ -3389,22 +3462,35 @@ impl Network {
     }
     async fn try_vote(&mut self, id: usize, w: u64) -> Result<()> {
         let local_agreement=self.uses_local_agreement();
-        let lane_mode=self.uses_lanes();
+        let lane_mode=self.uses_lanes(w*16);
         let _phase = self.profile.measure(Some(id), "validator.vote");
         for i in w * 4..w * 4 + 4 {
             // Timeouts insert their Skip vote immediately too, so they need the same
             // installed-set frontier as local blocks and received consensus inputs.
-            let already_voted = self.nodes[id].voted.contains(&i);
+            let already_voted = if lane_mode {self.nodes[id].votor.initial_vote(i).is_some() || (self.nodes[id].votor.own_at(i).is_none() && self.nodes[id].voted.contains(&i))} else {self.nodes[id].voted.contains(&i)};
             if !already_voted&&!self.sync_voting(id,i)? {break}
             if i % 4 != 0 && !self.nodes[id].voted.contains(&(i - 1)) {
                 break;
             }
             let now = Instant::now();
             let run = self.nodes[id].windows[&w];
+            if lane_mode && !run.lane_parent_abandoned {
+                if let Some(block)=self.nodes[id].executed_blocks.get(&i).copied() {
+                    if !self.nodes[id].lane_registered.contains(&i) {
+                        let parent=if i%4==0 {run.parent}else{self.nodes[id].executed_blocks.get(&(i-1)).copied()};
+                        if let Some(actions)=self.lane_execution_actions(id,consensus::Block{id:block,parent})? {
+                            let mut step=Step::new();self.consensus_actions(id,actions,&mut step)?;self.dispatch(id,step).await?;
+                        }
+                    }
+                    continue;
+                }
+            }
             // Content consensus has its own deadlines. Execution cannot skip a
             // cblock merely because those lane decisions are still in flight.
             let expired = !lane_mode && elapsed(run.start) >= 750000 + (i - w * 4 + 1) * 200000 + 50000;
-            let all_lanes_skipped=lane_mode&&self.nodes[id].lanes.as_ref().unwrap().decisions(i).is_some_and(|decision|decision.proposers.is_empty());
+            let final_lane_inputs=if lane_mode {self.nodes[id].lanes.as_ref().unwrap().decisions(i)}else{None};
+            let final_content=final_lane_inputs.as_ref().is_some_and(|finalized|self.selected_lane_inputs(id,i).is_some_and(|selected|selected.hashes==finalized.hashes));
+            let all_lanes_skipped=final_lane_inputs.as_ref().is_some_and(|decision|decision.proposers.is_empty());
             let slots = (i * 4..i * 4 + 4).collect::<Vec<_>>();
             if local_agreement {for slot in &slots {
                 if self.exchange.agreement_snapshot(id,*slot).is_some_and(|snapshot|snapshot.equivocation) {
@@ -3420,7 +3506,7 @@ impl Network {
                 });
             let disagreement = slots.iter().any(|s| {
                 self.nodes[id].slots.get(s).map_or(false, |x| {
-                    if lane_mode {x.lane_execution_invalid} else {x.equivocation
+                    if lane_mode {final_content&&x.lane_execution_invalid} else {x.equivocation
                         || x.invalid_reason.is_some()
                         || (!local_agreement && x.attest
                             .values()
@@ -3443,6 +3529,7 @@ impl Network {
                 && !certified_skip
                 && (!expired || already_voted)
                 && !self.nodes[id].executed_blocks.contains_key(&i)
+                && !run.lane_parent_abandoned
             {
                 // Lane certificates already decide every input, including a
                 // silent owner. Do not wait for that owner's third row again.
@@ -3469,10 +3556,10 @@ impl Network {
                 let accepted = slots
                     .iter()
                     .map(|s| {
-                        (
+                        Ok((
                             *s,
                             self.nodes[id].slots[s].agreed.clone(),
-                            if local_agreement {self.nodes[id].slots[s].agreement.as_ref().unwrap().pi.clone()} else {self.nodes[id].slots[s]
+                            if lane_mode {self.canonical_lane_pi(id,*s)?} else if local_agreement {self.nodes[id].slots[s].agreement.as_ref().unwrap().pi.clone()} else {self.nodes[id].slots[s]
                                 .attest
                                 .values()
                                 .next()
@@ -3480,14 +3567,14 @@ impl Network {
                                 .0
                                 .pi
                                 .clone()},
-                        )
+                        ))
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>>>()?;
                 // From the bridge's first slot the hash also commits to the cblock's outbox root,
                 // which Solana's light client proves outbox entries against.
                 let preimage = if lane_mode {
-                    encode(&(b"acrux-lab-lanes-cblock-v1".as_slice(),i,parent,self.nodes[id].lanes.as_ref().unwrap().decisions(i).unwrap().hashes,&state))?
-                } else {encode(&(i, parent, accepted, &state))?};
+                    crate::cblock_format::encode_lanes(i,parent,&accepted,&state,&self.selected_lane_inputs(id,i).unwrap().hashes)?
+                } else {crate::cblock_format::encode_legacy(i,parent,&accepted,&state)?};
                 let mut witness_outbox_root = None;
                 let hash = if self.bridge_open(i * 4) {
                     let mut outbox = self.outbox(id,i)?;
@@ -3515,6 +3602,9 @@ impl Network {
                     parent,
                 };
                 self.nodes[id].executed_blocks.insert(i, block.id);
+                if lane_mode && id==0 {let state_hashes=(i*4..i*4+4).map(|slot|self.nodes[id].slots[&slot].state_hash.clone().unwrap()).collect();self.nodes[id].lane_witnesses.insert(i,crate::types::CblockWitness {
+                    block:block.id,parent,preimage:preimage.clone(),state_hashes,outbox_root:witness_outbox_root,
+                });}
                 if id == 0 && self.config.peer_port.is_some() {
                     step.out.push(Outbox { from:id,to:(0..12).collect(),body:Wire::Cblock(crate::types::CblockWitness {
                         block:block.id,parent,preimage,
@@ -3551,8 +3641,9 @@ impl Network {
                         });
                     }
                 }
-                actions = self.nodes[id].votor.local_block(block)?;
-                let c = view::cblock_json(i, parent, &hex::encode(hash), &state, "pending");
+                actions = if lane_mode {self.lane_execution_actions(id,block)?.unwrap_or_default()} else {self.nodes[id].votor.local_block(block)?};
+                let mut c = view::cblock_json(i, parent, &hex::encode(hash), &state, "pending");
+                if lane_mode && id==0 {c["lanes"]=self.lane_yardstick(i);}
                 step.events.push(Telemetry {
                     slot: Some(i * 4),
                     anchor: "consensus",
@@ -3565,7 +3656,8 @@ impl Network {
                 });
             } else if already_voted {
                 continue;
-            } else if all_lanes_skipped || expired || disagreement || (run.skipped_from.is_some()&&(!lane_mode||self.nodes[id].lanes.as_ref().unwrap().decisions(i).is_some())) {
+            } else if all_lanes_skipped || expired || disagreement || run.lane_parent_abandoned || (run.skipped_from.is_some()&&(!lane_mode||self.nodes[id].lanes.as_ref().unwrap().ready(i).is_some())) {
+                if lane_mode && id==0 {let mut c=view::cblock_json(i,run.parent,"","","skipped");c["lanes"]=self.lane_yardstick(i);step.events.push(Telemetry{slot:Some(i*4),anchor:"consensus",at:offset(now,run.start),kind:"cblock.assembled",data:c});}
                 actions = self.nodes[id].votor.timeout(i)?;
                 self.nodes[id]
                     .windows
@@ -3605,6 +3697,7 @@ impl Network {
             self.consensus_actions(id, actions, &mut step)?;
             self.dispatch(id, step).await?;
         }
+        if lane_mode {self.early_lane_handover(id,w).await?;}
         Ok(())
     }
     fn first_skipped_consensus_slot(&self, id: usize, slot: u64) -> Option<u64> {
@@ -3632,9 +3725,11 @@ impl Network {
         actions: Vec<Action>,
         step: &mut Step,
     ) -> Result<()> {
-        for action in actions {
+        let mut actions=std::collections::VecDeque::from(actions);
+        while let Some(action)=actions.pop_front() {
             match action {
                 Action::SendVote(vote) => {
+                    if self.uses_lanes(vote.slot*4) && matches!(vote.kind,consensus::VoteKind::Notar|consensus::VoteKind::Skip) {self.nodes[id].voted.insert(vote.slot);}
                     if vote.slot % 4 == 3 {
                         self.handover_trace.lock().unwrap().entry(vote.slot / 4 + 1).or_default().push((id, "vote", Instant::now()));
                     }
@@ -3743,6 +3838,7 @@ impl Network {
                         "finalized",
                     );
                     c["finalizedUs"] = json!(at);
+                    if id==0 && self.uses_lanes(block.slot*4) {c["lanes"]=self.lane_yardstick(block.slot);}
                     step.events.push(Telemetry {
                         slot: Some(block.slot * 4),
                         anchor: "consensus",
@@ -3755,6 +3851,16 @@ impl Network {
                     window_first_slot,
                     parent,
                 } => {
+                    let window=window_first_slot/4;
+                    if self.uses_lanes(window_first_slot*4) && self.nodes[id].windows.get(&window).is_some_and(|run|run.parent!=parent) {
+                        let run=self.nodes[id].windows.get_mut(&window).unwrap();
+                        run.lane_parent_abandoned=true;
+                        run.skipped_from.get_or_insert(window_first_slot);
+                        // Lock Skip before accepting another wire certificate;
+                        // merely queued window repair could otherwise sign a
+                        // child of a competing speculative parent in between.
+                        for cblock in window_first_slot..window_first_slot+4 {actions.extend(self.nodes[id].votor.timeout(cblock)?);}
+                    }
                     let mut trace = self.handover_trace.lock().unwrap();
                     trace.entry(window_first_slot / 4).or_default().push((id, "ready", Instant::now()));
                     while trace.len() > 128 {
@@ -3850,6 +3956,7 @@ impl Network {
                         "threshold": threshold,
                         "proposerConfig": self.proposers.read().unwrap().config,
                         "consensusStakes":self.voting_set(finalized.slot)?.1,
+                        "lanesFromSlot":self.lanes_from_slot(),
                     }))
                 })();
                 let _ = reply.send(result.map_err(|e| e.to_string()));
@@ -3954,7 +4061,12 @@ impl Network {
             if signed_attestations { attestation["signature"] = json!(bs58::encode(signature).into_string()); }
             attestation
         }).collect::<Vec<_>>();
-        Ok(json!({"slot": slot, "agreed": agreed, "blocks": blocks, "attestations": attestations}))
+        let mut result=json!({"slot": slot, "agreed": agreed, "blocks": blocks, "attestations": attestations});
+        if self.uses_lanes(slot) {
+            result["pi"]=json!(self.canonical_lane_pi(0,slot)?.iter().map(|hash|hash.map(hex::encode)).collect::<Vec<_>>());
+            if slot%4==3 {result["laneCblock"]=self.lane_material(slot/4)?;}
+        }
+        Ok(result)
     }
 
     /// The demo pool's vault balances, read from node zero's executed state.
@@ -4444,7 +4556,7 @@ fn verify_exchange_report(input:&crate::external::ExternalIngress,schedules:&std
     Ok((identity,report))
 }
 async fn member_votes(mut incoming:mpsc::Receiver<acrux_transport::external::ExternalIngress>,transport:Arc<LocalTransport>,
-    schedules:Arc<std::sync::RwLock<ProposerSchedules>>,gateway:crate::gateway::SharedGateway,observer:crate::observer::Observer,chain_tag:Option<[u8;32]>) {
+    schedules:Arc<std::sync::RwLock<ProposerSchedules>>,gateway:crate::gateway::SharedGateway,observer:crate::observer::Observer,bridge:Option<crate::genesis::BridgeConfig>) {
     let mut reported=BTreeMap::new();
     while let Some(input)=incoming.recv().await {
         let started=gateway.read().await.current_window["number"].as_u64().unwrap_or(0)*4;
@@ -4491,7 +4603,18 @@ async fn member_votes(mut incoming:mpsc::Receiver<acrux_transport::external::Ext
                     let (identities,_)=frozen.voting_set(signed.vote.slot)?;
                     ensure!(identities.get(signed.vote.validator)==Some(&identity),"Identity is not a voter in this epoch");
                     let key=ed25519_dalek::VerifyingKey::from_bytes(&input.identity)?;
-                    let mut message=chain_tag.map_or_else(Vec::new,|tag|tag.to_vec());message.extend_from_slice(&encode(&signed.vote)?);
+                    let message=crate::types::vote_message(&signed.vote,bridge.as_ref())?;
+                    crypto::verify_bytes(&key,&message,&signed.signature)?;
+                    remember_verified(crypto::hash(&[key.as_bytes().as_slice(),&message,&signed.signature].concat()));
+                    (signed.vote.slot*4,(0..12).collect::<Vec<_>>())
+                },
+                Wire::LaneVote{lane,signed}=>{
+                    ensure!(bridge.as_ref().and_then(|rule|rule.lanes_from_slot).is_some_and(|from|signed.vote.slot*4>=from)&&(1..=3).contains(lane),"Lane vote before activation");
+                    ensure!(signed.vote.slot+64>=started && signed.vote.slot<=started+16,"Member lane vote is outside the held window");
+                    let (identities,_)=frozen.voting_set(signed.vote.slot)?;
+                    ensure!(identities.get(signed.vote.validator)==Some(&identity),"Identity is not a lane voter in this epoch");
+                    let key=ed25519_dalek::VerifyingKey::from_bytes(&input.identity)?;
+                    let message=crate::types::lane_vote_message(*lane,&signed.vote,bridge.as_ref())?;
                     crypto::verify_bytes(&key,&message,&signed.signature)?;
                     remember_verified(crypto::hash(&[key.as_bytes().as_slice(),&message,&signed.signature].concat()));
                     (signed.vote.slot*4,(0..12).collect::<Vec<_>>())
@@ -4705,6 +4828,7 @@ fn threshold_transaction(
 #[derive(Default)]
 struct StateChecks {
     pending: BTreeMap<u64, (String, u16)>,
+    lane_pending: BTreeMap<(u64,[u8;32]), (String,u16)>,
     completed: BTreeMap<u64,String>,
     checked: u64,
     mismatches: u64,

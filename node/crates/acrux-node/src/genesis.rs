@@ -129,9 +129,21 @@ pub struct BridgeConfig {
     /// Begin hashed admission snapshots at this bridge epoch; the first new set is the next epoch.
     #[serde(default)]
     pub admission_from_slot: Option<u64>,
+    /// Decide cblocks lane by lane from this window boundary; absent keeps the legacy rule.
+    #[serde(default)]
+    pub lanes_from_slot: Option<u64>,
+    /// SPL Token's native mint (`So111…112`) is placed from this slot, so ACRUX wraps as SOL does.
+    #[serde(default)]
+    pub native_mint_from_slot: Option<u64>,
 }
 impl BridgeConfig {
     pub fn chain_tag(&self) -> [u8; 32] { crate::crypto::hash(self.chain_id.as_bytes()) }
+    pub fn lanes_activation(&self) -> Result<Option<u64>> {
+        if let Some(slot) = self.lanes_from_slot {
+            ensure!(slot % 16 == 0 && slot >= self.from_slot, "lanesFromSlot must be a window boundary at or after fromSlot");
+        }
+        Ok(self.lanes_from_slot)
+    }
     pub fn native_cutover(&self) -> Result<Option<crate::execution::NativeCutover>> {
         match (self.native_from_slot, self.native_mint, self.native_scale) {
             (None, None, None) => Ok(None),
@@ -227,6 +239,8 @@ fn bridge(chain: &Path) -> Result<Option<BridgeConfig>> {
     config.stake_activation()?;
     config.fee_burn_activation()?;
     config.admission_activation()?;
+    config.lanes_activation()?;
+    ensure!(config.native_mint_from_slot.is_none_or(|slot| slot >= config.from_slot), "nativeMintFromSlot must be at or after fromSlot");
     Ok(Some(config))
 }
 
