@@ -3,7 +3,7 @@
 // status, so the server, the OpenAPI document and the fixtures read one table.
 
 import { z } from 'zod'
-import { Address } from './primitives.js'
+import { Address, openEnum } from './primitives.js'
 
 /** The codes every API speaks. A product adds its own with defineErrors. */
 export const BASE_ERROR_STATUS = {
@@ -25,7 +25,7 @@ export const BASE_ERROR_STATUS = {
 } as const
 export type BaseErrorCode = keyof typeof BASE_ERROR_STATUS
 
-export const ErrorStage = z.enum(['validation', 'auth', 'read', 'upload', 'build', 'wallet', 'co_sign', 'simulation', 'send', 'confirmation'])
+export const ErrorStage = openEnum(['validation', 'auth', 'read', 'upload', 'build', 'wallet', 'co_sign', 'simulation', 'send', 'confirmation'])
 export type ErrorStage = z.output<typeof ErrorStage>
 
 /** The program that refused a transaction, by address, so overlapping custom codes stay unambiguous. */
@@ -63,7 +63,8 @@ export function defineErrors<const Extra extends Record<string, number>>(extra: 
   const status = { ...BASE_ERROR_STATUS, ...extra } as typeof BASE_ERROR_STATUS & Extra
   type Code = keyof typeof status & string
   const ErrorCode = z.enum(Object.keys(status) as [Code, ...Code[]])
-  const ApiError = z.object({ error: fields(ErrorCode) })
+  // A client on an older contract still reads an error whose code a newer API added.
+  const ApiError = z.object({ error: fields(openEnum(ErrorCode.options)) })
   return { status, ErrorCode, ApiError }
 }
 

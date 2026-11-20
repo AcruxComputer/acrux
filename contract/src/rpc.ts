@@ -1,13 +1,13 @@
 import { z } from 'zod'
 import { ApiError, Balance, Count, Counters, DemoPool, Facts, FragmentSubmission, NetSnapshot, PlainSubmission, Quote, QuoteRequest, Slot, Submission, Transaction, TxId, Window, Address, BaseUnits, HubCode } from './schemas.js'
 import { LabReplay } from './events.js'
-import { Signature, U64, PageQuery } from './primitives.js'
+import { Signature, U64, PageQuery, openEnum } from './primitives.js'
 const empty = z.strictObject({})
 export const rpcMethods = {
   getValidatorEarningsEpochs: { params: empty, result: z.object({ epochSlots: Count.min(1), epochs: z.array(Count) }) },
   getValidatorEarnings: { params: z.strictObject({ epoch: Count }), result: z.object({
     epoch: Count, countedFromSlot: Count,
-    rows: z.array(z.object({ identity: Address, hub: HubCode, validatorKind: z.enum(['genesis', 'external']), base: BaseUnits, priority: BaseUnits, inclusion: BaseUnits })),
+    rows: z.array(z.object({ identity: Address, hub: HubCode, validatorKind: openEnum(['genesis', 'external']), base: BaseUnits, priority: BaseUnits, inclusion: BaseUnits })),
   }) },
   /** Bridge epochs from the native cut-over. Times are Unix milliseconds; cursor is an exclusive epoch. */
   getFeeBurns: { params: PageQuery, result: z.object({

@@ -7,6 +7,12 @@ import { fromBase58 } from './encoding.js'
 
 export const U64_MAX = 18446744073709551615n
 
+/** A response enum: its known values stay typed, and a value a newer API adds parses as its string,
+ * so a client on an older contract reads every response. Requests keep `z.enum`, which refuses it. */
+export function openEnum<const T extends readonly string[]>(values: T) {
+  return z.union([z.enum(values as unknown as [T[number], ...T[number][]]), z.string()]) as unknown as z.ZodType<T[number] | (string & {}), string>
+}
+
 const encodes = (bytes: number) => (value: string) => {
   try {
     return fromBase58(value).length === bytes

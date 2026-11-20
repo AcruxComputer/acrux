@@ -2,7 +2,7 @@ import { FAUCET_RETIRED_MESSAGE } from './bridge.js'
 import type { z } from 'zod'
 import { toBase58, toBase64 } from './encoding.js'
 import { PROTOCOL_PARAMETERS, errors } from './schemas.js'
-import type { Balance, GenesisShare, HubEarnings, Bridge, BridgeTransfer, Burn, BurnEpoch, DemoPool, Evidence, Facts, FaucetPolicy, FaucetStatus, FaucetGrant, LabScenario, RegistryConfig, SchedulePreview, SpecMap } from './schemas.js'
+import type { ScenarioId, Balance, GenesisShare, HubEarnings, Bridge, BridgeTransfer, Burn, BurnEpoch, DemoPool, Evidence, Facts, FaucetPolicy, FaucetStatus, FaucetGrant, LabScenario, RegistryConfig, SchedulePreview, SpecMap } from './schemas.js'
 import type { HashExchangePair, HashExchange as HashExchangeView, HubHashExchange, Cblock, Certificate, ExecutionSchedule, Hub, LabProtocol, LabRun, LabYardstickLane, Member, MergedTransaction, NetSnapshot, Parameters, Proposer, Slot, Transaction, Window } from './schemas.js'
 import type { ApiErrorBody } from './errors.js'
 import type { LabReplay, ProtocolEvent } from './events.js'
@@ -340,7 +340,7 @@ export const scenarios: z.infer<typeof LabScenario>[] = [
   { id: 'private-front-run', title: 'Private front-run', description: 'One receiver attempts to read and front-run a same-slot 2-of-3 swap.', seed: 'acrux-private-front-run-1', parameters: { attacker: 1, n: 3, t: 2, simultaneousTargetSlot: true }, lemma: 'Section 3.2 — Threshold transactions; Lemma 2.3', expectedOutcome: 'One fragment is unreadable; the honest same-slot fragments reconstruct the swap after commitment.' },
 ]
 function scenarioEvidence(scenario: z.infer<typeof LabScenario>, slot: Slot): z.infer<typeof Evidence> {
-  const kind = ({ 'last-look': 'late_block_dropped', censorship: 'transaction_included', crash: 'two_proposers_continue', equivocation: 'slashing_proof', 'split-commitments': 'skip_certificate', 'private-front-run': 'unreadable_fragment' } as const)[scenario.id]
+  const kind = ({ 'last-look': 'late_block_dropped', censorship: 'transaction_included', crash: 'two_proposers_continue', equivocation: 'slashing_proof', 'split-commitments': 'skip_certificate', 'private-front-run': 'unreadable_fragment' } as const)[scenario.id as ScenarioId]
   return { kind, slot: slot.slot, proposer: scenario.id === 'censorship' ? 3 : scenario.id === 'private-front-run' ? 1 : 3,
     txId: scenario.id === 'censorship' || scenario.id === 'private-front-run' ? fixtureHash(`tx-${slot.slot}-0`) : null,
     description: scenario.expectedOutcome, hashes: scenario.id === 'equivocation' ? [slot.blocks[2]!.commitment!.hash, fixtureHash('conflict-two')] : [],

@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { Address, Base64, BaseUnits, Signature, Timestamp, U64, page, PageQuery } from './primitives.js'
+import { Address, Base64, BaseUnits, Signature, Timestamp, U64, openEnum, page, PageQuery } from './primitives.js'
 import { defineErrors } from './errors.js'
 export { Address, Base64, BaseUnits, Signature, Timestamp, U64, PageQuery }
 export { CONTRACT_VERSION } from './version.js'
@@ -28,7 +28,7 @@ export const PROTOCOL_PARAMETERS: Parameters = {
   timeoutUs: 750000, tracks: 4, reserveLamports: '1000000', trackCapacityCu: null,
   fragmentExpirySlots: null, alpha: null, minimumHubMembers: null, minimumHubStake: null,
 }
-export const Proposer = z.object({ index: ProposerIndex, identity: Address, stake: U64, status: z.enum(['online', 'late', 'crashed']), validatorKind: z.enum(['genesis', 'external']).optional() })
+export const Proposer = z.object({ index: ProposerIndex, identity: Address, stake: U64, status: openEnum(['online', 'late', 'crashed']), validatorKind: openEnum(['genesis', 'external']).optional() })
 export type Proposer = z.infer<typeof Proposer>
 export const Window = z.object({ number: Count, hubCode: HubCode, firstSlot: SlotNumber, lastSlot: SlotNumber, consensusSlots: z.array(Count), proposers: z.array(Proposer).length(3) })
 export type Window = z.infer<typeof Window>
@@ -38,7 +38,7 @@ export const Commitment = z.object({ slot: SlotNumber, proposer: ProposerIndex, 
 export type Commitment = z.infer<typeof Commitment>
 export const Attestation = z.object({ slot: SlotNumber, proposer: ProposerIndex, pi: z.array(Hash.nullable()).length(3), key: Base64, signature: Signature, sentUs: Count, validatorArrivals: z.array(z.object({ identity: Address, arrivedUs: Count })) })
 export type Attestation = z.infer<typeof Attestation>
-export const ProposerBlock = z.object({ proposer: ProposerIndex, identity: Address, status: z.enum(['streaming', 'sealed', 'accepted', 'dropped', 'missing']), bytes: Count, slices: z.array(Slice), commitment: Commitment.nullable(), attestation: Attestation.nullable(), parent: z.object({ consensusSlot: Count, hash: Hash }).nullable(), validatorKind: z.enum(['genesis', 'external']).optional() })
+export const ProposerBlock = z.object({ proposer: ProposerIndex, identity: Address, status: openEnum(['streaming', 'sealed', 'accepted', 'dropped', 'missing']), bytes: Count, slices: z.array(Slice), commitment: Commitment.nullable(), attestation: Attestation.nullable(), parent: z.object({ consensusSlot: Count, hash: Hash }).nullable(), validatorKind: openEnum(['genesis', 'external']).optional() })
 export type ProposerBlock = z.infer<typeof ProposerBlock>
 /** priorityFeePerCu is an unsigned decimal string of micro-lamports per compute unit. */
 export const TxHeader = z.object({ id: TxId, feePayer: Address, priorityFeePerCu: U64.describe('Micro-lamports per compute unit, encoded as an unsigned decimal string.'), computeLimit: Count.min(1), writableAccounts: z.array(Address), targetSlot: SlotNumber })
@@ -46,30 +46,30 @@ export type TxHeader = z.infer<typeof TxHeader>
 /** Submitted headers reject unknown fields; response headers allow additive fields. */
 export const TxHeaderRequest = z.strictObject(TxHeader.shape)
 export const FragmentInclusion = z.object({ index: Count, receiver: ProposerIndex, slot: SlotNumber, proposer: ProposerIndex, includedUs: Count })
-export const MergedTransaction = TxHeader.extend({ kind: z.enum(['plain', 'fragments']), sourceProposers: z.array(ProposerIndex), n: z.number().int().min(1).max(3), t: z.number().int().min(1).max(3), fragmentIndices: z.array(Count), position: Count, selected: z.boolean(), exclusion: z.enum(['capacity', 'priority_fee', 'incomplete']).nullable() })
+export const MergedTransaction = TxHeader.extend({ kind: openEnum(['plain', 'fragments']), sourceProposers: z.array(ProposerIndex), n: z.number().int().min(1).max(3), t: z.number().int().min(1).max(3), fragmentIndices: z.array(Count), position: Count, selected: z.boolean(), exclusion: openEnum(['capacity', 'priority_fee', 'incomplete']).nullable() })
 export type MergedTransaction = z.infer<typeof MergedTransaction>
 export const Placement = z.object({ track: Track, startCu: Count, lengthCu: Count, txId: TxId })
 export type Placement = z.infer<typeof Placement>
 export const ExecutionSchedule = z.object({ algorithm: z.literal(4), tracks: z.literal(4), capacityCu: Count.min(1), placements: z.array(Placement), gaps: z.array(z.object({ track: Track, startCu: Count, lengthCu: Count })) })
 export type ExecutionSchedule = z.infer<typeof ExecutionSchedule>
-export const SkipReason = z.enum(['disagreeing_vectors', 'missing_attestation', 'equivocation', 'majority_lost', 'window_skipped'])
+export const SkipReason = openEnum(['disagreeing_vectors', 'missing_attestation', 'equivocation', 'majority_lost', 'window_skipped'])
 export const Skip = z.object({ reason: SkipReason, detail: z.string(), disagreeingVectors: z.array(Attestation), affectedSlots: z.array(SlotNumber), atUs: Count })
-export const Vote = z.object({ consensusSlot: Count, validator: Address, kind: z.enum(['notar', 'notar_fallback', 'skip', 'skip_fallback', 'finalize']), stakeShare: z.number().min(0).max(1), hash: Hash.nullable(), atUs: Count })
+export const Vote = z.object({ consensusSlot: Count, validator: Address, kind: openEnum(['notar', 'notar_fallback', 'skip', 'skip_fallback', 'finalize']), stakeShare: z.number().min(0).max(1), hash: Hash.nullable(), atUs: Count })
 export type Vote = z.infer<typeof Vote>
-export const Certificate = z.object({ consensusSlot: Count, kind: z.enum(['notarization', 'notar_fallback', 'fast_finalization', 'slow_finalization', 'skip']), stakeShare: z.number().min(0).max(1), threshold: z.number().min(0).max(1), hash: Hash.nullable(), signers: z.array(Address), atUs: Count, linkedConsensusSlot: Count.nullable() })
+export const Certificate = z.object({ consensusSlot: Count, kind: openEnum(['notarization', 'notar_fallback', 'fast_finalization', 'slow_finalization', 'skip']), stakeShare: z.number().min(0).max(1), threshold: z.number().min(0).max(1), hash: Hash.nullable(), signers: z.array(Address), atUs: Count, linkedConsensusSlot: Count.nullable() })
 export type Certificate = z.infer<typeof Certificate>
-export const Cblock = z.object({ consensusSlot: Count, slots: z.array(SlotNumber), parent: z.object({ consensusSlot: Count, hash: Hash }).nullable(), hash: Hash.nullable(), stateHash: Hash.nullable(), votes: z.array(Vote), certificates: z.array(Certificate), status: z.enum(['pending', 'notarized', 'finalized', 'skipped']), finalizedUs: Count.nullable() })
+export const Cblock = z.object({ consensusSlot: Count, slots: z.array(SlotNumber), parent: z.object({ consensusSlot: Count, hash: Hash }).nullable(), hash: Hash.nullable(), stateHash: Hash.nullable(), votes: z.array(Vote), certificates: z.array(Certificate), status: openEnum(['pending', 'notarized', 'finalized', 'skipped']), finalizedUs: Count.nullable() })
 export type Cblock = z.infer<typeof Cblock>
 // Block and execution times are slot-relative; these two deadlines are window ParentReady-relative.
-export const Slot = z.object({ slot: SlotNumber, wallTime: Timestamp, window: Window, consensusSlot: Count, status: z.enum(['pending', 'executed', 'finalized', 'skipped']), blocks: z.array(ProposerBlock), attestations: z.array(Attestation), agreedSet: z.array(ProposerIndex).nullable(), skip: Skip.nullable(), mergedOrder: z.array(MergedTransaction), schedule: ExecutionSchedule.nullable(), stateHash: Hash.nullable(), xblockHash: Hash.nullable(), cblock: Cblock, executedUs: Count.nullable(), attestationDeadlineUs: Count, consensusTimeoutUs: Count })
+export const Slot = z.object({ slot: SlotNumber, wallTime: Timestamp, window: Window, consensusSlot: Count, status: openEnum(['pending', 'executed', 'finalized', 'skipped']), blocks: z.array(ProposerBlock), attestations: z.array(Attestation), agreedSet: z.array(ProposerIndex).nullable(), skip: Skip.nullable(), mergedOrder: z.array(MergedTransaction), schedule: ExecutionSchedule.nullable(), stateHash: Hash.nullable(), xblockHash: Hash.nullable(), cblock: Cblock, executedUs: Count.nullable(), attestationDeadlineUs: Count, consensusTimeoutUs: Count })
 export type Slot = z.infer<typeof Slot>
 /** What the payer paid, in lamports: native ACRUX from the cut-over. Half the base fee is burned. */
 export const TxFees = z.object({ base: U64, priority: U64, inclusion: U64, burned: U64, total: U64 })
 export type TxFees = z.infer<typeof TxFees>
-export const Transaction = z.object({ header: TxHeader, state: z.enum(['unknown', 'sent', 'partly_included', 'executed', 'finalized', 'failed', 'expired']), kind: z.enum(['plain', 'fragments']), n: z.number().int().min(1).max(3), t: z.number().int().min(1).max(3), receivers: z.array(Proposer), fragments: z.array(FragmentInclusion), includedCount: Count, readableSlot: SlotNumber.nullable(), executedSlot: SlotNumber.nullable(), mergedPosition: Count.nullable(), result: z.enum(['success', 'error']).nullable(), logs: z.array(z.string()), failure: z.string().nullable(), expiresAfterSlot: SlotNumber.nullable(), finalization: Certificate.nullable(), fees: TxFees.optional() })
+export const Transaction = z.object({ header: TxHeader, state: openEnum(['unknown', 'sent', 'partly_included', 'executed', 'finalized', 'failed', 'expired']), kind: openEnum(['plain', 'fragments']), n: z.number().int().min(1).max(3), t: z.number().int().min(1).max(3), receivers: z.array(Proposer), fragments: z.array(FragmentInclusion), includedCount: Count, readableSlot: SlotNumber.nullable(), executedSlot: SlotNumber.nullable(), mergedPosition: Count.nullable(), result: openEnum(['success', 'error']).nullable(), logs: z.array(z.string()), failure: z.string().nullable(), expiresAfterSlot: SlotNumber.nullable(), finalization: Certificate.nullable(), fees: TxFees.optional() })
 export type Transaction = z.infer<typeof Transaction>
 export const Counters = z.object({ slots: Count, finalizedCblocks: Count, skips: Count, averageCommitSpreadUs: z.number().nonnegative() })
-export const NetSnapshot = z.object({ streamId: z.string(), cursor: Count, status: z.enum(['live', 'stalled', 'unavailable']), currentWindow: Window, recentSlots: z.array(Slot).max(64), upcomingWindows: z.array(Window), counters: Counters, parameters: Parameters })
+export const NetSnapshot = z.object({ streamId: z.string(), cursor: Count, status: openEnum(['live', 'stalled', 'unavailable']), currentWindow: Window, recentSlots: z.array(Slot).max(64), upcomingWindows: z.array(Window), counters: Counters, parameters: Parameters })
 export type NetSnapshot = z.infer<typeof NetSnapshot>
 export const Balance = z.object({ address: Address, lamports: U64, reserveLamports: U64, spendableLamports: U64, slot: SlotNumber })
 export const DemoMint = z.object({ address: Address, symbol: z.string(), name: z.string(), decimals: Count })
@@ -80,14 +80,14 @@ export const PlainSubmission = z.strictObject({ header: TxHeaderRequest, transac
 export const FragmentSubmission = z.strictObject({ header: TxHeaderRequest, n: z.number().int().min(2).max(3), t: z.number().int().min(2).max(3), index: Count.max(2), receiver: ProposerIndex, fragment: Base64.min(1), keyShare: Base64.min(1), headerSignature: Signature }).superRefine((v,c) => { if(v.t > v.n || v.index >= v.n) c.addIssue({code:'custom', message:'Require t <= n and fragment index < n.'}) })
 export const Submission = z.object({ id: TxId, accepted: z.literal(true), targetSlot: SlotNumber })
 /** The chain a hub or membership lives on: Acrux's own Hub Registry, or the one on Solana mainnet. */
-export const RegistryChain = z.enum(['acrux', 'solana'])
+export const RegistryChain = openEnum(['acrux', 'solana'])
 export const Member = z.object({ chain: RegistryChain, identity: Address, hubCode: HubCode, stake: U64, proposerStake: U64, capped: z.boolean(), effectiveEpoch: Count, joinedEpoch: Count, pendingMove: HubCode.nullable(), pendingLeave: z.boolean(), cooldownUntilEpoch: Count,
-  validatorKind: z.enum(['genesis', 'external']).optional(), admittedAtEpoch: Count.nullable().optional() })
+  validatorKind: openEnum(['genesis', 'external']).optional(), admittedAtEpoch: Count.nullable().optional() })
 export type Member = z.infer<typeof Member>
 /** Microseconds measured from a commitment's local send to its authenticated receipt. */
 export const HashExchangeStats = z.object({ p50: Count, p99: Count, count: Count.min(1) }).refine(value => value.p99 >= value.p50, 'p99 must be at least p50.')
 export type HashExchangeStats = z.infer<typeof HashExchangeStats>
-export const HashExchangePair = z.object({ members: z.tuple([Address, Address]), kind: z.enum(['applied', 'real']), p50: Count, p99: Count, count: Count.min(1) })
+export const HashExchangePair = z.object({ members: z.tuple([Address, Address]), kind: openEnum(['applied', 'real']), p50: Count, p99: Count, count: Count.min(1) })
   .refine(value => value.members[0] < value.members[1] && value.p99 >= value.p50, 'Pair members must be in canonical base58 order and percentiles must be ordered.')
 export type HashExchangePair = z.infer<typeof HashExchangePair>
 export const HashExchangeSpread = z.object({ applied: HashExchangeStats.nullable(), real: HashExchangeStats.nullable() })
@@ -100,13 +100,13 @@ export type HashExchangeTelemetry = z.infer<typeof HashExchangeTelemetry>
 export const HubHashExchange = z.object({ measuredAt: Timestamp, measurement: z.literal('roundTrip'), pairs: z.array(HashExchangePair), commitSpreadUs: HashExchangeSpread })
 export type HubHashExchange = z.infer<typeof HubHashExchange>
 /** ECEF coordinates are integer metres in the WGS84 geocentric reference frame. */
-export const Hub = z.object({ chain: RegistryChain, code: HubCode, name: z.string(), region: z.string(), ecef: z.object({ x: z.number().int(), y: z.number().int(), z: z.number().int() }).describe('Integer metres in WGS84 Earth-centred, Earth-fixed coordinates.'), latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), registrant: Address, depositLamports: U64, members: z.array(Member), stake: U64, proposerStake: U64, proposerStakeCap: U64, status: z.enum(['active', 'pending', 'inactive']), needs: z.object({ members: Count, stake: U64 }), createdEpoch: Count, lastActiveEpoch: Count.nullable(), releasableEpoch: Count.nullable(), releasable: z.boolean(), hashExchange: HubHashExchange.optional(), formedOutside: z.boolean().optional(), activatedAtEpoch: Count.nullable().optional() })
+export const Hub = z.object({ chain: RegistryChain, code: HubCode, name: z.string(), region: z.string(), ecef: z.object({ x: z.number().int(), y: z.number().int(), z: z.number().int() }).describe('Integer metres in WGS84 Earth-centred, Earth-fixed coordinates.'), latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), registrant: Address, depositLamports: U64, members: z.array(Member), stake: U64, proposerStake: U64, proposerStakeCap: U64, status: openEnum(['active', 'pending', 'inactive']), needs: z.object({ members: Count, stake: U64 }), createdEpoch: Count, lastActiveEpoch: Count.nullable(), releasableEpoch: Count.nullable(), releasable: z.boolean(), hashExchange: HubHashExchange.optional(), formedOutside: z.boolean().optional(), activatedAtEpoch: Count.nullable().optional() })
 export type Hub = z.infer<typeof Hub>
 export const Hubs = page(Hub)
 /** The genesis validators' share of stake in each bridge epoch's fixed set; the next epoch appears once its set is fixed. */
 export const GenesisShare = z.object({ currentEpoch: Count, epochs: z.array(z.object({ epoch: Count, fixedAtSlot: Count.nullable(), genesisStake: U64, totalStake: U64, genesisShareBps: Count.max(10000), genesisMembers: Count, externalMembers: Count })) })
 /** Earned fees only, in native lamports; amounts may exceed u64 after repeated circulation. */
-export const HubEarningsRow = z.object({ identity: Address, validatorKind: z.enum(['genesis', 'external']), base: BaseUnits, priority: BaseUnits, inclusion: BaseUnits })
+export const HubEarningsRow = z.object({ identity: Address, validatorKind: openEnum(['genesis', 'external']), base: BaseUnits, priority: BaseUnits, inclusion: BaseUnits })
 /** countedFromSlot is the first observed slot, so a partial first epoch is explicit. */
 export const HubEarningsEpoch = z.object({ epoch: Count, countedFromSlot: Count, rows: z.array(HubEarningsRow) })
 /** Finalized fee observations, newest bridge epoch first, with each epoch's historical roster. */
@@ -114,34 +114,34 @@ export const HubEarnings = z.object({ hubCode: HubCode, epochSlots: Count.min(1)
 export type HubEarningsRow = z.infer<typeof HubEarningsRow>
 export type HubEarningsEpoch = z.infer<typeof HubEarningsEpoch>
 export type HubEarnings = z.infer<typeof HubEarnings>
-export const RegistryConfig = z.object({ status: z.enum(['fixture', 'waiting', 'ready']), chain: RegistryChain, programId: Address.nullable(), cluster: z.enum(['localnet', 'mainnet-beta', 'acrux']), depositLamports: U64.nullable(), registrationFeeBps: Count.max(10000).nullable(), cooldownEpochs: Count.nullable(), inactivityEpochs: Count.nullable(), codeRules: z.object({ pattern: z.string().nullable(), minLength: Count.nullable(), maxLength: Count.nullable() }), minimumMembers: Count.nullable(), minimumStake: U64.nullable(), currentEpoch: Count, missingConfiguration: z.array(z.string()) })
-export const SchedulePreview = z.object({ epoch: Count, seed: z.string(), source: z.enum(['fixture', 'registry']), algorithm: z.literal(3), alpha: z.number().min(0).max(1), totalWindows: Count, shares: z.array(z.object({ hubCode: HubCode, proposerStake: U64, probability: z.number(), assignedWindows: Count })), regionalRuns: z.array(z.object({ region: z.string(), firstWindow: Count, lastWindow: Count })), windows: z.array(Window) })
+export const RegistryConfig = z.object({ status: openEnum(['fixture', 'waiting', 'ready']), chain: RegistryChain, programId: Address.nullable(), cluster: openEnum(['localnet', 'mainnet-beta', 'acrux']), depositLamports: U64.nullable(), registrationFeeBps: Count.max(10000).nullable(), cooldownEpochs: Count.nullable(), inactivityEpochs: Count.nullable(), codeRules: z.object({ pattern: z.string().nullable(), minLength: Count.nullable(), maxLength: Count.nullable() }), minimumMembers: Count.nullable(), minimumStake: U64.nullable(), currentEpoch: Count, missingConfiguration: z.array(z.string()) })
+export const SchedulePreview = z.object({ epoch: Count, seed: z.string(), source: openEnum(['fixture', 'registry']), algorithm: z.literal(3), alpha: z.number().min(0).max(1), totalWindows: Count, shares: z.array(z.object({ hubCode: HubCode, proposerStake: U64, probability: z.number(), assignedWindows: Count })), regionalRuns: z.array(z.object({ region: z.string(), firstWindow: Count, lastWindow: Count })), windows: z.array(Window) })
 export const FaucetPolicy = z.object({ amountLamports: U64.nullable(), perKey: Count.nullable(), perIp: Count.nullable(), periodSeconds: Count.nullable(), missingConfiguration: z.array(z.string()) })
 /** `availableLamports`: what the faucet can still grant, in lamports; null while the net cannot be read. */
 export const FaucetStatus = z.object({ address: Address, policy: FaucetPolicy, remainingForKey: Count.nullable(), remainingForIp: Count.nullable(), resetsAt: Timestamp.nullable(), eligible: z.boolean(), availableLamports: U64.nullable() })
 export const FaucetRequest = z.strictObject({ address: Address })
 export const FaucetGrant = z.object({ id: z.string(), transactionId: TxId.optional(), address: Address, amountLamports: U64, signature: Signature, balance: Balance, grantedAt: Timestamp })
-export const Facts = z.object({ source: z.enum(['fixture', 'measured']), measuredAt: Timestamp, sampleSize: Count, slotPacingUs: z.object({ p50: Count, p99: Count }), commitSpreadUs: z.object({ p50: Count, p99: Count }), attestationRelativeToBlockUs: z.object({ p50: z.number().int(), p99: z.number().int() }), cblockFinalizationUs: z.object({ p50: Count, p99: Count }),
+export const Facts = z.object({ source: openEnum(['fixture', 'measured']), measuredAt: Timestamp, sampleSize: Count, slotPacingUs: z.object({ p50: Count, p99: Count }), commitSpreadUs: z.object({ p50: Count, p99: Count }), attestationRelativeToBlockUs: z.object({ p50: z.number().int(), p99: z.number().int() }), cblockFinalizationUs: z.object({ p50: Count, p99: Count }),
   /** Window handovers per hub link (e.g. "FRA-NYC"): measured p50/p99 and the link's Rotor floor (50 ms plus the second hub's votes for the 60% certificate). */
   handoverUs: z.record(z.string(), z.object({ p50: Count, p99: Count, floorUs: Count, count: Count })),
   hashExchange: HashExchange.optional(), commitSpreadByLinkUs: HashExchangeSpread.optional() })
 export const ScenarioId = z.enum(['last-look', 'censorship', 'crash', 'equivocation', 'split-commitments', 'private-front-run'])
-export const Evidence = z.object({ kind: z.enum(['late_block_dropped', 'transaction_included', 'two_proposers_continue', 'slashing_proof', 'skip_certificate', 'unreadable_fragment', 'window_continued', 'lane_skipped']), slot: SlotNumber, proposer: ProposerIndex.nullable(), txId: TxId.nullable(), description: z.string(), hashes: z.array(Hash), signatures: z.array(Signature), observedFragments: Count.nullable(), threshold: Count.nullable(), attackSlot: SlotNumber.optional(), agreedSet: z.array(ProposerIndex).optional(), finalized: z.boolean().optional(), skipCertificate: Certificate.optional(), otherLanesFinalized: z.array(ProposerIndex).optional() })
-export const LabScenario = z.object({ id: ScenarioId, title: z.string(), description: z.string(), seed: z.string(), parameters: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])), lemma: z.string(), expectedOutcome: z.string() })
+export const Evidence = z.object({ kind: openEnum(['late_block_dropped', 'transaction_included', 'two_proposers_continue', 'slashing_proof', 'skip_certificate', 'unreadable_fragment', 'window_continued', 'lane_skipped']), slot: SlotNumber, proposer: ProposerIndex.nullable(), txId: TxId.nullable(), description: z.string(), hashes: z.array(Hash), signatures: z.array(Signature), observedFragments: Count.nullable(), threshold: Count.nullable(), attackSlot: SlotNumber.optional(), agreedSet: z.array(ProposerIndex).optional(), finalized: z.boolean().optional(), skipCertificate: Certificate.optional(), otherLanesFinalized: z.array(ProposerIndex).optional() })
+export const LabScenario = z.object({ id: openEnum(ScenarioId.options), title: z.string(), description: z.string(), seed: z.string(), parameters: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])), lemma: z.string(), expectedOutcome: z.string() })
 export const LabProtocol = z.enum(['today', 'agreement', 'lanes'])
 export type LabProtocol = z.infer<typeof LabProtocol>
 export const LabRunRequest = z.strictObject({ scenario: ScenarioId, seed: z.string().min(1).max(128).optional(), protocol: LabProtocol.default('today') })
 /** One proposer's consensus lane; vote counters use the same kind names as the cblock totals. */
-export const LabYardstickLane = z.object({ proposer: ProposerIndex, status: z.enum(['finalized', 'skipped', 'pending']), votes: z.record(z.string(), Count), certificates: z.array(z.string()) })
+export const LabYardstickLane = z.object({ proposer: ProposerIndex, status: openEnum(['finalized', 'skipped', 'pending']), votes: z.record(z.string(), Count), certificates: z.array(z.string()) })
 export type LabYardstickLane = z.infer<typeof LabYardstickLane>
 /** One cblock of the window before the attack, the attacker's window and the one after, as node zero recorded it. `votes` counts votes by kind; `finalizedUs` is the time from the cblock's start to finalized. */
 export const LabYardstickCblock = z.object({ cblock: Count, window: Count, status: z.string(), skipped: z.boolean(), votes: z.record(z.string(), Count), certificates: z.array(z.string()), finalizedUs: Count.nullable(), lanes: z.array(LabYardstickLane).optional() })
 /** A run's yardstick: slots skipped in the attacker's window, and each cblock of the three windows. */
 export const LabYardstick = z.object({ attackerWindow: Count, slotsSkipped: Count, cblocks: z.array(LabYardstickCblock) })
-export const LabRun = z.object({ id: z.string(), scenario: LabScenario, seed: z.string(), protocol: LabProtocol.optional(), status: z.enum(['queued', 'running', 'done', 'failed_to_start']), createdAt: Timestamp, startedAt: Timestamp.nullable(), endedAt: Timestamp.nullable(), outcome: z.string().nullable(), evidence: z.array(Evidence), yardstick: LabYardstick.nullable(), failure: z.string().nullable() })
+export const LabRun = z.object({ id: z.string(), scenario: LabScenario, seed: z.string(), protocol: openEnum(LabProtocol.options).optional(), status: openEnum(['queued', 'running', 'done', 'failed_to_start']), createdAt: Timestamp, startedAt: Timestamp.nullable(), endedAt: Timestamp.nullable(), outcome: z.string().nullable(), evidence: z.array(Evidence), yardstick: LabYardstick.nullable(), failure: z.string().nullable() })
 export type LabRun = z.infer<typeof LabRun>
 export const LabRuns = page(LabRun)
-export const SpecMap = z.object({ paper: z.string(), parameters: Parameters, entries: z.array(z.object({ reference: z.string(), lines: z.string().nullable(), file: z.string(), function: z.string(), scenario: ScenarioId.nullable(), status: z.enum(['fixture', 'planned', 'implemented']) })), decisions: z.array(z.object({ topic: z.string(), decision: z.string(), status: z.enum(['decided', 'configuration_required', 'fixture_only']) })) })
+export const SpecMap = z.object({ paper: z.string(), parameters: Parameters, entries: z.array(z.object({ reference: z.string(), lines: z.string().nullable(), file: z.string(), function: z.string(), scenario: ScenarioId.nullable(), status: openEnum(['fixture', 'planned', 'implemented']) })), decisions: z.array(z.object({ topic: z.string(), decision: z.string(), status: openEnum(['decided', 'configuration_required', 'fixture_only']) })) })
 /**
  * The bridge between Solana and Acrux (`acrux_bridge`, the same program on both chains). A deposit
  * locks tokens in the Solana mint's vault and is credited on Acrux at the mint derived from it, with
@@ -169,7 +169,7 @@ export const BridgeNative = z.object({
 })
 export type BridgeNative = z.infer<typeof BridgeNative>
 export const Bridge = z.object({
-  status: z.enum(['waiting', 'live']),
+  status: openEnum(['waiting', 'live']),
   /** The program's address, on Solana and on Acrux. */
   program: Address.nullable(),
   /** The first Acrux slot of the bridge rule. */
@@ -185,9 +185,9 @@ export const Bridge = z.object({
  * A deposit is `locked` on Solana, then `credited` on Acrux. A withdrawal is `burned` on Acrux, then
  * `certified` once Solana's light client certified its cblock, then `released` from the vault.
  */
-export const BridgeTransferStatus = z.enum(['locked', 'credited', 'burned', 'certified', 'released'])
+export const BridgeTransferStatus = openEnum(['locked', 'credited', 'burned', 'certified', 'released'])
 export const BridgeTransfer = z.object({
-  kind: z.enum(['deposit', 'withdrawal']), sequence: Count, status: BridgeTransferStatus,
+  kind: openEnum(['deposit', 'withdrawal']), sequence: Count, status: BridgeTransferStatus,
   solanaMint: Address, acruxMint: Address, amount: U64,
   /** The depositor on Solana, or the withdrawal's owner on Acrux. */
   from: Address,
@@ -210,7 +210,7 @@ export type BridgeTransferStatus = z.infer<typeof BridgeTransferStatus>
 export type BridgeTransfer = z.infer<typeof BridgeTransfer>
 export type BridgeTransfers = z.infer<typeof BridgeTransfers>
 /** Buyback amounts are base units. Totals may exceed one transaction's u64 range. */
-export const BuybackAction = z.enum(['claim', 'swap', 'burn'])
+export const BuybackAction = openEnum(['claim', 'swap', 'burn'])
 export const BuybackRow = z.object({
   id: z.string(), cycleId: z.string(), action: BuybackAction, signature: Signature,
   lamports: U64, tokenAmount: U64, createdAt: Timestamp,
@@ -226,7 +226,7 @@ export const ReplayAsset = z.union([z.literal('SOL'), Address])
 export const ReplayLeaderItem = z.object({ signature: Signature, priorityFeePerCu: Count, computeLimit: Count })
 export const ReplayMergedItem = z.object({ signature: Signature, priorityFeePerCu: Count, acruxSlot: Count, track: z.number().int().min(1).max(4), startCu: Count, lengthCu: Count })
 export const ReplayRepricing = z.object({
-  pool: z.enum(['pump-curve', 'concentrated', 'constant-product']),
+  pool: openEnum(['pump-curve', 'concentrated', 'constant-product']),
   /** What the victim got of the asset it bought, and would have got with no front leg (sent 2-of-3). */
   victimGot: BaseUnits, victimWouldGet: BaseUnits,
   /** The difference valued in the asset the victim paid with, at its own price. */
@@ -267,7 +267,7 @@ export type ReplaySandwichRow = z.infer<typeof ReplaySandwichRow>
 export type ReplayRange = z.infer<typeof ReplayRange>
 
 export const Buyback = z.object({
-  status: z.enum(['waiting', 'live']), mint: Address.nullable(), wallet: Address,
+  status: openEnum(['waiting', 'live']), mint: Address.nullable(), wallet: Address,
   totals: z.object({ claimedLamports: BaseUnits, swappedLamports: BaseUnits, acruxBought: BaseUnits, acruxBurned: BaseUnits }),
   rows: z.array(BuybackRow).max(50),
 })
@@ -281,7 +281,7 @@ export const BurnEpoch = z.object({
   startedAt: Timestamp.nullable(), endedAt: Timestamp.nullable(), closed: z.boolean(),
   /** Null means this node has no complete historical observation. */
   baseFeeBurnedLamports: U64.nullable(), feeBurnAmountBaseUnits: U64.nullable(), remainderLamports: U64.nullable(),
-  solanaBurn: z.object({ signature: Signature.nullable(), state: z.enum(['not_yet_due', 'pending', 'burned']) }),
+  solanaBurn: z.object({ signature: Signature.nullable(), state: openEnum(['not_yet_due', 'pending', 'burned']) }),
   buybackBurnBaseUnits: BaseUnits.nullable(), mintSupplyAtEnd: BurnSupply.nullable(),
 })
 export const Burn = z.object({
@@ -292,7 +292,7 @@ export const Burn = z.object({
 export type BurnSupply = z.infer<typeof BurnSupply>
 export type BurnEpoch = z.infer<typeof BurnEpoch>
 export type Burn = z.infer<typeof Burn>
-export const Health = z.object({ status: z.enum(['fixture', 'waiting', 'ready']), contractVersion: z.string(), missingConfiguration: z.array(z.string()) })
+export const Health = z.object({ status: openEnum(['fixture', 'waiting', 'ready']), contractVersion: z.string(), missingConfiguration: z.array(z.string()) })
 export const SCENARIOS = ['normal', 'empty', 'waiting', 'pending', 'executed', 'finalized', 'skipped', 'sent', 'partly_included', 'failed', 'expired', 'unknown', 'active', 'inactive', 'pending_only', 'queued', 'running', 'done', 'failed_to_start', 'limit_reached', 'unfunded', 'stalled', 'unavailable', 'code_taken', 'crash', 'disagreeing_vectors', 'missing_attestation', 'equivocation', 'majority_lost', 'burn-no-epochs', 'burn-pending', 'burn-burned', 'burn-running'] as const
 // Inferred wire types: schema and type share a name without separate interfaces.
 export type Slice = z.infer<typeof Slice>

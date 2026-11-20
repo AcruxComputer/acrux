@@ -185,6 +185,25 @@ for (const [name, schema, fixture] of [['PlainSubmission', s.PlainSubmission, pl
 }
 assert.equal(StreamCommand.safeParse({ version: 1, type: 'subscribe', filter: { kind: 'all', [extra]: 'rejected' } }).success, false,
   'StreamCommand rejects unknown nested filter fields')
+// A value a newer API adds to a response enum parses as its string; the same value in a request is refused.
+const future = 'future_value'
+const newerValues = [
+  ['Evidence.kind', s.Evidence, { ...f.labRuns[0].evidence[0], kind: future }],
+  ['LabRun.protocol', s.LabRun, { ...f.labRuns[0], protocol: future }],
+  ['LabScenario.id', s.LabScenario, { ...f.scenarios[0], id: future }],
+  ['Skip.reason', s.Skip, { ...f.slotsByState.skipped.skip, reason: future }],
+  ['Hub.chain', s.Hub, { ...f.outsideFormedHub, chain: future }],
+  ['BridgeTransfer.status', s.BridgeTransfer, { ...f.bridgeTransfersFixture[0], status: future }],
+  ['ApiError.code', s.ApiError, { ...error, error: { ...error.error, code: 'FUTURE_CODE', stage: future } }],
+]
+for (const [name, schema, value] of newerValues) {
+  const parsed = schema.parse(value)
+  assert.ok(JSON.stringify(parsed).includes(name === 'ApiError.code' ? 'FUTURE_CODE' : future), `${name} keeps a newer value`)
+}
+for (const [name, value] of [['LabRunRequest.protocol', { scenario: 'crash', protocol: future }], ['LabRunRequest.scenario', { scenario: future }]]) {
+  assert.equal(s.LabRunRequest.safeParse(value).success, false, `${name} refuses a value it does not know`)
+}
+assert.equal(s.BridgeTransfersQuery.safeParse({ kind: future }).success, false, 'BridgeTransfersQuery.kind refuses a value it does not know')
 console.log(JSON.stringify({ check: 'response-compatibility', responseObjects: objectResponses.length, auxiliaryResponses: 14,
   eventVariants: events.size, rpcResults: Object.keys(rpcMethods).length, nestedResponseObjects: objectSites,
-  strictRequestCases: requests.length, strictNestedRequests: 3, olderShapes: 4, result: 'passed' }))
+  strictRequestCases: requests.length, strictNestedRequests: 3, olderShapes: 4, newerEnumValues: newerValues.length, result: 'passed' }))

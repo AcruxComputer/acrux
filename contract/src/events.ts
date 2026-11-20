@@ -1,14 +1,15 @@
 import { z } from 'zod'
+import { openEnum } from './primitives.js'
 import { ApiError, Attestation, Certificate, Commitment, CommitmentArrival, Count, Cblock, Counters, Evidence, ExecutionSchedule, LabRun, MergedTransaction, NetSnapshot, ProposerIndex, Skip, Slice, Slot, Transaction, TxId, Window } from './schemas.js'
 
 // One version per envelope. Null slot is reserved for stream/window control messages.
 // atUs is relative to the named anchor, never an epoch timestamp. Slot.wallTime is UTC.
-const common = { node: z.string().optional(), version: z.literal(1), sequence: Count, streamId: z.string(), slot: Count.nullable(), anchor: z.enum(['slot', 'window', 'consensus', 'stream']), atUs: Count }
+const common = { node: z.string().optional(), version: z.literal(1), sequence: Count, streamId: z.string(), slot: Count.nullable(), anchor: openEnum(['slot', 'window', 'consensus', 'stream']), atUs: Count }
 const event = <T extends string, S extends z.ZodType>(type: T, data: S) => z.object({ ...common, type: z.literal(type), data })
 export const ProtocolEvent = z.discriminatedUnion('type', [
   event('stream.snapshot', NetSnapshot),
-  event('stream.resync', z.object({ reason: z.enum(['connected', 'cursor_expired', 'restarted', 'filter_changed']), snapshot: NetSnapshot })),
-  event('stream.heartbeat', z.object({ latestSlot: Count, status: z.enum(['live', 'stalled', 'unavailable']) })),
+  event('stream.resync', z.object({ reason: openEnum(['connected', 'cursor_expired', 'restarted', 'filter_changed']), snapshot: NetSnapshot })),
+  event('stream.heartbeat', z.object({ latestSlot: Count, status: openEnum(['live', 'stalled', 'unavailable']) })),
   event('stream.error', ApiError),
   event('window.started', Window),
   event('slot.started', Slot),
