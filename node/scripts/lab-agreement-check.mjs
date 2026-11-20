@@ -1,4 +1,4 @@
-// Build 6 steps 1..3: nine fresh Fault Lab runs, once each, on the same historical seed.
+// R22 / Build 6 step 5: nine fresh Fault Lab runs and the silent-lane finalization timing check.
 // Usage from backend, after the coordinated release build:
 // node node/scripts/lab-agreement-check.mjs
 // Only twelve loopback QUIC ports 5062..5073 are used; lab opens no HTTP listeners.
@@ -19,8 +19,8 @@ const backend = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const nodeDir = join(backend, 'node'), target = join(nodeDir, 'target')
 const binary = join(target, 'release', process.platform === 'win32' ? 'acrux.exe' : 'acrux')
 const sourceGenesis = join(backend, 'chain/genesis/acrux-net.json')
-const reportPath = join(nodeDir, 'reports/r21-lanes.json')
-assert.equal(process.argv.length, 2, 'R21 runs all nine fresh cases; the seed and scenarios stay fixed.')
+const reportPath = join(nodeDir, 'reports/r22-early-skip.json')
+assert.equal(process.argv.length, 2, 'R22 runs all nine fresh cases; the seed and scenarios stay fixed.')
 const seed = 'acrux-r20-agreement', basePort = 5062, attackerWindow = 4
 const cases = ['split-commitments', 'crash', 'censorship'].flatMap(scenario => ['today', 'agreement', 'lanes'].map(protocol => ({ scenario, protocol })))
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -96,6 +96,13 @@ function validateOutcome(item) {
       && JSON.stringify(row.otherLanesFinalized) === '[1,2]'),
       'Lane evidence must preserve the skip certificate, signatures and finalized honest lanes.')
     if (item.scenario === 'crash') require(evidence.some(row => row.kind === 'two_proposers_continue'), 'Crash still needs the existing two-proposer evidence.')
+    if (item.scenario === 'crash') {
+      const timing = item.crashTiming
+      require(timing?.status === 'measured', 'Crash timing needs all four finalized measurements in both the previous and attacker windows.')
+      if (timing?.status === 'measured') for (const row of timing.comparisons) {
+        require(row.withinLimit, `Crash cblock ${row.cblock} finalized in ${row.finalizedUs} us, above the previous-window median ${timing.baselineMedianUs} us plus 100000 us.`)
+      }
+    }
   } else if (item.scenario === 'split-commitments' && item.protocol === 'today') {
     require(yardstick.slotsSkipped === 16, 'Today must expose the whole skipped attacker window.')
     require(evidence.some(row => row.kind === 'skip_certificate'), 'Today split commitments need their skip certificate evidence.')
@@ -112,6 +119,33 @@ function validateOutcome(item) {
   }
   return problems
 }
+function crashTiming(outcome) {
+  const rows = outcome?.yardstick?.cblocks ?? []
+  const windows = [3, 4, 5].map(window => {
+    const cblocks = Array.from({ length: 4 }, (_, index) => {
+      const cblock = window * 4 + index, row = rows.find(row => row.cblock === cblock && row.window === window)
+      return { cblock, status: row?.status ?? 'missing', finalizedUs: row?.finalizedUs ?? null }
+    })
+    const valid = row => row.status === 'finalized' && Number.isSafeInteger(row.finalizedUs) && row.finalizedUs >= 0
+    const missingCblocks = cblocks.filter(row => !valid(row)).map(row => row.cblock)
+    const ordered = cblocks.filter(valid).map(row => row.finalizedUs).sort((a, b) => a - b)
+    // All four baseline observations are required. A skipped/pending/missing measurement
+    // cannot silently lower the median or become a fabricated zero.
+    const medianUs = missingCblocks.length ? null : (ordered[1] + ordered[2]) / 2
+    return { window, cblocks, missingCblocks, medianUs }
+  })
+  const baselineMedianUs = windows[0].medianUs
+  const allowanceUs = 100_000
+  const limitUs = baselineMedianUs === null ? null : baselineMedianUs + allowanceUs
+  const complete = windows[0].missingCblocks.length === 0 && windows[1].missingCblocks.length === 0
+  const comparisons = windows[1].cblocks.map(row => ({ ...row,
+    aboveBaselineUs: baselineMedianUs === null || windows[1].missingCblocks.includes(row.cblock) ? null : row.finalizedUs - baselineMedianUs,
+    withinLimit: limitUs === null || windows[1].missingCblocks.includes(row.cblock) ? null : row.finalizedUs <= limitUs,
+  }))
+  return { baselineWindow: 3, attackWindow: 4, allowanceUs, medianMethod: 'Arithmetic mean of the middle two of four finalized cblocks',
+    windows, baselineMedianUs, limitUs, status: complete ? 'measured' : 'unavailable',
+    passed: complete ? comparisons.every(row => row.withinLimit) : null, comparisons }
+}
 function windowSummary(outcome) {
   const rows = outcome?.yardstick?.cblocks ?? []
   return [3, 4, 5].map(window => {
@@ -121,7 +155,7 @@ function windowSummary(outcome) {
       skipped: own.filter(row => row.status === 'skipped').length,
       pending: own.filter(row => row.status === 'pending').length,
       slotsSkipped: own.filter(row => row.skipped).length * 4,
-      statuses: own.map(row => ({ cblock: row.cblock, status: row.status })),
+      statuses: own.map(row => ({ cblock: row.cblock, status: row.status, finalizedUs: row.finalizedUs })),
       lanes: [1, 2, 3].flatMap(proposer => {
         const laneRows = own.flatMap(row => (row.lanes ?? []).filter(lane => lane.proposer === proposer).map(lane => ({ cblock: row.cblock, status: lane.status })))
         return laneRows.length ? [{ proposer, finalized: laneRows.filter(row => row.status === 'finalized').length,
@@ -138,7 +172,7 @@ async function preserveFailedEvents(dir, item, started) {
     if (error.code !== 'ENOENT') throw error
     return { unavailable: 'The failed lab process produced no events.jsonl.' }
   }
-  const output = join(dirname(reportPath), `r21-${item.scenario}-${item.protocol}-${started}-events.jsonl.gz`)
+  const output = join(dirname(reportPath), `r22-${item.scenario}-${item.protocol}-${started}-events.jsonl.gz`)
   await mkdir(dirname(output), { recursive: true })
   await pipeline(createReadStream(input), createGzip(), createWriteStream(output, { flags: 'wx' }))
   return { path: relative(backend, output).split(sep).join('/'), compression: 'gzip',
@@ -209,20 +243,24 @@ async function runOnce({ scenario, protocol }, genesis, env, binarySha256) {
   item.windows = windowSummary(outcome)
   if (item.postCrash) item.postCrash.window = item.windows.find(row => row.window === 5)
   item.nonAttackSlotsSkipped = item.windows.filter(row => row.window !== attackerWindow).reduce((sum, row) => sum + row.slotsSkipped, 0)
+  if (scenario === 'crash') item.crashTiming = crashTiming(outcome)
   item.problems = validateOutcome(item)
   if (item.problems.length) {
     item.logTail = tail
     item.diagnosticEvents = await preserveFailedEvents(dir, item, started)
   }
   event('lab_run_finished', { scenario, protocol, status: outcome?.status ?? 'no_outcome',
-    slotsSkipped: outcome?.yardstick?.slotsSkipped ?? null, nonAttackSlotsSkipped: item.nonAttackSlotsSkipped, problems: item.problems })
+    slotsSkipped: outcome?.yardstick?.slotsSkipped ?? null, nonAttackSlotsSkipped: item.nonAttackSlotsSkipped,
+    ...(item.crashTiming ? { crashTiming: { status: item.crashTiming.status, previousMedianUs: item.crashTiming.baselineMedianUs,
+      limitUs: item.crashTiming.limitUs, attackerFinalizedUs: item.crashTiming.comparisons.map(row => row.finalizedUs),
+      withinLimit: item.crashTiming.passed, required: protocol === 'lanes' } } : {}), problems: item.problems })
   return item
 }
 
 try {
   await access(binary)
   await freePorts()
-  root = await mkdtemp(join(target, 'r21-lanes-'))
+  root = await mkdtemp(join(target, 'r22-early-skip-'))
   const genesis = JSON.parse(await readFile(sourceGenesis, 'utf8'))
   for (const program of genesis.programs) program.path = resolve(backend, 'chain', program.path)
   const genesisPath = join(root, 'genesis.json')
@@ -238,13 +276,14 @@ try {
   const startedAt = new Date().toISOString()
   const runs = []
   for (const requested of cases) runs.push(await runOnce(requested, genesisPath, env, binarySha256))
-  const report = { check: 'r21-lab-lanes', startedAt, finishedAt: new Date().toISOString(),
+  const report = { check: 'r22-early-skip', startedAt, finishedAt: new Date().toISOString(),
     version, binary: relative(backend, binary).split(sep).join('/'), binarySha256,
     executedCases: 9, reusedCases: 0, seed, basePort, trafficPerSecond: 50, runSeconds: 12, attackerWindow,
+    crashTimingRequirement: { protocol: 'lanes', comparison: 'Each window4 cblock finalizedUs <= median of all four finalized window3 cblocks + 100000 us', missingMeasurements: 'Unavailable and failed; no zero or partial baseline' },
     comparedWindows: [3, 4, 5], passed: runs.every(item => item.problems.length === 0), runs }
   await mkdir(dirname(reportPath), { recursive: true })
   await writeFile(reportPath, JSON.stringify(report, null, 2) + '\n')
-  event('lab_agreement_report', { report: relative(backend, reportPath).split(sep).join('/'), runs: runs.length, passed: report.passed })
+  event('lab_early_skip_report', { report: relative(backend, reportPath).split(sep).join('/'), runs: runs.length, passed: report.passed })
   assert.ok(report.passed, `Lab comparison failed; inspect ${relative(backend, reportPath)}. All nine cases ran once from fresh stores; no historical baseline was reused.`)
 } finally {
   await stopOwned()

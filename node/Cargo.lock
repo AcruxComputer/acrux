@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "acrux-consensus"
-version = "0.4.33"
+version = "0.4.34"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "acrux-crypto"
-version = "0.4.33"
+version = "0.4.34"
 dependencies = [
  "anyhow",
  "bincode",
@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "acrux-execution"
-version = "0.4.33"
+version = "0.4.34"
 dependencies = [
  "acrux-crypto",
  "acrux-schedule",
@@ -47,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "acrux-node"
-version = "0.4.33"
+version = "0.4.34"
 dependencies = [
  "acrux-consensus",
  "acrux-crypto",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "acrux-schedule"
-version = "0.4.33"
+version = "0.4.34"
 dependencies = [
  "anyhow",
  "rand 0.8.8",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "acrux-transport"
-version = "0.4.33"
+version = "0.4.34"
 dependencies = [
  "anyhow",
  "ed25519-dalek 2.2.0",

@@ -394,6 +394,15 @@ all three rows or two global message flights. A split commitment therefore
 skip-certifies its own lane; it does not reject the other columns. Votes are
 signed with a lane-specific domain and keep the existing 60% and 80% thresholds.
 
+Two signed nulls from a lane owner's other co-proposers trigger its Skip vote
+immediately, independently of the collection deadline. A null/hash pair does
+not. Two identical vectors also settle the healthy lanes immediately when every
+positive column's owner has attested and every null column has those two other
+proposers' nulls. This avoids waiting for a crashed owner's row or for the 500 ms
+collection bound. If attestations are missing, the existing skip timeout remains
+the fallback. All decisions use the same authenticated attestations delivered to
+validators; they do not inspect the scenario or a local crash flag.
+
 Execution waits for every lane's finalization or skip certificate, then uses the
 existing SortTxs, tracks and SVM execution on accepted blocks only. The existing
 execution Votor certifies the merged state and advances the window clock. Its
@@ -426,7 +435,8 @@ finalized lanes. Last-look and equivocation retain their late-drop/slashing
 evidence and use `lane_skipped` instead of a whole-cblock skip. Crash, censorship
 and private-fragment evidence remain unchanged. Run the nine paired cases with
 `node node/scripts/lab-agreement-check.mjs` from `backend/`; it prints each
-run's yardstick and per-lane summary and removes its own temporary stores.
+run's yardstick, per-lane summary and, for `crash`, the crash window's
+finalization against the window before, and removes its own temporary stores.
 
 ## CLI
 

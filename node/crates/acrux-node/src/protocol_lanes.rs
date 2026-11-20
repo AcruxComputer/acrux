@@ -40,6 +40,10 @@ impl Network {
                 let expired=elapsed(self.nodes[id].windows[&window].start)>=750_000+(cblock%4+1)*200_000+50_000;
                 let mut hashes=vec![];
                 let mut pending=false;
+                // These are authenticated co-proposer rows, not a local absence or
+                // a fault flag. Two signed nulls make the existing Skip vote safe
+                // before the fallback timer or the complete attestation view.
+                if !skip && (cblock*4..cblock*4+4).any(|slot|self.exchange.lane_missing(id,slot,lane)) {skip=true;}
                 if !skip {for slot in cblock*4..cblock*4+4 {
                     if self.nodes[id].slots.get(&slot).is_some_and(|local|local.lane_equivocation.contains(&lane)) {skip=true;break}
                     let Some(inputs)=self.exchange.lane_snapshot(id,slot) else {pending=true;break};

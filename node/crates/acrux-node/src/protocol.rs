@@ -3444,7 +3444,10 @@ impl Network {
                 && (!expired || already_voted)
                 && !self.nodes[id].executed_blocks.contains_key(&i)
             {
-                if !already_voted
+                // Lane certificates already decide every input, including a
+                // silent owner. Do not wait for that owner's third row again.
+                if !lane_mode
+                    && !already_voted
                     && i % 4 == 0
                     && elapsed(run.start) < 570000
                     && self.nodes[id].slots[&(w * 16)].attest.len() < 3

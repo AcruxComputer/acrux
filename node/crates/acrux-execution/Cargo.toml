@@ -1,6 +1,6 @@
 [package]
 name = "acrux-execution"
-version = "0.4.33"
+version = "0.4.34"
 edition = "2021"
 description = "Algorithm 4 selection, SVM execution with fees and state hashes, and threshold transactions."
 

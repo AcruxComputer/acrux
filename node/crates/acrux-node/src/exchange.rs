@@ -189,6 +189,9 @@ impl ExchangeEngine {
     pub(crate) fn lane_snapshot(&self,owner:usize,slot:u64)->Option<crate::lanes::Inputs> {
         self.lanes.lock().unwrap().get_mut(&(owner,slot)).and_then(|round|round.snapshot(Instant::now()))
     }
+    pub(crate) fn lane_missing(&self,owner:usize,slot:u64,lane:usize)->bool {
+        self.lanes.lock().unwrap().get(&(owner,slot)).is_some_and(|round|round.missing(lane))
+    }
 
     pub fn metrics_json(&self)->serde_json::Value { self.metrics.json() }
     pub(crate) fn metrics_report(&self)->crate::exchange_metrics::ExchangeReport {self.metrics.report()}

@@ -57,12 +57,30 @@ impl Round {
         self.inputs.clone()
     }
 
+    /// The owner's own mark cannot stand in for either co-proposer's observation.
+    pub(crate) fn missing(&self, lane: usize) -> bool {
+        (1..=3).filter(|role| *role != lane).all(|role| {
+            self.rows.get(&role).is_some_and(|row| row.pi[lane - 1].is_none())
+        })
+    }
+
     fn advance(&mut self, now: Instant) {
         if self.inputs.is_none() {
             let elapsed = self.started.is_some_and(|first| {
                 now.saturating_duration_since(first) >= Duration::from_millis(500)
             });
-            if self.rows.len() != 3 && !elapsed {
+            let stable = self.rows.len() == 2 && {
+                let mut rows = self.rows.values();
+                let first = rows.next().unwrap();
+                let second = rows.next().unwrap();
+                first.pi == second.pi && first.pi.iter().enumerate().all(|(column, hash)| {
+                    match hash {
+                        Some(_) => self.rows.contains_key(&(column + 1)),
+                        None => self.missing(column + 1),
+                    }
+                })
+            };
+            if self.rows.len() != 3 && !elapsed && !stable {
                 return;
             }
             let hashes = (0..3).map(|column| {
@@ -271,6 +289,74 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
+    fn silent_lane_skips_on_two_other_null_attestations_without_waiting() {
+        let first = Instant::now();
+        let row = |proposer, pi| crate::types::Attestation {
+            slot: 0, proposer, pi, key: [proposer as u8; 32],
+        };
+        let all = vec![Some([1; 32]), Some([2; 32]), Some([3; 32])];
+        let two = vec![Some([1; 32]), Some([2; 32]), None];
+        let mut missing = Round::default();
+        missing.record(row(1, two.clone()), first);
+        assert!(!missing.missing(3), "one other attestation is insufficient");
+        missing.record(row(2, two.clone()), first + Duration::from_millis(1));
+        assert!(missing.missing(3));
+        assert!(!missing.missing(1));
+        assert!(!missing.missing(2));
+        assert_eq!(missing.snapshot(first + Duration::from_millis(1)),
+            Some(Inputs { hashes: two.clone() }),
+            "the healthy lanes can proceed as soon as both matching rows arrive");
+
+        let mut voters = (0..12).map(|own| Lanes::new(own, vec![1; 12]).unwrap()).collect::<Vec<_>>();
+        let mut skip_votes = Vec::new();
+        for voter in voters.iter_mut().take(8) {
+            assert!(missing.missing(3));
+            skip_votes.extend(voter.timeout(3, 0).unwrap().into_iter().filter_map(|(lane, action)| {
+                match action {
+                    Action::SendVote(vote) if lane == 3 && vote.kind == VoteKind::Skip => Some(vote),
+                    _ => None,
+                }
+            }));
+        }
+        assert_eq!(skip_votes.len(), 8);
+        let mut certified = false;
+        for voter in &mut voters {
+            for vote in &skip_votes {
+                let actions = voter.receive(3, Message::Vote(vote.clone())).unwrap();
+                certified |= actions.iter().any(|(lane, action)| {
+                    *lane == 3 && matches!(action, Action::SendCertificate(c) if c.kind == CertificateKind::Skip)
+                });
+            }
+            assert_eq!(voter.decision(3, 0), Some(None));
+            assert!(voter.decision(1, 0).is_none());
+            assert!(voter.decision(2, 0).is_none());
+        }
+        assert!(certified, "the early path emits the existing Votor Skip votes and certificate");
+        assert_eq!(missing.snapshot(first + Duration::from_millis(1)),
+            Some(Inputs { hashes: two.clone() }), "no phase deadline needed to advance");
+
+        let mut mixed = Round::default();
+        mixed.record(row(1, all.clone()), first);
+        mixed.record(row(2, two.clone()), first + Duration::from_millis(1));
+        assert!(!mixed.missing(3), "a null/hash pair is not evidence of a silent lane");
+        assert!(mixed.snapshot(first + Duration::from_millis(1)).is_none());
+        let mut mixed_voter = Lanes::new(0, vec![1; 12]).unwrap();
+        let early = if mixed.missing(3) { mixed_voter.timeout(3, 0).unwrap() } else { vec![] };
+        assert!(early.is_empty(), "a null/hash pair emits no early Skip vote");
+        let mut owner_and_other = Round::default();
+        owner_and_other.record(row(3, two.clone()), first);
+        owner_and_other.record(row(1, two), first + Duration::from_millis(1));
+        assert!(!owner_and_other.missing(3), "the owner's row cannot replace the second other row");
+        assert!(owner_and_other.snapshot(first + Duration::from_millis(1)).is_none());
+        let mut owner_pending = Round::default();
+        owner_pending.record(row(1, all.clone()), first);
+        owner_pending.record(row(2, all), first + Duration::from_millis(1));
+        assert!(!owner_pending.missing(3));
+        assert!(owner_pending.snapshot(first + Duration::from_millis(1)).is_none(),
+            "matching hashes cannot freeze the absent owner's lane as skipped");
+    }
+
+    #[test]
     fn skipped_lane_waits_at_barrier_then_merges_the_two_accepted_sources() {
         let first = Instant::now();
         let row = |proposer, pi| crate::types::Attestation {
@@ -289,9 +375,9 @@ mod tests {
         let mut crash = Round::default();
         crash.record(row(1, two.clone()), first);
         crash.record(row(2, two.clone()), first + Duration::from_millis(10));
-        assert!(crash.snapshot(first + Duration::from_millis(499)).is_none());
-        assert_eq!(crash.snapshot(first + Duration::from_millis(500)), expected,
-            "two signed rows settle a crashed owner's lane at the receipt bound");
+        assert_eq!(crash.snapshot(first + Duration::from_millis(10)), expected,
+            "two identical signed rows settle the healthy lanes without the receipt timeout");
+        assert_eq!(crash.snapshot(first + Duration::from_millis(500)), expected);
         crash.record(row(3, vec![None, None, Some([3; 32])]), first + Duration::from_millis(501));
         assert_eq!(crash.snapshot(first + Duration::from_millis(502)), expected,
             "a late null row does not change the frozen view or revive a skipped lane");
