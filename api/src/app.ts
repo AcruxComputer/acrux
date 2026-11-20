@@ -8,7 +8,7 @@ import {
   type LabRun, type ProtocolEvent, type Transaction,
 } from '@acrux/contract'
 import {
-  facts, faucetGrant, faucetStatus, fixtureErrors, hubs, labRuns, labRunsByState,
+  facts, genesisShare, genesisShareGenesisOnly, faucetGrant, faucetStatus, fixtureErrors, hubs, labRuns, labRunsByState,
   makeFixtureTransaction, makeLabReplay, makeSchedulePreview, registryConfig, scenarios, externalBlockTransaction,
   specMap, transactionsByState, replayRange, replaySlot, burnNoEpochs, burnPending, burnBurned, burnRunning, bridgeFixture, bridgeWaitingFixture, bridgeTransfersFixture,
 } from '@acrux/contract/fixtures'
@@ -79,6 +79,7 @@ export function createFixtureApi() {
     const rows = scenario === 'empty' || scenario === 'waiting' ? [] : scenario === 'pending_only' ? hubs.filter(h => h.status === 'pending') : hubs
     return c.json(paginate(rows, readQuery(c, PageQuery)))
   })
+  app.get('/v1/genesis-share', c => c.json(c.get('scenario') === 'empty' ? genesisShareGenesisOnly : genesisShare))
   app.get('/v1/hubs/:code', c => {
     const code = readParam(c, 'code', HubCode)
     const found = hubs.find(h => h.code === code)

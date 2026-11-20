@@ -17,6 +17,7 @@ const operations: Operation[] = [
   { method:'get', path:'/v1/registry/config', operationId:'registryConfig',summary:'Registry flow configuration',response:'RegistryConfig' },
   { method:'get', path:'/v1/registry/members/{identity}', operationId:'member',summary:'Validator membership and cooldown',response:'Member',params:{identity:'Address'} },
   { method:'get', path:'/v1/schedule', operationId:'schedule',summary:'Algorithm 3 epoch preview',response:'SchedulePreview',query:z.strictObject({epoch:s.Count.optional()}) },
+  { method:'get', path:'/v1/genesis-share', operationId:'genesisShare',summary:'Genesis share of stake per epoch',response:'GenesisShare' },
   { method:'get', path:'/v1/facts', operationId:'facts',summary:'Explicitly synthetic facts snapshot',response:'Facts' },
   { method:'get', path:'/v1/spec', operationId:'spec',summary:'Paper to implementation map',response:'SpecMap' },
   { method:'get', path:'/v1/transactions/{id}', operationId:'transaction',summary:'Transaction trail',response:'Transaction',params:{id:'TxId'} },

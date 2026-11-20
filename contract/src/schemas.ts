@@ -103,6 +103,8 @@ export type HubHashExchange = z.infer<typeof HubHashExchange>
 export const Hub = z.object({ chain: RegistryChain, code: HubCode, name: z.string(), region: z.string(), ecef: z.object({ x: z.number().int(), y: z.number().int(), z: z.number().int() }).describe('Integer metres in WGS84 Earth-centred, Earth-fixed coordinates.'), latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), registrant: Address, depositLamports: U64, members: z.array(Member), stake: U64, proposerStake: U64, proposerStakeCap: U64, status: z.enum(['active', 'pending', 'inactive']), needs: z.object({ members: Count, stake: U64 }), createdEpoch: Count, lastActiveEpoch: Count.nullable(), releasableEpoch: Count.nullable(), releasable: z.boolean(), hashExchange: HubHashExchange.optional(), formedOutside: z.boolean().optional(), activatedAtEpoch: Count.nullable().optional() })
 export type Hub = z.infer<typeof Hub>
 export const Hubs = page(Hub)
+/** The genesis validators' share of stake in each bridge epoch's fixed set; the next epoch appears once its set is fixed. */
+export const GenesisShare = z.object({ currentEpoch: Count, epochs: z.array(z.object({ epoch: Count, fixedAtSlot: Count.nullable(), genesisStake: U64, totalStake: U64, genesisShareBps: Count.max(10000), genesisMembers: Count, externalMembers: Count })) })
 export const RegistryConfig = z.object({ status: z.enum(['fixture', 'waiting', 'ready']), chain: RegistryChain, programId: Address.nullable(), cluster: z.enum(['localnet', 'mainnet-beta', 'acrux']), depositLamports: U64.nullable(), registrationFeeBps: Count.max(10000).nullable(), cooldownEpochs: Count.nullable(), inactivityEpochs: Count.nullable(), codeRules: z.object({ pattern: z.string().nullable(), minLength: Count.nullable(), maxLength: Count.nullable() }), minimumMembers: Count.nullable(), minimumStake: U64.nullable(), currentEpoch: Count, missingConfiguration: z.array(z.string()) })
 export const SchedulePreview = z.object({ epoch: Count, seed: z.string(), source: z.enum(['fixture', 'registry']), algorithm: z.literal(3), alpha: z.number().min(0).max(1), totalWindows: Count, shares: z.array(z.object({ hubCode: HubCode, proposerStake: U64, probability: z.number(), assignedWindows: Count })), regionalRuns: z.array(z.object({ region: z.string(), firstWindow: Count, lastWindow: Count })), windows: z.array(Window) })
 export const FaucetPolicy = z.object({ amountLamports: U64.nullable(), perKey: Count.nullable(), perIp: Count.nullable(), periodSeconds: Count.nullable(), missingConfiguration: z.array(z.string()) })
@@ -289,6 +291,7 @@ export type PlainSubmission = z.infer<typeof PlainSubmission>
 export type FragmentSubmission = z.infer<typeof FragmentSubmission>
 export type Submission = z.infer<typeof Submission>
 export type Hubs = z.infer<typeof Hubs>
+export type GenesisShare = z.infer<typeof GenesisShare>
 export type RegistryConfig = z.infer<typeof RegistryConfig>
 export type SchedulePreview = z.infer<typeof SchedulePreview>
 export type FaucetPolicy = z.infer<typeof FaucetPolicy>

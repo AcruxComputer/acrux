@@ -39,7 +39,7 @@ const responseFixtures = {
   HashExchangePair: f.hashExchangeWithOutside.hubs[0].pairs[0], HashExchangeSpread: f.facts.commitSpreadByLinkUs,
   HashExchangeHub: f.hashExchangeWithOutside.hubs[0], HashExchange: f.hashExchangeWithOutside,
   HashExchangeTelemetry: { ...f.hashExchangeWithOutside, commitSpreadByLinkUs: f.factsWithOutside.commitSpreadByLinkUs },
-  HubHashExchange: f.outsideFormedHub.hashExchange, Hub: f.outsideFormedHub, Hubs: paged(f.hubs),
+  HubHashExchange: f.outsideFormedHub.hashExchange, Hub: f.outsideFormedHub, Hubs: paged(f.hubs), GenesisShare: f.genesisShare,
   RegistryConfig: f.registryConfig, SchedulePreview: f.schedulePreview, FaucetPolicy: f.faucetPolicy,
   FaucetStatus: f.makeFaucetStatus(), FaucetGrant: f.faucetGrant(), Facts: f.factsWithOutside,
   Evidence: f.labRuns[0].evidence[0], LabScenario: f.scenarios[0], LabRun: f.labRuns[0],

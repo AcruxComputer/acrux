@@ -2,7 +2,7 @@ import { FAUCET_RETIRED_MESSAGE } from './bridge.js'
 import type { z } from 'zod'
 import { toBase58, toBase64 } from './encoding.js'
 import { PROTOCOL_PARAMETERS, errors } from './schemas.js'
-import type { Balance, Bridge, BridgeTransfer, Burn, BurnEpoch, DemoPool, Evidence, Facts, FaucetPolicy, FaucetStatus, FaucetGrant, LabScenario, RegistryConfig, SchedulePreview, SpecMap } from './schemas.js'
+import type { Balance, GenesisShare, Bridge, BridgeTransfer, Burn, BurnEpoch, DemoPool, Evidence, Facts, FaucetPolicy, FaucetStatus, FaucetGrant, LabScenario, RegistryConfig, SchedulePreview, SpecMap } from './schemas.js'
 import type { HashExchangePair, HashExchange as HashExchangeView, HubHashExchange, Cblock, Certificate, ExecutionSchedule, Hub, LabRun, Member, MergedTransaction, NetSnapshot, Parameters, Proposer, Slot, Transaction, Window } from './schemas.js'
 import type { ApiErrorBody } from './errors.js'
 import type { LabReplay, ProtocolEvent } from './events.js'
@@ -582,3 +582,12 @@ export const burnNoEpochs: Burn = {
 export const burnBurned: Burn = { ...burnNoEpochs, totals: { baseFeeBurnBaseUnits: '1000', buybackBurnBaseUnits: '250000000' }, epochs: { ...burnNoEpochs.epochs, items: [burnedEpoch] } }
 export const burnPending: Burn = { ...burnBurned, totals: { baseFeeBurnBaseUnits: '1000', buybackBurnBaseUnits: '750000000' }, epochs: { ...burnNoEpochs.epochs, items: [pendingEpoch, burnedEpoch] } }
 export const burnRunning: Burn = { ...burnPending, epochs: { ...burnNoEpochs.epochs, items: [runningEpoch, pendingEpoch, burnedEpoch] } }
+
+/** Genesis stake 12,000,000 ACRUX; outside operators stake from epoch 13 and form a hub at epoch 14. */
+export const genesisShare: GenesisShare = { currentEpoch: 14, epochs: [
+  { epoch: 12, fixedAtSlot: null, genesisStake: '12000000000000000', totalStake: '12000000000000000', genesisShareBps: 10000, genesisMembers: 12, externalMembers: 0 },
+  { epoch: 13, fixedAtSlot: 5615600, genesisStake: '12000000000000000', totalStake: '12120000000000000', genesisShareBps: 9900, genesisMembers: 12, externalMembers: 1 },
+  { epoch: 14, fixedAtSlot: 6047600, genesisStake: '12000000000000000', totalStake: '12600000000000000', genesisShareBps: 9523, genesisMembers: 12, externalMembers: 5 },
+  { epoch: 15, fixedAtSlot: 6479600, genesisStake: '12000000000000000', totalStake: '13200000000000000', genesisShareBps: 9090, genesisMembers: 12, externalMembers: 8 },
+] }
+export const genesisShareGenesisOnly: GenesisShare = { currentEpoch: 12, epochs: [genesisShare.epochs[0]!] }
