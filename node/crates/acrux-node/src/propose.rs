@@ -681,8 +681,31 @@ impl Observer {
 
 }
 
+/// Runs sessions until Ctrl-C. A session that lost its link after connecting starts again from a
+/// fresh snapshot; the vote journal on disk keeps every vote it already cast.
 pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_port:Option<u16>, metrics_port:Option<u16>, peer_port:Option<u16>, peer_address:Option<String>) -> Result<()> {
     ensure!(peer_port.is_some()||peer_address.is_none(),"--peer-address requires --peer-port");
+    let mut wait=Duration::from_secs(1);
+    // Once the first session has connected, a failed reconnect (the RPC or the link) is retried too.
+    let mut connected=false;
+    loop {
+        let started=std::time::Instant::now();
+        let error=match session(url,hub,identity,genesis_path,rpc_port,metrics_port,peer_port,peer_address.clone(),&mut connected).await {
+            Ok(())=>return Ok(()),
+            Err(error) if !connected=>return Err(error),
+            Err(error)=>error,
+        };
+        if started.elapsed()>=Duration::from_secs(60) {wait=Duration::from_secs(1)}
+        println!("link lost: {error:#}; reconnecting in {} s",wait.as_secs());
+        tokio::select! {
+            _=tokio::time::sleep(wait)=>{},
+            result=tokio::signal::ctrl_c()=>{result?;return Ok(())},
+        }
+        wait=(wait*2).min(Duration::from_secs(30));
+    }
+}
+
+async fn session(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_port:Option<u16>, metrics_port:Option<u16>, peer_port:Option<u16>, peer_address:Option<String>, connected:&mut bool) -> Result<()> {
     let genesis = crate::genesis::Genesis::load(std::path::Path::new(genesis_path))?;
     let programs = genesis.programs.iter().map(|(address,path)|crate::execution::GenesisProgram {address:address.clone(),path:path.clone()}).collect::<Vec<_>>();
     let snapshot = cli::rpc(url,"getExecutionSnapshot",json!({})).await?;
@@ -729,6 +752,7 @@ pub async fn run(url: &str, hub: &str, identity: &str, genesis_path: &str, rpc_p
         None=>(None,None,None),
     };
     let mut client = crate::external::ExternalClient::connect(address,&cert,hub,&signer,from_slot).await?;
+    *connected=true;
     let control = std::sync::Arc::new(client.control.clone());
     let connection = client.connection.clone();
     println!("from cblock {last}: {} accounts loaded, state {} matches",replay.executor.account_count(),&start_hash[..12]);

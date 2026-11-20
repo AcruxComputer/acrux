@@ -29,7 +29,7 @@ const event = (event, fields = {}) => console.log(JSON.stringify({ event, ...fie
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
 const children = new Set(), roundTrips = [], matchedSlots = new Set()
 let runDir, env, fatal, stopped = false, netChild, observer, observerLine = '', netTail = '', observerTail = ''
-let lastMatchedSlot = null, authenticatedSlowPeer = false, droppedSlowPeer = false
+let lastMatchedSlot = null, authenticatedSlowPeer = false, droppedSlowPeer = false, linkLosses = 0
 let requestId = 0, farProxy, farRelay
 process.once('SIGINT', () => { stopped = true })
 process.once('SIGTERM', () => { stopped = true })
@@ -98,6 +98,8 @@ function observe(chunk) {
   let newline
   while ((newline = observerLine.indexOf('\n')) >= 0) {
     const line = observerLine.slice(0, newline); observerLine = observerLine.slice(newline + 1)
+    // A reconnect starts again from a fresh snapshot, so its first slots may repeat.
+    if (line.startsWith('link lost:')) { linkLosses++; lastMatchedSlot = null }
     const slot = /^slot (\d+) re-executed\b/.exec(line)
     if (slot) {
       if (!/\bmatches\b/.test(line)) { fatal = new Error(`Observer state mismatch: ${line}`); continue }
@@ -181,12 +183,12 @@ try {
     farProxy = proxy
     // One client, one upstream: each datagram waits 145 ms before it is passed on, either way.
     const relay = dgram.createSocket('udp4'), upstream = dgram.createSocket('udp4')
-    let client, relayOpen = true
-    const pass = (socket, message, port, address) => { if (relayOpen) socket.send(message, port, address) }
+    let client, relayOpen = true, heldUntil = 0
+    const pass = (socket, message, port, address) => { if (relayOpen && Date.now() >= heldUntil) socket.send(message, port, address) }
     relay.on('message', (message, from) => { client = from; setTimeout(() => pass(upstream, message, ports.external, '127.0.0.1'), 145) })
     upstream.on('message', message => { if (client) setTimeout(() => pass(relay, message, client.port, client.address), 145) })
     await new Promise(resolve => relay.bind(relayPort, '127.0.0.1', resolve))
-    farRelay = { close: () => { relayOpen = false; relay.close(); upstream.close() } }
+    farRelay = { close: () => { relayOpen = false; relay.close(); upstream.close() }, hold: ms => { heldUntil = Date.now() + ms } }
     event('propose_far_proxy', { url: farUrl, eachWayMs: 145, bytesPerSecond: 1_000_000, quicRelay: `127.0.0.1:${relayPort}` })
   }
   observer = child(binary, ['node', 'propose', '--hub', 'FRA', '--identity', identity, '--net', far ? farUrl : rpcUrl, '--genesis', genesisPath])
@@ -209,11 +211,12 @@ try {
   const beforeSlow = await head(), matchedBeforeSlow = matchedSlots.size
   const paceStarted = Date.now()
   const pace = (async () => {
-    await pause(5000)
+    // The host gives each observer write 10 s before it closes a peer that stopped reading.
+    await pause(12_000)
     alive()
     const after = await head(), elapsedSeconds = (Date.now() - paceStarted) / 1000
     const finalizedSlotsAdvanced = (after - beforeSlow) * 4
-    assert.ok(droppedSlowPeer, 'Bounded backpressure must drop the stopped-reading peer within the five-second pace window.')
+    assert.ok(droppedSlowPeer, 'Bounded backpressure must drop the stopped-reading peer within the twelve-second pace window.')
     const finalizedSlotsPerSecond = finalizedSlotsAdvanced / elapsedSeconds
     assert.ok(finalizedSlotsPerSecond >= 12, `The net slowed to ${finalizedSlotsPerSecond.toFixed(2)} finalized slots/s during the slow-peer scenario.`)
     assert.ok(matchedSlots.size > matchedBeforeSlow, 'The healthy observer must keep matching during the slow-peer scenario.')
@@ -233,6 +236,14 @@ try {
   event('propose_link_rtt_measured', { samples: roundTrips.length, medianRttMs, minimumRttMs: roundTrips[0], simulatedFraRttMs: [2, 8], appliedDelayMs: 0 })
   if (far) assert.ok(medianRttMs >= 290 && medianRttMs < 400, `The relayed link's median RTT ${medianRttMs} ms must be the relay's 290 ms.`)
   else assert.ok(medianRttMs < 2, `Loopback link median RTT ${medianRttMs} ms must be below FRA's minimum simulated 2 ms RTT.`)
+  if (far) {
+    // The link goes silent for 15 s, past the host's 10 s write deadline; the observer reconnects.
+    const before = matchedSlots.size, heldAt = Date.now()
+    farRelay.hold(15_000)
+    await until('The observer reports its lost link', 90_000, async () => linkLosses > 0)
+    await until('The reconnected observer matches 50 more slots', 120_000, async () => matchedSlots.size >= before + 50)
+    event('propose_observer_reconnected', { heldMs: 15_000, linkLosses, recoveredAfterMs: Date.now() - heldAt, matchedSlots: matchedSlots.size })
+  }
   event('propose_observer_passed', { matchedSlots: matchedSlots.size, lastMatchedSlot, elapsedSeconds: (Date.now() - startedAt) / 1000, medianRttMs, badSignatureRefused: true, stoppedReadingPeerDropped: true })
 } catch (error) {
   // The net's own account of each outside peer it closed or refused.

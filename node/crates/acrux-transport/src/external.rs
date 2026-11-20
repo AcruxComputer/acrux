@@ -14,7 +14,9 @@ use std::{
 use tokio::{sync::{Notify, Semaphore}, task::JoinHandle, time::{timeout, timeout_at}};
 
 const AUTH_DEADLINE: Duration = Duration::from_secs(5);
-const WRITE_DEADLINE: Duration = Duration::from_secs(2);
+// A far observer catching up from its snapshot can leave its window full for seconds; the held
+// history, not this deadline, bounds how far behind it may fall.
+const WRITE_DEADLINE: Duration = Duration::from_secs(10);
 const CONTROL_LIMIT: usize = 128;
 const MAX_PACKET_BYTES: usize = 1024 * 1024;
 const MAX_MEMBER_ENVELOPE_BYTES: usize = 2048;
