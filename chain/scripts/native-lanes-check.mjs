@@ -43,6 +43,10 @@ assert.ok(epochSlots % 32 === 0, 'The local epoch midpoint must be a proposer-wi
 assert.ok(nativeFromSlot % epochSlots === 0 && stakeFromSlot % epochSlots === 0 && stakeFromSlot > nativeFromSlot, 'Use separate native and stake activation boundaries in the local bridge epochs.')
 assert.ok(admissionFromSlot % epochSlots === 0 && admissionFromSlot > stakeFromSlot, 'Admission must start at a later local epoch boundary than Stake activation.')
 assert.ok(lanesFromSlot % epochSlots === 0 && lanesFromSlot >= admissionFromSlot + 4 * epochSlots, 'Set lanes at least four local epochs after admission so the outside member can join, delegate and produce before activation.')
+// Optional: the native mint and the epoch fee burn in the same rule, as they go on the net.
+const optional = name => arg(name) === undefined ? undefined : asNumber(required(name), name)
+const nativeMintFromSlot = optional('native-mint-from-slot'), feeBurnFromSlot = optional('fee-burn-from-slot')
+assert.ok(feeBurnFromSlot === undefined || feeBurnFromSlot % epochSlots === 0 && feeBurnFromSlot > lanesFromSlot, 'Set the fee burn at a local epoch boundary after lanes.')
 const stakeLamports = genesisStakeLamports * 2n
 asNumber(stakeLamports, 'twice genesis-stake-lamports')
 // Four times the delegation leaves this local holder room for account rent and fees.
@@ -190,8 +194,9 @@ try {
     createAssociatedTokenAccountIdempotentInstruction(authority.publicKey, source, authority.publicKey, mint, TOKEN_PROGRAM_ID),
     createMintToInstruction(mint, source, authority.publicKey, depositAmount, [], TOKEN_PROGRAM_ID),
   ], authority, [mintKeypair])
+  if (feeBurnFromSlot !== undefined) await send(solana, [await onSolana.methods.initFeeBurnConfig().accountsStrict({ authority: authority.publicKey, bridge: addresses.bridge, mint, config: addresses.feeBurnConfig, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId }).instruction()], authority)
   runDir = mkdtempSync(join(target, 'native-lanes-check-'))
-  const rule = { program: program.toBase58(), fromSlot: 0, epochSlots, chainId, nativeFromSlot, nativeMint: mint.toBase58(), nativeScale: Number(scale), stakeFromSlot, genesisStakeLamports: genesisStakeLamports.toString(), admissionFromSlot, lanesFromSlot }
+  const rule = { program: program.toBase58(), fromSlot: 0, epochSlots, chainId, nativeFromSlot, nativeMint: mint.toBase58(), nativeScale: Number(scale), stakeFromSlot, genesisStakeLamports: genesisStakeLamports.toString(), admissionFromSlot, lanesFromSlot, nativeMintFromSlot, feeBurnFromSlot }
   writeFileSync(join(runDir, 'bridge.json'), JSON.stringify(rule))
   mkdirSync(join(runDir, 'placements'))
   const env = { ...process.env, ACRUX_GENESIS_SEED: DEV_SEED, ACRUX_BIND: '127.0.0.1', ACRUX_BRIDGE: join(runDir, 'bridge.json'), ACRUX_BRIDGE_RPC: `${solanaUrl},${solanaUrl}`, ACRUX_BRIDGE_PROOF_MAX: '100000', ACRUX_PLACEMENTS: join(runDir, 'placements/placements.json') }
@@ -470,6 +475,50 @@ try {
   })
   assert.deepEqual((await solana.getAccountInfo(programData(program), 'finalized')).data, programBefore.data, 'No bridge program upgrade is involved.')
 
+  let nativeMint, feeBurned
+  if (nativeMintFromSlot !== undefined) {
+    await waitSlot(nativeMintFromSlot + 4)
+    const placed = await acrux.getAccountInfo(new PublicKey('So11111111111111111111111111111111111111112'), 'finalized')
+    assert.ok(placed && placed.owner.equals(TOKEN_PROGRAM_ID) && placed.data.length === MINT_SIZE && placed.data[44] === 9 && placed.data[45] === 1, 'The native mint must be placed from its slot.')
+    nativeMint = { lamports: placed.lamports }
+  }
+  if (feeBurnFromSlot !== undefined) {
+    // Base fees of the first fee-burn epoch, on lanes cblocks, burned through the program on Solana.
+    const burnEpoch = feeBurnFromSlot / epochSlots
+    await waitSlot(feeBurnFromSlot + 4)
+    const destination = Keypair.generate().publicKey, burnTransfers = []
+    for (let i = 0; i < 3; i++) {
+      const signature = await send(acrux, [SystemProgram.transfer({ fromPubkey: holder.publicKey, toPubkey: destination, lamports: 2_000_000 })], holder)
+      const receipt = await acrux.getTransaction(signature, { commitment: 'finalized', maxSupportedTransactionVersion: 0 })
+      assert.equal(Math.floor(receipt.slot / epochSlots), burnEpoch, 'Choose a later fee-burn epoch if the transfers missed it.')
+      burnTransfers.push(signature)
+    }
+    for (let epoch = Math.floor(withdrawalSlot / epochSlots); epoch < burnEpoch; epoch++) await relayNext(epoch)
+    await waitSlot((burnEpoch + 1) * epochSlots + 4)
+    const burnProof = await until('The fee-burn epoch-ending proof', 60, () => rpc('getCblockProof', { feeBurnEpoch: burnEpoch }))
+    const ending = await rpc('getSlot', { slot: burnProof.consensusSlot * 4 })
+    assert.equal(ending.cblock.lanes.length, 3, 'The epoch-ending cblock is a lanes cblock.')
+    const leaves = burnProof.outbox.map(bytes => decodeEntry(Buffer.from(bytes, 'base64'))).filter(entry => entry?.feeBurn)
+    assert.equal(leaves.length, 1)
+    assert.equal(leaves[0].epoch.toNumber(), burnEpoch)
+    const amount = BigInt(leaves[0].amount.toString())
+    assert.ok(amount > 0n, 'The three transfers must burn at least one Solana base unit.')
+    const supplyBefore = BigInt((await solana.getTokenSupply(mint, 'finalized')).value.amount)
+    const relayed = await relay(onSolana, burnProof)
+    assert.deepEqual(relayed.burned, [{ epoch: burnEpoch, amount: amount.toString() }])
+    assert.ok(await onSolana.account.validatorSet.fetchNullable(addresses.set(burnEpoch + 1), 'confirmed'), 'The epoch-ending cblock still hands the next set on.')
+    // The relay confirms its burn; the finalized supply follows a few slots later.
+    await until('The burn is finalized in the mint supply', 60, async () => BigInt((await solana.getTokenSupply(mint, 'finalized')).value.amount) === supplyBefore - amount)
+    assert.deepEqual((await relay(onSolana, burnProof)).burned, [])
+    const supply = await rpc('getNativeSupply')
+    const vaultAfter = unpackAccount(pda(Buffer.from('vault'), mint.toBuffer()), await solana.getAccountInfo(pda(Buffer.from('vault'), mint.toBuffer()), 'finalized'), TOKEN_PROGRAM_ID).amount
+    assert.equal(BigInt(supply.creditedLamports) - BigInt(supply.withdrawnLamports) - BigInt(supply.feeBurnedLamports), vaultAfter * scale, 'Credited less withdrawn and fee-burned equals the vault.')
+    const crossed = (burnEpoch + 1) * epochSlots
+    await until('The RPC follower matches past the fee-burn epoch', 60, async () => [...followerStates.keys()].some(slot => slot >= crossed))
+    feeBurned = { epoch: burnEpoch, cblock: burnProof.consensusSlot, amount: amount.toString(), burnTransfers, burnTransactions: relayed.transactions, feeBurnedLamports: supply.feeBurnedLamports }
+    event('native_lanes_fee_burned', feeBurned)
+  }
+
   const silentWindow = await until('A future window draws the admitted outside member', 120, async () => {
     const latest = await acrux.getSlot('processed')
     return (await rpc('getSchedule', { limit: 8 })).find(window => window.firstSlot > latest + 8
@@ -494,7 +543,7 @@ try {
     withdrawal, withdrawalCblock: cblock, withdrawalSequence: withdrawalSequence.toNumber(), releasedBaseUnits: withdrawAmount.toString(),
     unchangedSolanaProgram: program.toBase58(), silentWindow: silentWindow.number, silentRole,
     silentFinalizedUs: silent.cblock.finalizedUs, skipTimeoutUs: silent.consensusTimeoutUs,
-    rpcFollowerMatches: followerStates.size, observerMatches })
+    rpcFollowerMatches: followerStates.size, observerMatches, nativeMint, feeBurned })
 } catch (error) {
   console.error(`The local net's last output:\n${tail}\nOutside process:\n${observerTail}\nRPC follower:\n${followerTail}`)
   throw error

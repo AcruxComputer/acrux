@@ -20,11 +20,24 @@ const UNFUNDED_LAMPORTS = 10_000_000
 const RETIRED_ACCOUNT_CREATION = 'The previous recipient-account creation transaction is retired. Waiting for its blockhash to expire.'
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
+// A load-balanced RPC can route a read to a node behind the slot the last receipt came from.
+// That node catches up within a second or two, so the request is asked again instead of
+// failing the whole cycle.
+const MIN_CONTEXT_SLOT_NOT_REACHED = '"code":-32016'
+const MIN_CONTEXT_ATTEMPTS = 10
+
 /** HTTP-only connections: every request is aborted; confirmation uses the keeper journal's bounded poll. */
 export function bridgeConnection(url: string) {
-  return new Connection(url, { commitment: 'confirmed', disableRetryOnRateLimit: true, fetch: (input, init) => fetch(input, {
-    ...init, signal: init?.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(RPC_MS)]) : AbortSignal.timeout(RPC_MS),
-  }) })
+  return new Connection(url, { commitment: 'confirmed', disableRetryOnRateLimit: true, fetch: async (input, init) => {
+    for (let attempt = 1; ; attempt++) {
+      const response = await fetch(input, {
+        ...init, signal: init?.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(RPC_MS)]) : AbortSignal.timeout(RPC_MS),
+      })
+      const body = await response.text()
+      if (attempt === MIN_CONTEXT_ATTEMPTS || !body.includes(MIN_CONTEXT_SLOT_NOT_REACHED)) return new Response(body, { status: response.status, statusText: response.statusText })
+      await pause(500)
+    }
+  } })
 }
 
 type Finality = 'confirmed' | 'finalized'
