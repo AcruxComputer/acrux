@@ -388,6 +388,8 @@ pub struct SvmExecutor {
     native_mint_from: Option<u64>,
     /// From this slot, each admission cut-off lowers the genesis weight by admitted outside stake.
     genesis_step_from: Option<u64>,
+    /// From this slot, identities' rule votes are counted and rules in force apply.
+    rules_from: Option<u64>,
     stake_config: Option<StakeConfig>,
     admission_config: Option<AdmissionConfig>,
     fee_burn_config: Option<FeeBurnConfig>,
@@ -601,6 +603,7 @@ impl SvmExecutor {
             native_cutover: None,
             native_mint_from: None,
             genesis_step_from: None,
+            rules_from: None,
             stake_config: None,
             admission_config: None,
             fee_burn_config: None,
@@ -993,6 +996,55 @@ impl SvmExecutor {
         self.genesis_step_from = Some(slot);
     }
 
+    pub fn set_rules_from(&mut self, slot: u64) {
+        self.rules_from = Some(slot);
+    }
+
+    fn rules_state(&self, accounts: &BTreeMap<Pubkey, Arc<Account>>) -> Result<crate::rules::RulesState> {
+        let Some(bridge) = self.bridge else { return Ok(Default::default()) };
+        let Some(account) = accounts.get(&crate::rules::rules_address(&bridge)).filter(|account| !native_wallet(account)) else { return Ok(Default::default()) };
+        anyhow::ensure!(account.owner == bridge && !account.executable && account.data.get(..8) == Some(&Sha256::digest(b"account:Rules")[..8]), "Invalid rules account");
+        Ok(bincode::deserialize(&account.data[8..])?)
+    }
+
+    /// Every rule change voted on, open ones in their epoch and those in force.
+    pub fn rules(&self, checkpoint: &ExecutorCheckpoint) -> Result<Vec<crate::rules::Rule>> {
+        Ok(self.rules_state(&checkpoint.accounts)?.rules)
+    }
+
+    /// A key's activation slot at `slot`, from the genesis rule and the rules in force.
+    fn effective_slot(&self, key: &str, genesis: Option<u64>, slot: u64) -> Result<Option<u64>> {
+        if self.rules_from.is_none_or(|from| slot < from) { return Ok(genesis) }
+        Ok(crate::rules::effective_slot(&self.rules_state(&self.accounts)?.rules, key, genesis, slot))
+    }
+
+    fn record_rule_votes(&mut self, slot: u64, voter: Pubkey, changes: Vec<crate::rules::RuleChange>) -> Result<()> {
+        let epoch_slots = self.admission_config.as_ref().context("Rule votes require admission")?.epoch_slots;
+        let epoch = slot / epoch_slots;
+        let Some(snapshot) = self.admission_snapshot(&self.checkpoint(), epoch)? else { return Ok(()) };
+        let stakes = snapshot.members.iter().map(|member| (member.identity, member.stake)).collect::<BTreeMap<_,_>>();
+        let mut state = self.rules_state(&self.accounts)?;
+        let mut changed = false;
+        for change in changes { changed |= crate::rules::vote(&mut state, change, voter, epoch, epoch_slots, &stakes); }
+        if !changed { return Ok(()) }
+        let bridge = self.bridge.context("Rule votes require the bridge")?;
+        let key = crate::rules::rules_address(&bridge);
+        let previous = self.svm.get_account(&key);
+        anyhow::ensure!(previous.as_ref().is_none_or(|account| native_wallet(account) || (account.owner == bridge && !account.executable && account.data.get(..8) == Some(&Sha256::digest(b"account:Rules")[..8]))), "Rules address has an incompatible account");
+        let mut data = Sha256::digest(b"account:Rules")[..8].to_vec(); data.extend(bincode::serialize(&state)?);
+        let before = previous.map_or(0, |account| account.lamports);
+        let lamports = before.max(self.rent_exempt_minimum(data.len()));
+        self.put(key, Account { lamports, data, owner: bridge, executable: false, rent_epoch: 0 })?;
+        // The rules account's rent joins the native reserve, as admission's accounts do.
+        if lamports > before {
+            let mut gate = self.native_gate()?.context("Rule votes require native ACRUX")?;
+            let reserve = u64::from_le_bytes(gate.data[64..72].try_into().unwrap()).checked_add(lamports - before).context("Rules reserve overflow")?;
+            gate.data[64..72].copy_from_slice(&reserve.to_le_bytes());
+            self.put(bridge_native(&bridge), gate)?;
+        }
+        Ok(())
+    }
+
     /// (epoch, genesis weight per identity) for each retained snapshot since the step began.
     fn genesis_steps(&self, accounts: &BTreeMap<Pubkey, Arc<Account>>) -> Result<Vec<(u64,u64)>> {
         let Some(bridge) = self.bridge else { return Ok(vec![]) };
@@ -1011,7 +1063,7 @@ impl SvmExecutor {
     /// Solana's native mint at `So11111111111111111111111111111111111111112`: 9 decimals, initialized,
     /// no authorities, supply 0. Its rent joins the native reserve, so circulating ACRUX is unchanged.
     fn apply_native_mint(&mut self, slot: u64) -> Result<()> {
-        if self.native_mint_from.is_none_or(|from| slot < from) { return Ok(()) }
+        if self.effective_slot("nativeMintFromSlot", self.native_mint_from, slot)?.is_none_or(|from| slot < from) { return Ok(()) }
         let key = native_mint_id();
         let mut data = vec![0u8; 82];
         data[44] = 9;
@@ -1397,7 +1449,7 @@ impl SvmExecutor {
                 let source = state.next_cutoff_epoch;
                 let cutoff_slot = source.checked_mul(rule.epoch_slots).and_then(|start| start.checked_add(rule.epoch_slots / 2)).context("Admission cutoff overflow")?;
                 let target = source.checked_add(1).context("Admission epoch overflow")?;
-                let frozen = if self.genesis_step_from.is_some_and(|from| cutoff_slot >= from) {
+                let frozen = if self.effective_slot("genesisStepFromSlot", self.genesis_step_from, cutoff_slot)?.is_some_and(|from| cutoff_slot >= from) {
                     // The held weight only falls: an outside undelegation never raises it again.
                     let held = steps.last().map_or(rule.genesis_stake_lamports, |(_,weight)| *weight);
                     let first = admission::snapshot(&rule,&self.accounts,&catalog,target,cutoff_slot,state.snapshots.last(),held)?;
@@ -1904,6 +1956,9 @@ impl SvmExecutor {
     }
 
     pub fn execute_slot(&mut self, slot: u64, items: Vec<ExecutionItem>) -> Result<SlotExecution> {
+        if self.rules_from.is_some_and(|from| slot >= from) {
+            if let Some(reason) = crate::rules::unsupported(&self.rules_state(&self.accounts)?.rules, slot, env!("CARGO_PKG_VERSION")) { bail!(reason) }
+        }
         self.observe_earnings_slot(slot);
         self.prepare_stake_epoch(slot)?;
         self.set_slot_clock(slot)?;
@@ -2058,6 +2113,8 @@ impl SvmExecutor {
                 .context("Simulation balance overflow")?;
             self.svm.set_account(payer, simulation_account)?;
             let peers=if self.admission_config.as_ref().is_some_and(|rule|slot>=rule.from_slot) {admission::peer_memos(&tx)} else {vec![]};
+            let rule_votes=if self.rules_from.is_some_and(|from|slot>=from) {crate::rules::rule_memos(&tx)} else {vec![]};
+            let voter=tx.message.static_account_keys().first().copied();
             let simulated = self.svm.simulate_transaction(tx);
             self.svm.set_account(payer, real_account)?;
             let outcome = match simulated {
@@ -2115,6 +2172,7 @@ impl SvmExecutor {
                 },
             };
             if outcome.success {self.record_peer_announcements(slot,peers)?;}
+            if outcome.success && !rule_votes.is_empty() { if let Some(voter)=voter { self.record_rule_votes(slot,voter,rule_votes)?; } }
             let outcome = ExecutionResult { after: self.account_view(&keys), before, ..outcome };
             self.remember_executed(candidate.id.clone(), &item.transaction.bytes);
             results.push(outcome);
@@ -2892,6 +2950,39 @@ mod tests {
         let catalog=executor.validator_catalog(&executor.checkpoint()).unwrap();
         let emptied=admission::snapshot(&rule,&executor.accounts,&catalog,7,208,Some(&next),0).unwrap();
         assert!(!emptied.members.iter().any(|member|genesis.contains(&member.identity)));
+    }
+
+    #[test]
+    fn rule_votes_take_force_at_sixty_percent_and_a_newer_rule_stops_this_node() {
+        let (mut executor,owner,rule,_,_,_)=admission_check_executor();
+        executor.set_rules_from(96);
+        for slot in [64,80,96] {executor.execute_slot(slot,vec![]).unwrap();}
+        let supply=executor.native_supply().unwrap().unwrap();
+        let change=|key:&str,slot:u64,min:&str| crate::rules::RuleChange {keys:[(key.to_string(),slot)].into(),min_version:min.into()};
+        let step=change("genesisStepFromSlot",128,"0.4.37");
+        for (identity,_) in &rule.genesis[..7] {executor.record_rule_votes(97,*identity,vec![step.clone()]).unwrap();}
+        assert_eq!(executor.rules(&executor.checkpoint()).unwrap()[0].in_force_from_slot,None,"seven of twelve equal stakes is under 60%");
+        executor.record_rule_votes(97,owner.pubkey(),vec![step.clone()]).unwrap();
+        assert_eq!(executor.rules(&executor.checkpoint()).unwrap()[0].voters.len(),7,"an identity outside the set has no vote");
+        executor.record_rule_votes(98,rule.genesis[7].0,vec![step.clone()]).unwrap();
+        let passed=executor.rules(&executor.checkpoint()).unwrap().remove(0);
+        assert_eq!((passed.voters.len(),passed.signed_stake*12,passed.in_force_from_slot),(8,passed.total_stake*8,Some(128)),"eight of twelve take force from the next boundary");
+        assert_eq!(executor.native_supply().unwrap().unwrap().circulating_lamports,supply.circulating_lamports,"the rules account's rent joins the reserve");
+        // The rule switches the genesis step on, though the genesis rule names none.
+        for slot in [112,128,144] {executor.execute_slot(slot,vec![]).unwrap();}
+        assert_eq!(executor.genesis_weight(&executor.checkpoint(),5).unwrap(),Some(rule.genesis_stake_lamports));
+        // A rule needing a newer node stops this one at its boundary.
+        let newer=change("nativeMintFromSlot",192,"9.0.0");
+        for (identity,_) in &rule.genesis[..8] {executor.record_rule_votes(145,*identity,vec![newer.clone()]).unwrap();}
+        executor.execute_slot(159,vec![]).unwrap();
+        let stopped=executor.execute_slot(160,vec![]).unwrap_err().to_string();
+        assert!(stopped.contains("needs node 9.0.0"),"{stopped}");
+        // The vote itself is a top-level Memo whose only account is the signing fee payer.
+        let voter=Keypair::new();
+        let memo=solana_sdk::instruction::Instruction {program_id:Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr").unwrap(),
+            accounts:vec![solana_sdk::instruction::AccountMeta::new_readonly(voter.pubkey(),true)],data:format!("{}{}",crate::rules::MEMO_PREFIX,serde_json::to_string(&step).unwrap()).into_bytes()};
+        let tx=solana_sdk::transaction::VersionedTransaction::from(Transaction::new_signed_with_payer(&[memo],Some(&voter.pubkey()),&[&voter],Hash::default()));
+        assert_eq!(crate::rules::rule_memos(&tx),vec![step]);
     }
 
     #[test]

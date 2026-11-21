@@ -49,6 +49,10 @@ const nativeMintFromSlot = optional('native-mint-from-slot'), feeBurnFromSlot = 
 assert.ok(feeBurnFromSlot === undefined || feeBurnFromSlot % epochSlots === 0 && feeBurnFromSlot > lanesFromSlot, 'Set the fee burn at a local epoch boundary after lanes.')
 // Optional: the genesis weight steps down by admitted outside stake from this boundary.
 const genesisStepFromSlot = optional('genesis-step-from-slot')
+// Optional: rule changes voted by the genesis identities from this boundary, after everything above.
+const rulesFromSlot = optional('rules-from-slot')
+assert.ok(rulesFromSlot === undefined || rulesFromSlot % epochSlots === 0 && rulesFromSlot >= Math.max(lanesFromSlot, feeBurnFromSlot ?? 0, genesisStepFromSlot ?? 0) + 4 * epochSlots,
+  'Set the rules at a local epoch boundary at least four epochs after lanes, the fee burn and the genesis step.')
 assert.ok(genesisStepFromSlot === undefined || genesisStepFromSlot % epochSlots === 0 && genesisStepFromSlot >= Math.max(lanesFromSlot, feeBurnFromSlot ?? 0) + 4 * epochSlots,
   'Set the genesis step at a local epoch boundary at least four epochs after lanes and the fee burn, so a second outside member can join and stake before it.')
 const stakeLamports = genesisStakeLamports * 2n
@@ -200,7 +204,7 @@ try {
   ], authority, [mintKeypair])
   if (feeBurnFromSlot !== undefined) await send(solana, [await onSolana.methods.initFeeBurnConfig().accountsStrict({ authority: authority.publicKey, bridge: addresses.bridge, mint, config: addresses.feeBurnConfig, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId }).instruction()], authority)
   runDir = mkdtempSync(join(target, 'native-lanes-check-'))
-  const rule = { program: program.toBase58(), fromSlot: 0, epochSlots, chainId, nativeFromSlot, nativeMint: mint.toBase58(), nativeScale: Number(scale), stakeFromSlot, genesisStakeLamports: genesisStakeLamports.toString(), admissionFromSlot, lanesFromSlot, nativeMintFromSlot, feeBurnFromSlot, genesisStepFromSlot }
+  const rule = { program: program.toBase58(), fromSlot: 0, epochSlots, chainId, nativeFromSlot, nativeMint: mint.toBase58(), nativeScale: Number(scale), stakeFromSlot, genesisStakeLamports: genesisStakeLamports.toString(), admissionFromSlot, lanesFromSlot, nativeMintFromSlot, feeBurnFromSlot, genesisStepFromSlot, rulesFromSlot }
   writeFileSync(join(runDir, 'bridge.json'), JSON.stringify(rule))
   mkdirSync(join(runDir, 'placements'))
   const env = { ...process.env, ACRUX_GENESIS_SEED: DEV_SEED, ACRUX_BIND: '127.0.0.1', ACRUX_BRIDGE: join(runDir, 'bridge.json'), ACRUX_BRIDGE_RPC: `${solanaUrl},${solanaUrl}`, ACRUX_BRIDGE_PROOF_MAX: '100000', ACRUX_PLACEMENTS: join(runDir, 'placements/placements.json') }
@@ -610,12 +614,87 @@ try {
       secondMember: second.publicKey.toBase58(), certifiedUnderStepped: stepEpoch + 2 }
     event('native_lanes_genesis_stepped', genesisStep)
   }
+  let rules
+  if (rulesFromSlot !== undefined) {
+    // The twelve genesis identities vote with `acrux rule vote`, each paying its own fee.
+    const keysDir = join(runDir, 'identities')
+    const written = spawnSync(binary, ['identities', '--out', keysDir], { cwd: runDir, env, windowsHide: true, encoding: 'utf8', timeout: 30_000 })
+    assert.equal(written.status, 0, `Write the local identities: ${written.stderr}`)
+    const identities = Array.from({ length: 12 }, (_, index) => {
+      const path = join(keysDir, `validator-${index}.json`)
+      return { path, key: Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(path, 'utf8')))) }
+    })
+    for (const identity of identities) await send(acrux, [SystemProgram.transfer({ fromPubkey: holder.publicKey, toPubkey: identity.key.publicKey, lamports: 5_000_000 })], holder)
+    const vote = (identity, set, minVersion = '0.4.37') => new Promise((done, failed) => {
+      const run = spawn(binary, ['rule', 'vote', '--rpc', gateway, '--identity', identity.path, ...set.flatMap(entry => ['--set', entry]), '--min-version', minVersion],
+        { cwd: runDir, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+      let out = ''
+      for (const stream of [run.stdout, run.stderr]) stream.on('data', data => { out += data })
+      run.once('error', failed)
+      run.once('exit', code => code === 0 ? done(/^rule ([0-9a-f]{64}) voted/m.exec(out)[1]) : failed(new Error(`rule vote: ${out}`)))
+    })
+    const votes = async (voters, set, minVersion) => (await Promise.all(voters.map(identity => vote(identity, set, minVersion))))[0]
+    const ruleOf = async hash => (await rpc('getRules')).rules.find(rule => rule.hash === hash)
+    const finalizedSlot = async () => (await rpc('getFinalizedCblock')).consensusSlot * 4
+
+    // Before rulesFromSlot a vote is an ordinary Memo.
+    assert.ok(await finalizedSlot() < rulesFromSlot - epochSlots / 4, 'Choose a later rules boundary: the early vote must land before it.')
+    const early = await vote(identities[0], [`genesisStepFromSlot=${rulesFromSlot + 4 * epochSlots}`])
+    assert.equal(await ruleOf(early), undefined)
+    assert.equal((await rpc('getRules')).rulesFromSlot, rulesFromSlot)
+
+    await waitSlot(rulesFromSlot + 4)
+    const voteEpoch = Math.floor(await finalizedSlot() / epochSlots), boundary = (voteEpoch + 1) * epochSlots
+    // With no step in the genesis rule, the change is what switches it on.
+    const stepFromSlot = genesisStepFromSlot === undefined ? boundary + epochSlots : undefined
+    const key = stepFromSlot === undefined ? 'nativeMintFromSlot' : 'genesisStepFromSlot'
+    const change = [`${key}=${boundary + epochSlots}`]
+    const hash = await votes(identities.slice(0, 7), change)
+    const open = await until('Seven votes are recorded', 30, async () => (await ruleOf(hash))?.voters.length === 7 && ruleOf(hash))
+    assert.equal(open.inForceFromSlot, null, 'Seven of the genesis identities hold under 60% of the set.')
+    // The fewest equal genesis votes that reach 60% of the set, outside stake included.
+    const weight = BigInt(open.signedStake) / 7n, need = Number((BigInt(open.totalStake) * 60n + 100n * weight - 1n) / (100n * weight))
+    assert.ok(need > 7 && need <= 12)
+    const [openHash] = await Promise.all([votes(identities.slice(0, 7), [`${key}=${boundary + 2 * epochSlots}`]), ...identities.slice(7, need - 1).map(identity => vote(identity, change))])
+    assert.equal((await until('One vote short', 30, async () => (await ruleOf(hash))?.voters.length === need - 1 && ruleOf(hash))).inForceFromSlot, null, 'One vote short of 60% stays open.')
+    await vote(identities[need - 1], change)
+    const passed = await until('The last vote puts the change in force', 30, async () => (await ruleOf(hash))?.inForceFromSlot === boundary && ruleOf(hash))
+    assert.ok(BigInt(passed.signedStake) * 100n >= BigInt(passed.totalStake) * 60n)
+    assert.ok(await finalizedSlot() < boundary, 'Use a longer local epoch: the votes must land in one epoch.')
+    rules = { hash, keys: passed.keys, inForceFromSlot: boundary, voters: need, signedStake: passed.signedStake, totalStake: passed.totalStake }
+    if (stepFromSlot !== undefined) {
+      const stepEpoch = stepFromSlot / epochSlots
+      await waitSlot(stepFromSlot + epochSlots / 2 + 8)
+      const set = await until('The first set fixed after the voted step', 60, () => rpc('getValidatorSet', { epoch: stepEpoch + 1 }).catch(() => false))
+      // The admitted outside member holds two genesis weights and counts as one.
+      assert.equal(BigInt(set.genesisWeight), 11n * genesisStakeLamports / 12n, 'The voted step lowers the genesis by the capped outside stake.')
+      assert.equal((await rpc('getValidatorSet', { epoch: stepEpoch })).genesisWeight, null)
+      rules.genesisWeight = set.genesisWeight
+    }
+    assert.equal((await ruleOf(openHash))?.inForceFromSlot ?? null, null, 'A change with seven of the genesis votes never takes force.')
+    await until('The RPC follower matches under the rule in force', 60, async () => [...followerStates.keys()].some(slot => slot >= boundary + epochSlots))
+
+    // A change that needs a newer node: in force at its boundary, where every node here stops.
+    const stopAt = (Math.floor(await finalizedSlot() / epochSlots) + 1) * epochSlots
+    const newer = await votes(identities.slice(0, need), [`nativeMintFromSlot=${stopAt + epochSlots}`], '9.0.0')
+    await until('The newer change is in force', 30, async () => (await ruleOf(newer))?.inForceFromSlot === stopAt)
+    const last = await finalizedSlot()
+    const deadline = Date.now() + (stopAt - last) / 10 * 1000 + 90_000
+    while (!/needs node 9\.0\.0/.test(tail) && Date.now() < deadline) await pause(500)
+    assert.match(tail, /needs node 9\.0\.0/, 'The net stops at the change it can\'t carry.')
+    const stopped = await finalizedSlot().catch(() => last)
+    assert.ok(stopped < stopAt, `Nothing from slot ${stopAt} finalizes on this node; the last is ${stopped}.`)
+    rules.open = openHash; rules.stoppedAt = stopAt; rules.lastFinalized = stopped
+    event('native_lanes_rules', rules)
+    await stopOwned(follower); follower = undefined
+    await stopOwned(child); child = undefined
+  }
   event('native_lanes_check_passed', { identity: holder.publicKey.toBase58(), lanesFromSlot, epochSlots, before, after,
     boundaryBefore: boundaryBefore.agreement, boundaryAfter: boundaryAfter.agreement,
     withdrawal, withdrawalCblock: cblock, withdrawalSequence: withdrawalSequence.toNumber(), releasedBaseUnits: withdrawAmount.toString(),
     unchangedSolanaProgram: program.toBase58(), silentWindow: silentWindow.number, silentRole,
     silentFinalizedUs: silent.cblock.finalizedUs, skipTimeoutUs: silent.consensusTimeoutUs,
-    rpcFollowerMatches: followerStates.size, observerMatches, nativeMint, feeBurned, genesisStep })
+    rpcFollowerMatches: followerStates.size, observerMatches, nativeMint, feeBurned, genesisStep, rules })
 } catch (error) {
   console.error(`The local net's last output:\n${tail}\nOutside process:\n${observerTail}\nRPC follower:\n${followerTail}`)
   throw error

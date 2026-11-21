@@ -53,6 +53,7 @@ pub enum GatewayCommand {
         reply: CommandReply,
     },
     ValidatorSet { epoch:Option<u64>,reply:CommandReply },
+    Rules { reply:CommandReply },
     ExecutionAgreement {slot:u64,reply:CommandReply},
     Balance {
         address: String,
@@ -404,6 +405,7 @@ async fn rpc_one(state: SharedGateway, client: std::net::IpAddr, request: Value)
         },
         "getCurrentWindow" => Ok(state.read().await.current_window.clone()),
         "getCounters" => Ok(state.read().await.counters.clone()),
+        "getRules" => command(&state,|reply|GatewayCommand::Rules{reply}).await.map_err(|_|("NET_UNAVAILABLE","The rules are not available yet.")),
         "getValidatorSet" => {
             if params.as_object().is_none_or(|params|params.keys().any(|key|key!="epoch")) || params.get("epoch").is_some_and(|value|safe_integer(value).is_none()) {
                 Err(("INVALID_INPUT","Give an optional nonnegative epoch."))

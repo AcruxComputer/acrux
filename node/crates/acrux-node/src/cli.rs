@@ -306,7 +306,7 @@ pub(crate) fn load_follow_snapshot(mut snapshot: Value, genesis: &crate::genesis
     if let Some(bridge) = &genesis.bridge {
         executor.set_bridge(bridge.program);
         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
-        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); } if let Some(slot) = bridge.genesis_step_from_slot { executor.set_genesis_step_from(slot); }
+        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); } if let Some(slot) = bridge.genesis_step_from_slot { executor.set_genesis_step_from(slot); } if let Some(slot) = bridge.rules_from_slot { executor.set_rules_from(slot); }
         if let Some(fee_burn) = bridge.fee_burn_activation()? { executor.set_fee_burn_config(fee_burn); }
         if let Some((from_slot, genesis_stake_lamports)) = stake_rule {
             let identities = config.as_ref().context("Public proposer configuration is missing")?.identities.iter().map(|identity| identity.parse()).collect::<std::result::Result<Vec<_>, _>>()?;
@@ -596,6 +596,34 @@ pub enum HubAction {
     Release { code: String },
 }
 
+/// One rule vote: a Memo from the identity naming the change, paid by it.
+pub async fn rule_vote(rpc_url: &str, keypair_path: &str, set: &[String], min_version: &str) -> Result<()> {
+    let signer = keypair(keypair_path)?;
+    let me = signer.pubkey();
+    let keys = set.iter().map(|entry| {
+        let (key, slot) = entry.split_once('=').context("Give each --set as key=slot")?;
+        Ok((key.to_string(), slot.parse::<u64>().context("A slot is an unsigned integer")?))
+    }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+    let change = acrux_execution::rules::RuleChange { keys, min_version: min_version.into() };
+    let data = format!("{}{}", acrux_execution::rules::MEMO_PREFIX, serde_json::to_string(&change)?);
+    let instruction = Instruction { program_id: Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")?, accounts: vec![AccountMeta::new_readonly(me, true)], data: data.into_bytes() };
+    let blockhash: Hash = rpc(rpc_url, "getLatestBlockhash", json!([{"commitment": "confirmed"}])).await?["value"]["blockhash"].as_str().context("blockhash")?.parse()?;
+    let tx = Transaction::new_signed_with_payer(&[instruction], Some(&me), &[&signer], blockhash);
+    let signature = rpc(rpc_url, "sendTransaction", json!([B64.encode(bincode::serialize(&tx)?), {"encoding": "base64", "preflightCommitment": "confirmed"}])).await?;
+    let signature = signature.as_str().context("signature")?.to_owned();
+    for _ in 0..60 {
+        let status = rpc(rpc_url, "getSignatureStatuses", json!([[signature]])).await?;
+        let entry = &status["value"][0];
+        if !entry.is_null() && matches!(entry["confirmationStatus"].as_str(), Some("confirmed" | "finalized")) {
+            ensure!(entry["err"].is_null(), "the rule vote failed: {}", entry["err"]);
+            println!("rule {} voted by {me}: {signature}", hex::encode(change.hash()));
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    bail!("the rule vote was not confirmed within 30 s: {signature}")
+}
+
 /// One Hub Registry instruction, signed with the identity keypair (and paid by it).
 pub async fn hub(rpc_url: &str, program: &str, keypair_path: &str, action: HubAction) -> Result<()> {
     let program = Pubkey::from_str(program)?;
@@ -727,7 +755,7 @@ pub async fn import(url: &str, store: &str, genesis: &str) -> Result<()> {
     if let Some(bridge) = &genesis.bridge {
         executor.set_bridge(bridge.program);
         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
-        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); } if let Some(slot) = bridge.genesis_step_from_slot { executor.set_genesis_step_from(slot); }
+        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); } if let Some(slot) = bridge.genesis_step_from_slot { executor.set_genesis_step_from(slot); } if let Some(slot) = bridge.rules_from_slot { executor.set_rules_from(slot); }
         if let Some(fee_burn) = bridge.fee_burn_activation()? { executor.set_fee_burn_config(fee_burn); }
         if let Some((from_slot, genesis_stake_lamports)) = bridge.stake_activation()? {
             let config: crate::protocol::ProposerConfig = serde_json::from_value(snapshot.get("proposerConfig").context("Public proposer configuration is missing")?.clone())?;

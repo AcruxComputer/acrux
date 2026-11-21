@@ -109,6 +109,10 @@ export const Hubs = page(Hub)
 /** The genesis validators' share of stake in each bridge epoch's fixed set; the next epoch appears once its set is fixed. */
 /** From `genesisStepFromSlot`, each set's `genesisWeight` (per genesis identity, native lamports) falls by admitted outside stake, each outside identity counted up to one genesis identity's original weight, and never rises; null before the step. */
 export const GenesisShare = z.object({ currentEpoch: Count, genesisStepFromSlot: Count.nullable().optional(), epochs: z.array(z.object({ epoch: Count, fixedAtSlot: Count.nullable(), genesisStake: U64, totalStake: U64, genesisShareBps: Count.max(10000), genesisMembers: Count, externalMembers: Count, genesisWeight: U64.nullable().optional() })) })
+/** A change to the rule voted by validator identities: activation slots by key. It is in force from `inForceFromSlot` once identities holding `passPercent` of `epoch`'s admitted stake signed it; until then it is open in that epoch. */
+export const RuleChange = z.object({ hash: z.string().regex(/^[0-9a-f]{64}$/), keys: z.record(z.string(), Count), minVersion: z.string(), epoch: Count, voters: z.array(Address), signedStake: U64, totalStake: U64, inForceFromSlot: Count.nullable() })
+/** The genesis rule's governed keys, the keys this node applies, and every change voted on. */
+export const Rules = z.object({ rulesFromSlot: Count.nullable(), passPercent: Count.max(100), knownKeys: z.array(z.string()), nodeVersion: z.string(), genesis: z.record(z.string(), Count.nullable()), rules: z.array(RuleChange) })
 /** Earned fees only, in native lamports; amounts may exceed u64 after repeated circulation. */
 export const HubEarningsRow = z.object({ identity: Address, validatorKind: openEnum(['genesis', 'external']), base: BaseUnits, priority: BaseUnits, inclusion: BaseUnits })
 /** countedFromSlot is the first observed slot, so a partial first epoch is explicit. */
@@ -314,6 +318,8 @@ export type FragmentSubmission = z.infer<typeof FragmentSubmission>
 export type Submission = z.infer<typeof Submission>
 export type Hubs = z.infer<typeof Hubs>
 export type GenesisShare = z.infer<typeof GenesisShare>
+export type RuleChange = z.infer<typeof RuleChange>
+export type Rules = z.infer<typeof Rules>
 export type RegistryConfig = z.infer<typeof RegistryConfig>
 export type SchedulePreview = z.infer<typeof SchedulePreview>
 export type FaucetPolicy = z.infer<typeof FaucetPolicy>

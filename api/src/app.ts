@@ -8,7 +8,7 @@ import {
   type LabRun, type ProtocolEvent, type Transaction,
 } from '@acrux/contract'
 import {
-  facts, genesisShare, genesisShareGenesisOnly, hubEarnings, outsideHubEarnings, hubEarningsEmpty, faucetGrant, faucetStatus, fixtureErrors, hubs, labRuns, labRunsByState, labRunsByProtocol, labLanesCrashRun,
+  facts, genesisShare, genesisShareGenesisOnly, rules, rulesNone, hubEarnings, outsideHubEarnings, hubEarningsEmpty, faucetGrant, faucetStatus, fixtureErrors, hubs, labRuns, labRunsByState, labRunsByProtocol, labLanesCrashRun,
   makeFixtureTransaction, makeLabReplay, makeSchedulePreview, registryConfig, scenarios, externalBlockTransaction,
   specMap, transactionsByState, replayRange, replaySlot, burnNoEpochs, burnPending, burnBurned, burnRunning, bridgeFixture, bridgeWaitingFixture, bridgeTransfersFixture,
 } from '@acrux/contract/fixtures'
@@ -80,6 +80,7 @@ export function createFixtureApi() {
     return c.json(paginate(rows, readQuery(c, PageQuery)))
   })
   app.get('/v1/genesis-share', c => c.json(c.get('scenario') === 'empty' ? genesisShareGenesisOnly : genesisShare))
+  app.get('/v1/rules', c => c.json(c.get('scenario') === 'empty' ? rulesNone : rules))
   app.get('/v1/hubs/:code/earnings', c => {
     const code = readParam(c, 'code', HubCode)
     readQuery(c, z.strictObject({}))

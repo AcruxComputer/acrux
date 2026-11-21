@@ -804,7 +804,7 @@ impl Network {
                     if let Some(bridge) = genesis.as_ref().and_then(|g| g.bridge.as_ref()) {
                         executor.set_bridge(bridge.program);
                         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
-                        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); } if let Some(slot) = bridge.genesis_step_from_slot { executor.set_genesis_step_from(slot); }
+                        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); } if let Some(slot) = bridge.genesis_step_from_slot { executor.set_genesis_step_from(slot); } if let Some(slot) = bridge.rules_from_slot { executor.set_rules_from(slot); }
                         if let Some(fee_burn) = bridge.fee_burn_activation()? { executor.set_fee_burn_config(fee_burn); }
                         if let Some(admission)=bridge.admission_config(&admission_genesis)? {executor.set_admission_config(admission);}
                         if let Some((from_slot, genesis_stake_lamports)) = bridge.stake_activation()? {
@@ -821,7 +821,7 @@ impl Network {
                     if let Some(bridge) = genesis.as_ref().and_then(|g| g.bridge.as_ref()) {
                         executor.set_bridge(bridge.program);
                         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
-                        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); } if let Some(slot) = bridge.genesis_step_from_slot { executor.set_genesis_step_from(slot); }
+                        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); } if let Some(slot) = bridge.genesis_step_from_slot { executor.set_genesis_step_from(slot); } if let Some(slot) = bridge.rules_from_slot { executor.set_rules_from(slot); }
                         if let Some(fee_burn) = bridge.fee_burn_activation()? { executor.set_fee_burn_config(fee_burn); }
                         if let Some(admission)=bridge.admission_config(&admission_genesis)? {executor.set_admission_config(admission);}
                         if let Some((from_slot, genesis_stake_lamports)) = bridge.stake_activation()? {
@@ -1073,6 +1073,20 @@ impl Network {
             lanes.install_stakes(from,own,snapshot.members.iter().map(|member|member.stake).collect())?;
         }}
         Ok(node.epoch_voting.ready(&schedules,cblock))
+    }
+    /// The genesis rule's rule keys and every rule change voted on, with its signed stake.
+    fn rules_json(&self)->Result<Value> {
+        let executor=self.nodes[0].executor.as_ref().unwrap();
+        let rule=self.genesis.as_ref().and_then(|g|g.bridge.as_ref());
+        let rules=executor.rules(&executor.checkpoint())?.into_iter().map(|rule| json!({
+            "hash":hex::encode(rule.hash),"keys":rule.change.keys,"minVersion":rule.change.min_version,"epoch":rule.epoch,
+            "voters":rule.voters.iter().map(|voter|voter.to_string()).collect::<Vec<_>>(),
+            "signedStake":rule.signed_stake.to_string(),"totalStake":rule.total_stake.to_string(),"inForceFromSlot":rule.in_force_from_slot,
+        })).collect::<Vec<_>>();
+        Ok(json!({"rulesFromSlot":rule.and_then(|rule|rule.rules_from_slot),"passPercent":acrux_execution::rules::PASS_PERCENT as u64,
+            "knownKeys":acrux_execution::rules::KNOWN_KEYS,"nodeVersion":env!("CARGO_PKG_VERSION"),
+            "genesis":{"genesisStepFromSlot":rule.and_then(|rule|rule.genesis_step_from_slot),"nativeMintFromSlot":rule.and_then(|rule|rule.native_mint_from_slot)},
+            "rules":rules}))
     }
     fn validator_set_json(&self,epoch:u64)->Result<Value> {
         let schedules=self.proposers.read().unwrap();
@@ -3993,6 +4007,9 @@ impl Network {
             }
             GatewayCommand::Faucet { reply } => {
                 let _ = reply.send(self.faucet_available().map_err(|e| e.to_string()));
+            }
+            GatewayCommand::Rules {reply} => {
+                let result=self.rules_json().map_err(|error|error.to_string());let _=reply.send(result);
             }
             GatewayCommand::ValidatorSet {epoch,reply} => {
                 let epoch=epoch.unwrap_or_else(||self.latest_started()/self.proposers.read().unwrap().config.epoch_slots);

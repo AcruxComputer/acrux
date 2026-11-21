@@ -24,6 +24,7 @@ import { createBurnReader, mountBurnRoutes, readNodeFeeBurns } from './burn.js'
 import { BridgeReader, readBridgeRelayer, readBridgeTransfers } from './bridge.js'
 import { readReplayRange } from './replay.js'
 import { createGenesisShareReader } from './genesis-share.js'
+import { readRules } from './rules.js'
 import { createHubEarningsReader } from './earnings.js'
 import { createHashExchangeReader, hubHashExchange, memberHashExchange } from './hash-exchange.js'
 /** `?from=&to=`: the totals of one slot range, an epoch say. */
@@ -123,6 +124,10 @@ export function createNodeApi() {
   const genesisShare = createGenesisShareReader(env.GATEWAY_RPC_URL)
   app.get('/v1/genesis-share', async c => {
     try { return c.json(await genesisShare()) }
+    catch { fail('NET_UNAVAILABLE', 'Acrux Net is unavailable.', { retryable: true, stage: 'read' }) }
+  })
+  app.get('/v1/rules', async c => {
+    try { return c.json(await readRules(env.GATEWAY_RPC_URL)) }
     catch { fail('NET_UNAVAILABLE', 'Acrux Net is unavailable.', { retryable: true, stage: 'read' }) }
   })
   const hubEarnings = createHubEarningsReader(env.GATEWAY_RPC_URL)

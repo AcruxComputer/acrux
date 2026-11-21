@@ -139,6 +139,10 @@ pub struct BridgeConfig {
     /// admitted outside stake, each outside identity counted up to one genesis identity's weight.
     #[serde(default)]
     pub genesis_step_from_slot: Option<u64>,
+    /// From this bridge epoch boundary, admitted identities vote rule changes by Memo, and a change
+    /// signed by 60% of an epoch's stake is in force from the next boundary.
+    #[serde(default)]
+    pub rules_from_slot: Option<u64>,
 }
 impl BridgeConfig {
     pub fn chain_tag(&self) -> [u8; 32] { crate::crypto::hash(self.chain_id.as_bytes()) }
@@ -191,6 +195,12 @@ impl BridgeConfig {
         let Some(slot) = self.genesis_step_from_slot else { return Ok(None) };
         let admission = self.admission_activation()?.context("genesisStepFromSlot requires admissionFromSlot")?;
         ensure!(slot % self.epoch_slots == 0 && slot > admission, "genesisStepFromSlot must be a bridge epoch boundary after admissionFromSlot");
+        Ok(Some(slot))
+    }
+    pub fn rules_activation(&self) -> Result<Option<u64>> {
+        let Some(slot) = self.rules_from_slot else { return Ok(None) };
+        let admission = self.admission_activation()?.context("rulesFromSlot requires admissionFromSlot")?;
+        ensure!(slot % self.epoch_slots == 0 && slot > admission, "rulesFromSlot must be a bridge epoch boundary after admissionFromSlot");
         Ok(Some(slot))
     }
     pub fn fee_burn_activation(&self) -> Result<Option<crate::execution::FeeBurnConfig>> {
@@ -251,6 +261,7 @@ fn bridge(chain: &Path) -> Result<Option<BridgeConfig>> {
     config.admission_activation()?;
     config.lanes_activation()?;
     config.genesis_step_activation()?;
+    config.rules_activation()?;
     ensure!(config.native_mint_from_slot.is_none_or(|slot| slot >= config.from_slot), "nativeMintFromSlot must be at or after fromSlot");
     Ok(Some(config))
 }

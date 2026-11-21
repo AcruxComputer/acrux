@@ -55,6 +55,11 @@ enum Command {
         #[command(subcommand)]
         command: NodeCommand,
     },
+    /// Rule changes signed by the validator set: `acrux rule vote --set genesisStepFromSlot=8640000 --min-version 0.4.37`.
+    Rule {
+        #[command(subcommand)]
+        command: RuleCommand,
+    },
     /// The Hub Registry on Solana.
     Hub {
         #[command(subcommand)]
@@ -149,6 +154,23 @@ enum NodeCommand {
         /// The net's genesis, for its programs.
         #[arg(long, default_value = "../chain/genesis/acrux-net.json")]
         genesis: String,
+    },
+}
+#[derive(Subcommand)]
+enum RuleCommand {
+    /// Signs a Memo naming the change from a validator identity; each identity's Memo is its vote.
+    Vote {
+        #[arg(long, default_value = "http://127.0.0.1:4930")]
+        rpc: String,
+        /// The validator identity keypair that signs and pays the fee.
+        #[arg(long, default_value = "acrux-key.json")]
+        identity: String,
+        /// A key and its activation slot, `key=slot`; repeat for more keys.
+        #[arg(long = "set", required = true)]
+        set: Vec<String>,
+        /// The oldest node version that carries the change.
+        #[arg(long)]
+        min_version: String,
     },
 }
 #[derive(Subcommand)]
@@ -270,6 +292,7 @@ async fn run() -> anyhow::Result<()> {
         Command::Replay { block, rpc, slot, save, rows, json } => return acrux_node::replay::run(block.as_deref(), rpc.as_deref(), slot, save.as_deref(), rows, json.as_deref()).await,
         Command::Send { rpc, keypair, to, lamports, n, t, priority } => return cli::send(&rpc, &keypair, &to, lamports, n, t, priority).await,
         Command::Node { command: NodeCommand::Follow { url, genesis } } => return cli::follow(&url, &genesis).await,
+        Command::Rule { command: RuleCommand::Vote { rpc, identity, set, min_version } } => return cli::rule_vote(&rpc, &identity, &set, &min_version).await,
         Command::Node { command: NodeCommand::Propose { hub, identity, net, genesis, rpc_port, metrics_port, peer_port, peer_address } } => return acrux_node::propose::run(&net, &hub, &identity, &genesis, rpc_port, metrics_port, peer_port, peer_address).await,
         Command::Net { command: NetCommand::Import { url, store, genesis } } => return cli::import(&url, &store, &genesis).await,
         Command::Hub { command, rpc, program, identity } => {
@@ -333,7 +356,7 @@ async fn run() -> anyhow::Result<()> {
             Configuration { gateway_port, websocket_port: ws_port, base_port, metrics_port, store_path: store, genesis_path: Some(genesis), ..Default::default() }
         }
         Command::Net { command: NetCommand::Import { .. } } => unreachable!("handled above"),
-        Command::Schedule | Command::Identities { .. } | Command::Keygen { .. } | Command::Send { .. } | Command::Replay { .. } | Command::Node { .. } | Command::Hub { .. } => unreachable!("handled above"),
+        Command::Schedule | Command::Identities { .. } | Command::Keygen { .. } | Command::Send { .. } | Command::Replay { .. } | Command::Node { .. } | Command::Rule { .. } | Command::Hub { .. } => unreachable!("handled above"),
         Command::Lab { command: LabCommand::Run { scenario, protocol, seed, base_port, out, genesis } } => {
             // The faulty window is the fifth, after the net has settled; its attacker is the
             // scenario's proposer role (for censorship, the honest proposer that carries the transaction).

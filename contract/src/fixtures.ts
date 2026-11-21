@@ -2,7 +2,7 @@ import { FAUCET_RETIRED_MESSAGE } from './bridge.js'
 import type { z } from 'zod'
 import { toBase58, toBase64 } from './encoding.js'
 import { PROTOCOL_PARAMETERS, errors } from './schemas.js'
-import type { ScenarioId, Balance, GenesisShare, HubEarnings, Bridge, BridgeTransfer, Burn, BurnEpoch, DemoPool, Evidence, Facts, FaucetPolicy, FaucetStatus, FaucetGrant, LabScenario, RegistryConfig, SchedulePreview, SpecMap } from './schemas.js'
+import type { ScenarioId, Balance, GenesisShare, Rules, HubEarnings, Bridge, BridgeTransfer, Burn, BurnEpoch, DemoPool, Evidence, Facts, FaucetPolicy, FaucetStatus, FaucetGrant, LabScenario, RegistryConfig, SchedulePreview, SpecMap } from './schemas.js'
 import type { HashExchangePair, HashExchange as HashExchangeView, HubHashExchange, Cblock, CblockLane, Certificate, ExecutionSchedule, Hub, LabProtocol, LabRun, LabYardstickLane, Member, MergedTransaction, NetSnapshot, Parameters, Proposer, Slot, Transaction, Window } from './schemas.js'
 import type { ApiErrorBody } from './errors.js'
 import type { LabReplay, ProtocolEvent } from './events.js'
@@ -652,6 +652,16 @@ export const genesisShare: GenesisShare = { currentEpoch: 20, genesisStepFromSlo
   { epoch: 21, fixedAtSlot: 8856000, genesisStake: '9000000000000000', totalStake: '12000000000000000', genesisShareBps: 7500, genesisMembers: 12, externalMembers: 12, genesisWeight: '750000000000000' },
 ] }
 export const genesisShareGenesisOnly: GenesisShare = { currentEpoch: 12, epochs: [genesisShare.epochs[0]!] }
+
+/** From slot 8,640,000: one change in force, signed by eight of twelve equal genesis stakes, and one still open. */
+export const rules: Rules = { rulesFromSlot: 8640000, passPercent: 60, knownKeys: ['genesisStepFromSlot', 'nativeMintFromSlot'], nodeVersion: '0.4.37',
+  genesis: { genesisStepFromSlot: null, nativeMintFromSlot: 6480000 }, rules: [
+  { hash: 'a1'.repeat(32), keys: { genesisStepFromSlot: 9504000 }, minVersion: '0.4.37', epoch: 20, voters: [fixtureAddress('genesis-1'), fixtureAddress('genesis-2'), fixtureAddress('genesis-3'), fixtureAddress('genesis-4'), fixtureAddress('genesis-5'), fixtureAddress('genesis-6'), fixtureAddress('genesis-7'), fixtureAddress('genesis-8')],
+    signedStake: '8000000000000000', totalStake: '12000000000000000', inForceFromSlot: 9072000 },
+  { hash: 'b2'.repeat(32), keys: { genesisStepFromSlot: 9936000 }, minVersion: '0.4.37', epoch: 21, voters: [fixtureAddress('genesis-9')],
+    signedStake: '1000000000000000', totalStake: '12000000000000000', inForceFromSlot: null },
+] }
+export const rulesNone: Rules = { ...rules, rules: [] }
 
 /** Existing fees move to validators; these are synthetic observations, with no issuance. */
 export const hubEarnings: HubEarnings = { hubCode: 'FRA', epochSlots: 432000, epochs: [
