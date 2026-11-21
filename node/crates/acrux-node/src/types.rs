@@ -237,7 +237,7 @@ mod vote_tests {
     use crate::{crypto, genesis::BridgeConfig};
 
     fn rule(chain_id: &str) -> BridgeConfig {
-        BridgeConfig { program: solana_sdk::pubkey::Pubkey::new_unique(), from_slot: 400, epoch_slots: 432_000, chain_id: chain_id.into(), min_withdrawal: Default::default(), native_from_slot: None, native_mint: None, native_scale: None, stake_from_slot: None, genesis_stake_lamports: None, fee_burn_from_slot: None, admission_from_slot: None, lanes_from_slot:None, native_mint_from_slot:None }
+        BridgeConfig { program: solana_sdk::pubkey::Pubkey::new_unique(), from_slot: 400, epoch_slots: 432_000, chain_id: chain_id.into(), min_withdrawal: Default::default(), native_from_slot: None, native_mint: None, native_scale: None, stake_from_slot: None, genesis_stake_lamports: None, fee_burn_from_slot: None, admission_from_slot: None, lanes_from_slot:None, native_mint_from_slot:None, genesis_step_from_slot: None }
     }
 
     #[test]

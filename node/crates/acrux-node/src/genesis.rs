@@ -135,6 +135,10 @@ pub struct BridgeConfig {
     /// SPL Token's native mint (`So111…112`) is placed from this slot, so ACRUX wraps as SOL does.
     #[serde(default)]
     pub native_mint_from_slot: Option<u64>,
+    /// From this bridge epoch boundary, each admission cut-off lowers the genesis weight by the
+    /// admitted outside stake, each outside identity counted up to one genesis identity's weight.
+    #[serde(default)]
+    pub genesis_step_from_slot: Option<u64>,
 }
 impl BridgeConfig {
     pub fn chain_tag(&self) -> [u8; 32] { crate::crypto::hash(self.chain_id.as_bytes()) }
@@ -182,6 +186,12 @@ impl BridgeConfig {
             from_slot,epoch_slots:self.epoch_slots,registry_program:Pubkey::from_str("ABjgHL8TcjxUjx6vfwsVQyvxiXR6pFgMkeESgwK6CbDm").unwrap(),
             genesis:genesis.to_vec(),genesis_stake_lamports:self.genesis_stake_lamports.unwrap(),
         }))
+    }
+    pub fn genesis_step_activation(&self) -> Result<Option<u64>> {
+        let Some(slot) = self.genesis_step_from_slot else { return Ok(None) };
+        let admission = self.admission_activation()?.context("genesisStepFromSlot requires admissionFromSlot")?;
+        ensure!(slot % self.epoch_slots == 0 && slot > admission, "genesisStepFromSlot must be a bridge epoch boundary after admissionFromSlot");
+        Ok(Some(slot))
     }
     pub fn fee_burn_activation(&self) -> Result<Option<crate::execution::FeeBurnConfig>> {
         let Some(slot) = self.fee_burn_from_slot else { return Ok(None) };
@@ -240,6 +250,7 @@ fn bridge(chain: &Path) -> Result<Option<BridgeConfig>> {
     config.fee_burn_activation()?;
     config.admission_activation()?;
     config.lanes_activation()?;
+    config.genesis_step_activation()?;
     ensure!(config.native_mint_from_slot.is_none_or(|slot| slot >= config.from_slot), "nativeMintFromSlot must be at or after fromSlot");
     Ok(Some(config))
 }

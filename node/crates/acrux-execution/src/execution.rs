@@ -386,6 +386,8 @@ pub struct SvmExecutor {
     native_cutover: Option<NativeCutover>,
     /// SPL Token's native mint, placed from this slot so lamports wrap as they do on Solana.
     native_mint_from: Option<u64>,
+    /// From this slot, each admission cut-off lowers the genesis weight by admitted outside stake.
+    genesis_step_from: Option<u64>,
     stake_config: Option<StakeConfig>,
     admission_config: Option<AdmissionConfig>,
     fee_burn_config: Option<FeeBurnConfig>,
@@ -598,6 +600,7 @@ impl SvmExecutor {
             bridge_minimums: None,
             native_cutover: None,
             native_mint_from: None,
+            genesis_step_from: None,
             stake_config: None,
             admission_config: None,
             fee_burn_config: None,
@@ -986,6 +989,25 @@ impl SvmExecutor {
         self.native_mint_from = Some(slot);
     }
 
+    pub fn set_genesis_step_from(&mut self, slot: u64) {
+        self.genesis_step_from = Some(slot);
+    }
+
+    /// (epoch, genesis weight per identity) for each retained snapshot since the step began.
+    fn genesis_steps(&self, accounts: &BTreeMap<Pubkey, Arc<Account>>) -> Result<Vec<(u64,u64)>> {
+        let Some(bridge) = self.bridge else { return Ok(vec![]) };
+        let Some(account) = accounts.get(&admission::genesis_step_address(&bridge)).filter(|account| !native_wallet(account)) else { return Ok(vec![]) };
+        anyhow::ensure!(account.owner == bridge && !account.executable && account.data.get(..8) == Some(&Sha256::digest(b"account:GenesisStep")[..8]), "Invalid genesis step account");
+        let steps: Vec<(u64,u64)> = bincode::deserialize(&account.data[8..])?;
+        anyhow::ensure!(!steps.is_empty() && steps.len() <= admission::RETAINED_SNAPSHOTS && steps.windows(2).all(|pair| pair[0].0 < pair[1].0 && pair[0].1 >= pair[1].1), "Invalid committed genesis steps");
+        Ok(steps)
+    }
+
+    /// The genesis weight per identity fixed for `epoch`, once the step has begun.
+    pub fn genesis_weight(&self, checkpoint: &ExecutorCheckpoint, epoch: u64) -> Result<Option<u64>> {
+        Ok(self.genesis_steps(&checkpoint.accounts)?.into_iter().find(|(held,_)| *held == epoch).map(|(_,weight)| weight))
+    }
+
     /// Solana's native mint at `So11111111111111111111111111111111111111112`: 9 decimals, initialized,
     /// no authorities, supply 0. Its rent joins the native reserve, so circulating ACRUX is unchanged.
     fn apply_native_mint(&mut self, slot: u64) -> Result<()> {
@@ -1294,8 +1316,9 @@ impl SvmExecutor {
         let delegated = admission::delegated_weights(&self.accounts, &catalog, epoch)?;
         let effective = self.effective_memberships(epoch)?.into_iter().map(|member| member.identity).collect::<BTreeSet<_>>();
         let genesis = rule.genesis.iter().map(|(identity,_)| *identity).collect::<BTreeSet<_>>();
+        let genesis_stake = self.genesis_steps(&self.accounts)?.last().map_or(rule.genesis_stake_lamports, |(_,weight)| *weight);
         catalog.into_iter().map(|identity| {
-            let weight = if effective.contains(&identity) { delegated.get(&identity).copied().unwrap_or(0).checked_add(if genesis.contains(&identity) { rule.genesis_stake_lamports } else { 0 }).context("Admission stake overflow")? } else { 0 };
+            let weight = if effective.contains(&identity) { delegated.get(&identity).copied().unwrap_or(0).checked_add(if genesis.contains(&identity) { genesis_stake } else { 0 }).context("Admission stake overflow")? } else { 0 };
             Ok((identity,weight))
         }).collect()
     }
@@ -1367,12 +1390,24 @@ impl SvmExecutor {
             state.catalog_len = catalog.len() as u64;
         }
         let due = if slot % rule.epoch_slots >= rule.epoch_slots / 2 { Some(epoch) } else { epoch.checked_sub(1) };
+        let mut steps = self.genesis_steps(&self.accounts)?;
+        let steps_before = steps.clone();
         if let Some(due) = due {
             while state.next_cutoff_epoch <= due {
                 let source = state.next_cutoff_epoch;
                 let cutoff_slot = source.checked_mul(rule.epoch_slots).and_then(|start| start.checked_add(rule.epoch_slots / 2)).context("Admission cutoff overflow")?;
                 let target = source.checked_add(1).context("Admission epoch overflow")?;
-                let frozen = admission::snapshot(&rule,&self.accounts,&catalog,target,cutoff_slot,state.snapshots.last())?;
+                let frozen = if self.genesis_step_from.is_some_and(|from| cutoff_slot >= from) {
+                    // The held weight only falls: an outside undelegation never raises it again.
+                    let held = steps.last().map_or(rule.genesis_stake_lamports, |(_,weight)| *weight);
+                    let first = admission::snapshot(&rule,&self.accounts,&catalog,target,cutoff_slot,state.snapshots.last(),held)?;
+                    let stepped = held.min(admission::stepped_genesis_stake(&rule,&first.members));
+                    steps.push((target,stepped));
+                    if steps.len() > admission::RETAINED_SNAPSHOTS { steps.remove(0); }
+                    if stepped == held { first } else { admission::snapshot(&rule,&self.accounts,&catalog,target,cutoff_slot,state.snapshots.last(),stepped)? }
+                } else {
+                    admission::snapshot(&rule,&self.accounts,&catalog,target,cutoff_slot,state.snapshots.last(),rule.genesis_stake_lamports)?
+                };
                 hub_snapshots.push(self.freeze_hub_places(&rule,&frozen,&mut additions)?);
                 state.snapshots.push(frozen);
                 if state.snapshots.len() > admission::RETAINED_SNAPSHOTS { state.snapshots.remove(0); }
@@ -1386,6 +1421,13 @@ impl SvmExecutor {
             anyhow::ensure!(previous.as_ref().is_none_or(|account|native_wallet(account)||(account.owner==bridge&&!account.executable&&account.data.get(..8)==Some(&Sha256::digest(b"account:AdmissionHubs")[..8]))),"Admission hub address has an incompatible account");
             let mut data=Sha256::digest(b"account:AdmissionHubs")[..8].to_vec();data.extend(bincode::serialize(&hub_snapshots)?);
             additions.insert(key,Account {lamports:previous.map_or(0,|account|account.lamports).max(self.rent_exempt_minimum(data.len())),data,owner:bridge,executable:false,rent_epoch:0});
+        }
+        if steps != steps_before {
+            let key = admission::genesis_step_address(&bridge);
+            let previous = self.svm.get_account(&key);
+            anyhow::ensure!(previous.as_ref().is_none_or(|account| native_wallet(account) || (account.owner == bridge && !account.executable && account.data.get(..8) == Some(&Sha256::digest(b"account:GenesisStep")[..8]))), "Genesis step address has an incompatible account");
+            let mut data = Sha256::digest(b"account:GenesisStep")[..8].to_vec(); data.extend(bincode::serialize(&steps)?);
+            additions.insert(key,Account { lamports:previous.map_or(0,|account| account.lamports).max(self.rent_exempt_minimum(data.len())),data,owner:bridge,executable:false,rent_epoch:0 });
         }
         let mut data = Sha256::digest(b"account:Admission")[..8].to_vec(); data.extend(bincode::serialize(&state)?);
         let before = existing.as_ref().map_or(0,|account| account.lamports);
@@ -2802,11 +2844,54 @@ mod tests {
             executor.put(Pubkey::new_unique(),Account {lamports:1,data,owner:solana_sdk::stake::program::id(),..Account::default()}).unwrap();
         }
         for key in stake_keys {executor.put(key,Account::default()).unwrap();}
-        let waiting=admission::snapshot(&rule,&executor.accounts,&catalog,5,144,None).unwrap();
+        let waiting=admission::snapshot(&rule,&executor.accounts,&catalog,5,144,None,rule.genesis_stake_lamports).unwrap();
         assert!(!waiting.members.iter().any(|member|member.hub=="MAD"),"four identities below one percent capped stake do not activate");
         for slot in [144,176,208,240] {executor.execute_slot(slot,vec![]).unwrap();}
         assert!(executor.admission_snapshot(&executor.checkpoint(),3).unwrap().is_none());
         assert_eq!(executor.registered_hubs(&executor.checkpoint()).unwrap().into_iter().find(|hub|hub.code=="MAD").unwrap().activated_at_epoch,Some(3),"first activation outlives rolling epoch places");
+    }
+
+    #[test]
+    fn genesis_weight_steps_down_by_capped_outside_stake_and_never_rises() {
+        use solana_sdk::stake::state::{Meta,Stake,StakeStateV2,Delegation};
+        let (mut executor,_,rule,_,_,_)=admission_check_executor();
+        let outsiders=(0..3).map(|_|Pubkey::new_unique()).collect::<Vec<_>>();
+        for identity in &outsiders {admission_member(&mut executor,rule.registry_program,*identity,"FRA",2,None);}
+        executor.execute_slot(64,vec![]).unwrap();
+        let mut stake_keys=vec![];
+        for (identity,stake) in outsiders.iter().zip([300_000_000u64,50_000_000,100_000_000]) {
+            let key=Pubkey::new_unique();stake_keys.push(key);
+            let mut data=bincode::serialize(&StakeStateV2::Stake(Meta::default(),Stake {delegation:Delegation {voter_pubkey:validator_vote_address(identity),stake,activation_epoch:2,deactivation_epoch:u64::MAX,..Delegation::default()},credits_observed:0},Default::default())).unwrap();
+            data.resize(StakeStateV2::size_of(),0);
+            executor.put(key,Account {lamports:stake,data,owner:solana_sdk::stake::program::id(),..Account::default()}).unwrap();
+        }
+        // Before the step's slot, a configured step leaves every state hash as it was.
+        let start=executor.checkpoint(); let slots=[80,96,112,128,143];
+        let legacy=slots.map(|slot|{executor.execute_slot(slot,vec![]).unwrap();executor.state_hash()});
+        executor.restore(start).unwrap(); executor.set_genesis_step_from(128);
+        assert_eq!(slots.map(|slot|{executor.execute_slot(slot,vec![]).unwrap();executor.state_hash()}),legacy);
+        assert_eq!(executor.genesis_weight(&executor.checkpoint(),5).unwrap(),None);
+        executor.execute_slot(144,vec![]).unwrap();
+        // 2,400 less 200 (300 capped at one genesis weight), 50 and 100, shared by twelve.
+        let stepped=(12*200_000_000-350_000_000)/12;
+        let frozen=executor.admission_snapshot(&executor.checkpoint(),5).unwrap().unwrap();
+        let genesis=rule.genesis.iter().map(|(identity,_)|*identity).collect::<BTreeSet<_>>();
+        assert!(frozen.members.iter().filter(|member|genesis.contains(&member.identity)).all(|member|member.stake==stepped));
+        assert_eq!(frozen.members.iter().filter(|member|!genesis.contains(&member.identity)).map(|member|member.stake).sum::<u64>(),450_000_000);
+        assert_eq!(executor.genesis_weight(&executor.checkpoint(),5).unwrap(),Some(stepped));
+        assert!(executor.validator_stake_weights(5).unwrap().iter().filter(|(identity,_)|genesis.contains(identity)).all(|(_,weight)|*weight==stepped));
+        // An outside undelegation lowers the outside stake but never raises the genesis weight.
+        executor.put(stake_keys[1],Account::default()).unwrap();
+        executor.execute_slot(176,vec![]).unwrap();
+        assert_eq!(executor.genesis_weight(&executor.checkpoint(),6).unwrap(),Some(stepped));
+        let next=executor.admission_snapshot(&executor.checkpoint(),6).unwrap().unwrap();
+        assert!(next.members.iter().filter(|member|genesis.contains(&member.identity)).all(|member|member.stake==stepped));
+        // Twelve outsiders at the cap or more take the genesis to zero, and a zero member leaves.
+        let full=(0..12).map(|_|AdmissionMember {identity:Pubkey::new_unique(),hub:"FRA".into(),stake:250_000_000,admitted_at_epoch:5}).collect::<Vec<_>>();
+        assert_eq!(admission::stepped_genesis_stake(&rule,&full),0);
+        let catalog=executor.validator_catalog(&executor.checkpoint()).unwrap();
+        let emptied=admission::snapshot(&rule,&executor.accounts,&catalog,7,208,Some(&next),0).unwrap();
+        assert!(!emptied.members.iter().any(|member|genesis.contains(&member.identity)));
     }
 
     #[test]

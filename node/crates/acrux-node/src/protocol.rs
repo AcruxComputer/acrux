@@ -804,7 +804,7 @@ impl Network {
                     if let Some(bridge) = genesis.as_ref().and_then(|g| g.bridge.as_ref()) {
                         executor.set_bridge(bridge.program);
                         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
-                        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); }
+                        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); } if let Some(slot) = bridge.genesis_step_from_slot { executor.set_genesis_step_from(slot); }
                         if let Some(fee_burn) = bridge.fee_burn_activation()? { executor.set_fee_burn_config(fee_burn); }
                         if let Some(admission)=bridge.admission_config(&admission_genesis)? {executor.set_admission_config(admission);}
                         if let Some((from_slot, genesis_stake_lamports)) = bridge.stake_activation()? {
@@ -821,7 +821,7 @@ impl Network {
                     if let Some(bridge) = genesis.as_ref().and_then(|g| g.bridge.as_ref()) {
                         executor.set_bridge(bridge.program);
                         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
-                        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); }
+                        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); } if let Some(slot) = bridge.genesis_step_from_slot { executor.set_genesis_step_from(slot); }
                         if let Some(fee_burn) = bridge.fee_burn_activation()? { executor.set_fee_burn_config(fee_burn); }
                         if let Some(admission)=bridge.admission_config(&admission_genesis)? {executor.set_admission_config(admission);}
                         if let Some((from_slot, genesis_stake_lamports)) = bridge.stake_activation()? {
@@ -1085,6 +1085,7 @@ impl Network {
         }).collect::<Vec<_>>();
         let executor=self.nodes[0].executor.as_ref().unwrap();
         let checkpoint=executor.checkpoint();
+        let genesis_weight=executor.genesis_weight(&checkpoint,epoch)?;
         let registered=executor.registered_hubs(&checkpoint)?;
         let mut codes=schedules.config.hubs.iter().map(|hub|hub.code.clone()).collect::<BTreeSet<_>>();
         codes.extend(registered.iter().map(|hub|hub.code.clone()));
@@ -1096,7 +1097,7 @@ impl Network {
             let first=if schedules.config.hubs.iter().any(|hub|hub.code==code){Some(0)}else{registered.iter().find(|hub|hub.code==code).and_then(|hub|hub.activated_at_epoch)};
             json!({"hubCode":code,"formedOutside":formed_outside,"activatedAtEpoch":first,"active":active})
         }).collect::<Vec<_>>();
-        Ok(json!({"epoch":epoch,"cutoffSlot":frozen.filter(|_|schedules.admission_active(epoch)).map(|set|set.cutoff_slot),"members":members,"catalog":schedules.catalog,"genesisIdentities":schedules.config.identities,"hubs":hubs}))
+        Ok(json!({"epoch":epoch,"cutoffSlot":frozen.filter(|_|schedules.admission_active(epoch)).map(|set|set.cutoff_slot),"members":members,"catalog":schedules.catalog,"genesisIdentities":schedules.config.identities,"genesisWeight":genesis_weight.map(|weight|weight.to_string()),"genesisStepFromSlot":self.genesis.as_ref().and_then(|g|g.bridge.as_ref()).and_then(|rule|rule.genesis_step_from_slot),"hubs":hubs}))
     }
     async fn refresh_member_peers(&mut self,cblock:u64)->Result<()> {
         let Some(server)=self.transport.external_server() else{return Ok(())};

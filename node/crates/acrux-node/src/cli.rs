@@ -306,7 +306,7 @@ pub(crate) fn load_follow_snapshot(mut snapshot: Value, genesis: &crate::genesis
     if let Some(bridge) = &genesis.bridge {
         executor.set_bridge(bridge.program);
         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
-        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); }
+        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); } if let Some(slot) = bridge.genesis_step_from_slot { executor.set_genesis_step_from(slot); }
         if let Some(fee_burn) = bridge.fee_burn_activation()? { executor.set_fee_burn_config(fee_burn); }
         if let Some((from_slot, genesis_stake_lamports)) = stake_rule {
             let identities = config.as_ref().context("Public proposer configuration is missing")?.identities.iter().map(|identity| identity.parse()).collect::<std::result::Result<Vec<_>, _>>()?;
@@ -727,7 +727,7 @@ pub async fn import(url: &str, store: &str, genesis: &str) -> Result<()> {
     if let Some(bridge) = &genesis.bridge {
         executor.set_bridge(bridge.program);
         executor.set_bridge_minimums(bridge.from_slot, bridge.min_withdrawal.iter().map(|(mint, amount)| crate::execution::MinimumWithdrawal { mint: *mint, amount: *amount }).collect());
-        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); }
+        if let Some(native) = bridge.native_cutover()? { executor.set_native_cutover(native); } if let Some(slot) = bridge.native_mint_from_slot { executor.set_native_mint_from(slot); } if let Some(slot) = bridge.genesis_step_from_slot { executor.set_genesis_step_from(slot); }
         if let Some(fee_burn) = bridge.fee_burn_activation()? { executor.set_fee_burn_config(fee_burn); }
         if let Some((from_slot, genesis_stake_lamports)) = bridge.stake_activation()? {
             let config: crate::protocol::ProposerConfig = serde_json::from_value(snapshot.get("proposerConfig").context("Public proposer configuration is missing")?.clone())?;

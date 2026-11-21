@@ -637,12 +637,19 @@ export const burnBurned: Burn = { ...burnNoEpochs, totals: { baseFeeBurnBaseUnit
 export const burnPending: Burn = { ...burnBurned, totals: { baseFeeBurnBaseUnits: '1000', buybackBurnBaseUnits: '750000000' }, epochs: { ...burnNoEpochs.epochs, items: [pendingEpoch, burnedEpoch] } }
 export const burnRunning: Burn = { ...burnPending, epochs: { ...burnNoEpochs.epochs, items: [runningEpoch, pendingEpoch, burnedEpoch] } }
 
-/** Genesis stake 12,000,000 ACRUX; outside operators stake from epoch 13 and form a hub at epoch 14. */
-export const genesisShare: GenesisShare = { currentEpoch: 14, epochs: [
+/** Genesis stake 12,000,000 ACRUX; outside operators stake from epoch 13 and form a hub at epoch 14.
+ * From slot 8,208,000 (epoch 19) the genesis weight steps down: epoch 20's set is the first stepped. */
+export const genesisShare: GenesisShare = { currentEpoch: 20, genesisStepFromSlot: 8208000, epochs: [
   { epoch: 12, fixedAtSlot: null, genesisStake: '12000000000000000', totalStake: '12000000000000000', genesisShareBps: 10000, genesisMembers: 12, externalMembers: 0 },
   { epoch: 13, fixedAtSlot: 5615600, genesisStake: '12000000000000000', totalStake: '12120000000000000', genesisShareBps: 9900, genesisMembers: 12, externalMembers: 1 },
   { epoch: 14, fixedAtSlot: 6047600, genesisStake: '12000000000000000', totalStake: '12600000000000000', genesisShareBps: 9523, genesisMembers: 12, externalMembers: 5 },
   { epoch: 15, fixedAtSlot: 6479600, genesisStake: '12000000000000000', totalStake: '13200000000000000', genesisShareBps: 9090, genesisMembers: 12, externalMembers: 8 },
+  { epoch: 16, fixedAtSlot: 6696000, genesisStake: '12000000000000000', totalStake: '13200000000000000', genesisShareBps: 9090, genesisMembers: 12, externalMembers: 8, genesisWeight: null },
+  { epoch: 17, fixedAtSlot: 7128000, genesisStake: '12000000000000000', totalStake: '13400000000000000', genesisShareBps: 8955, genesisMembers: 12, externalMembers: 9, genesisWeight: null },
+  { epoch: 18, fixedAtSlot: 7560000, genesisStake: '12000000000000000', totalStake: '13400000000000000', genesisShareBps: 8955, genesisMembers: 12, externalMembers: 9, genesisWeight: null },
+  { epoch: 19, fixedAtSlot: 7992000, genesisStake: '12000000000000000', totalStake: '13600000000000000', genesisShareBps: 8823, genesisMembers: 12, externalMembers: 10, genesisWeight: null },
+  { epoch: 20, fixedAtSlot: 8424000, genesisStake: '10399999999999992', totalStake: '11999999999999992', genesisShareBps: 8666, genesisMembers: 12, externalMembers: 10, genesisWeight: '866666666666666' },
+  { epoch: 21, fixedAtSlot: 8856000, genesisStake: '9000000000000000', totalStake: '12000000000000000', genesisShareBps: 7500, genesisMembers: 12, externalMembers: 12, genesisWeight: '750000000000000' },
 ] }
 export const genesisShareGenesisOnly: GenesisShare = { currentEpoch: 12, epochs: [genesisShare.epochs[0]!] }
 

@@ -111,6 +111,19 @@ pub(crate) fn catalog(accounts: &BTreeMap<Pubkey, Arc<Account>>, bridge: &Pubkey
     ensure!(identities.len() >= state.rule.genesis.len() && state.rule.genesis.iter().map(|(identity,_)| identity).eq(identities[..state.rule.genesis.len()].iter()), "Validator catalog changed its genesis order");
     Ok(identities)
 }
+/// The genesis weight per identity in force for each retained snapshot, from `genesisStepFromSlot`.
+pub(crate) fn genesis_step_address(bridge: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"genesis_step"], bridge).0
+}
+/// The genesis total less the admitted outside stake, each outside identity counted up to one
+/// genesis identity's original weight, shared equally across the genesis identities.
+pub(crate) fn stepped_genesis_stake(rule: &AdmissionConfig, members: &[AdmissionMember]) -> u64 {
+    let genesis = rule.genesis.iter().map(|(identity,_)| *identity).collect::<BTreeSet<_>>();
+    let original = u128::from(rule.genesis_stake_lamports);
+    let outside = members.iter().filter(|member| !genesis.contains(&member.identity)).map(|member| u128::from(member.stake).min(original)).sum::<u128>();
+    let count = rule.genesis.len() as u128;
+    ((original * count).saturating_sub(outside) / count) as u64
+}
 pub(crate) fn marker_address(bridge: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"admission"], bridge).0
 }
@@ -227,14 +240,14 @@ pub(crate) fn delegated_weights(accounts: &BTreeMap<Pubkey, Arc<Account>>, ident
     Ok(weights)
 }
 
-pub(crate) fn snapshot(rule: &AdmissionConfig, accounts: &BTreeMap<Pubkey, Arc<Account>>, catalog: &[Pubkey], epoch: u64, cutoff_slot: u64, previous: Option<&AdmissionSnapshot>) -> Result<AdmissionSnapshot> {
+pub(crate) fn snapshot(rule: &AdmissionConfig, accounts: &BTreeMap<Pubkey, Arc<Account>>, catalog: &[Pubkey], epoch: u64, cutoff_slot: u64, previous: Option<&AdmissionSnapshot>, genesis_stake: u64) -> Result<AdmissionSnapshot> {
     let effective = memberships(accounts, &rule.registry_program, epoch).into_iter().map(|member| (member.identity, member)).collect::<BTreeMap<_,_>>();
     let delegated = delegated_weights(accounts, catalog, epoch)?;
     let genesis = rule.genesis.iter().map(|(identity,_)| *identity).collect::<BTreeSet<_>>();
     let mut members = vec![];
     for identity in catalog {
         let Some(membership) = effective.get(identity) else { continue };
-        let stake = delegated.get(identity).copied().unwrap_or(0).checked_add(if genesis.contains(identity) { rule.genesis_stake_lamports } else { 0 }).context("Admission stake overflow")?;
+        let stake = delegated.get(identity).copied().unwrap_or(0).checked_add(if genesis.contains(identity) { genesis_stake } else { 0 }).context("Admission stake overflow")?;
         if stake == 0 { continue }
         let admitted_at_epoch = previous.and_then(|snapshot| snapshot.members.iter().find(|member| member.identity == *identity)).map_or(epoch, |member| member.admitted_at_epoch);
         members.push(AdmissionMember { identity:*identity,hub:membership.hub.clone(),stake,admitted_at_epoch });

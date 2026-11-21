@@ -47,6 +47,10 @@ assert.ok(lanesFromSlot % epochSlots === 0 && lanesFromSlot >= admissionFromSlot
 const optional = name => arg(name) === undefined ? undefined : asNumber(required(name), name)
 const nativeMintFromSlot = optional('native-mint-from-slot'), feeBurnFromSlot = optional('fee-burn-from-slot')
 assert.ok(feeBurnFromSlot === undefined || feeBurnFromSlot % epochSlots === 0 && feeBurnFromSlot > lanesFromSlot, 'Set the fee burn at a local epoch boundary after lanes.')
+// Optional: the genesis weight steps down by admitted outside stake from this boundary.
+const genesisStepFromSlot = optional('genesis-step-from-slot')
+assert.ok(genesisStepFromSlot === undefined || genesisStepFromSlot % epochSlots === 0 && genesisStepFromSlot >= Math.max(lanesFromSlot, feeBurnFromSlot ?? 0) + 4 * epochSlots,
+  'Set the genesis step at a local epoch boundary at least four epochs after lanes and the fee burn, so a second outside member can join and stake before it.')
 const stakeLamports = genesisStakeLamports * 2n
 asNumber(stakeLamports, 'twice genesis-stake-lamports')
 // Four times the delegation leaves this local holder room for account rent and fees.
@@ -196,7 +200,7 @@ try {
   ], authority, [mintKeypair])
   if (feeBurnFromSlot !== undefined) await send(solana, [await onSolana.methods.initFeeBurnConfig().accountsStrict({ authority: authority.publicKey, bridge: addresses.bridge, mint, config: addresses.feeBurnConfig, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId }).instruction()], authority)
   runDir = mkdtempSync(join(target, 'native-lanes-check-'))
-  const rule = { program: program.toBase58(), fromSlot: 0, epochSlots, chainId, nativeFromSlot, nativeMint: mint.toBase58(), nativeScale: Number(scale), stakeFromSlot, genesisStakeLamports: genesisStakeLamports.toString(), admissionFromSlot, lanesFromSlot, nativeMintFromSlot, feeBurnFromSlot }
+  const rule = { program: program.toBase58(), fromSlot: 0, epochSlots, chainId, nativeFromSlot, nativeMint: mint.toBase58(), nativeScale: Number(scale), stakeFromSlot, genesisStakeLamports: genesisStakeLamports.toString(), admissionFromSlot, lanesFromSlot, nativeMintFromSlot, feeBurnFromSlot, genesisStepFromSlot }
   writeFileSync(join(runDir, 'bridge.json'), JSON.stringify(rule))
   mkdirSync(join(runDir, 'placements'))
   const env = { ...process.env, ACRUX_GENESIS_SEED: DEV_SEED, ACRUX_BIND: '127.0.0.1', ACRUX_BRIDGE: join(runDir, 'bridge.json'), ACRUX_BRIDGE_RPC: `${solanaUrl},${solanaUrl}`, ACRUX_BRIDGE_PROOF_MAX: '100000', ACRUX_PLACEMENTS: join(runDir, 'placements/placements.json') }
@@ -538,12 +542,80 @@ try {
   assert.ok(silentAgreement.matching && silentAgreement.validators === 12)
   await until('The RPC follower keeps matching after the silent lane', 30, async () => followerStates.has(silent.slot))
   assert.equal(followerStates.get(silent.slot), silent.stateHash.slice(0, 12))
+  let genesisStep
+  if (genesisStepFromSlot !== undefined) {
+    // A second outside member, offline, joins and stakes half a genesis weight; the first holds two.
+    // Each counts up to one genesis weight, so the genesis falls by 1.5 weights shared by twelve.
+    const stepEpoch = genesisStepFromSlot / epochSlots
+    let handed = Math.floor(await acrux.getSlot('finalized') / epochSlots) + 1
+    while (!(await onSolana.account.validatorSet.fetchNullable(addresses.set(handed), 'confirmed'))) handed--
+    const relayThrough = async epoch => { for (; handed < epoch; handed++) await relayNext(handed) }
+    const second = Keypair.generate(), secondStake = Keypair.generate(), secondLamports = genesisStakeLamports / 2n
+    assert.ok(secondLamports >= BigInt(minimum.value), 'Half --genesis-stake-lamports must meet the Stake program minimum.')
+    const secondMembership = rpda(Buffer.from('member'), second.publicKey.toBuffer())
+    await send(acrux, [await registry.methods.joinHub().accountsStrict({
+      payer: holder.publicKey, identity: second.publicKey, registry: registryAddress, hub, membership: secondMembership,
+      systemProgram: SystemProgram.programId, eventAuthority: registryEvents, program: registry.programId,
+    }).instruction()], holder, [second])
+    const secondEffective = (await registry.account.membership.fetch(secondMembership)).effectiveEpoch.toNumber()
+    assert.ok(secondEffective < stepEpoch, 'Choose a later genesis step: the second member must take effect before it.')
+    const secondVote = PublicKey.findProgramAddressSync([Buffer.from('acrux_genesis_vote'), second.publicKey.toBuffer()], VoteProgram.programId)[0]
+    await relayThrough(secondEffective)
+    await waitSlot(secondEffective * epochSlots + 4)
+    await until('The second member gets its Vote account', 30, async () => (await acrux.getAccountInfo(secondVote, 'finalized'))?.owner.equals(VoteProgram.programId))
+    const secondCreate = StakeProgram.createAccount({ fromPubkey: holder.publicKey, stakePubkey: secondStake.publicKey,
+      authorized: new Authorized(holder.publicKey, holder.publicKey), lamports: asNumber(secondLamports + BigInt(rent), 'second stake funding') })
+    const secondDelegate = StakeProgram.delegate({ stakePubkey: secondStake.publicKey, authorizedPubkey: holder.publicKey, votePubkey: secondVote })
+    const secondDelegated = await send(acrux, [...secondCreate.instructions, ...secondDelegate.instructions], holder, [secondStake])
+    const secondReceipt = await acrux.getTransaction(secondDelegated, { commitment: 'finalized', maxSupportedTransactionVersion: 0 })
+    assert.ok(secondReceipt.slot < (stepEpoch - 1) * epochSlots + epochSlots / 2, 'Choose a later genesis step: the second stake must be in the last unstepped set.')
+
+    const genesisOf = set => set.members.filter(member => member.validatorKind === 'genesis')
+    await relayThrough(stepEpoch)
+    const unstepped = await rpc('getValidatorSet', { epoch: stepEpoch })
+    assert.equal(unstepped.genesisWeight, null)
+    assert.equal(unstepped.genesisStepFromSlot, genesisStepFromSlot)
+    assert.ok(genesisOf(unstepped).length === 12 && genesisOf(unstepped).every(member => BigInt(member.stake) === genesisStakeLamports), 'Before the step the genesis keeps its whole weight.')
+    assert.equal(BigInt(unstepped.members.find(member => member.identity === second.publicKey.toBase58()).stake), secondLamports)
+    const stepped = (12n * genesisStakeLamports - genesisStakeLamports - secondLamports) / 12n
+    await relayThrough(stepEpoch + 1)
+    const first = await rpc('getValidatorSet', { epoch: stepEpoch + 1 })
+    assert.equal(BigInt(first.genesisWeight), stepped)
+    assert.ok(genesisOf(first).every(member => BigInt(member.stake) === stepped), 'The first stepped set lowers each genesis identity equally.')
+    assert.equal(BigInt(first.members.find(member => member.identity === holder.publicKey.toBase58()).stake), stakeLamports, 'Outside stake keeps its full weight; only its count toward the step is capped.')
+    const onSolanaStepped = await onSolana.account.validatorSet.fetch(addresses.set(stepEpoch + 1), 'confirmed')
+    assert.ok(onSolanaStepped.validators.filter(member => genesisOf(first).some(g => g.identity === member.key.toBase58())).every(member => BigInt(member.stake.toString()) === stepped))
+
+    // The second member leaves its stake; the next set drops it, and the genesis weight holds.
+    await waitSlot((stepEpoch + 1) * epochSlots + 4)
+    const deactivated = await send(acrux, StakeProgram.deactivate({ stakePubkey: secondStake.publicKey, authorizedPubkey: holder.publicKey }).instructions, holder)
+    const deactivatedReceipt = await acrux.getTransaction(deactivated, { commitment: 'finalized', maxSupportedTransactionVersion: 0 })
+    assert.ok(deactivatedReceipt.slot < (stepEpoch + 1) * epochSlots + epochSlots / 2, 'Use a longer local epoch: the undelegation must land before the cut-off.')
+    // Set stepEpoch + 1 is the stepped one, so this relay is certified under the lowered weights.
+    await relayThrough(stepEpoch + 2)
+    const held = await rpc('getValidatorSet', { epoch: stepEpoch + 2 })
+    assert.ok(!held.members.some(member => member.identity === second.publicKey.toBase58()))
+    assert.equal(BigInt(held.genesisWeight), stepped, 'An outside undelegation never raises the genesis weight.')
+    assert.ok(genesisOf(held).every(member => BigInt(member.stake) === stepped))
+    await relayThrough(stepEpoch + 3)
+    const crossed = (stepEpoch + 2) * epochSlots
+    await until('The RPC follower matches past the stepped sets', 60, async () => [...followerStates.keys()].some(slot => slot >= crossed))
+    const { createGenesisShareReader } = await import(new URL('../../api/dist/genesis-share.js', import.meta.url))
+    const share = await createGenesisShareReader(gateway)()
+    const rows = Object.fromEntries(share.epochs.map(row => [row.epoch, row]))
+    assert.equal(share.genesisStepFromSlot, genesisStepFromSlot)
+    assert.ok(rows[stepEpoch].genesisWeight === null && BigInt(rows[stepEpoch + 1].genesisWeight) === stepped)
+    assert.ok(rows[stepEpoch + 1].genesisShareBps < rows[stepEpoch].genesisShareBps, '/v1/genesis-share reads the falling share.')
+    genesisStep = { stepEpoch, genesisWeight: stepped.toString(), shareBps: [stepEpoch, stepEpoch + 1, stepEpoch + 2].map(epoch => rows[epoch]?.genesisShareBps),
+      secondMember: second.publicKey.toBase58(), certifiedUnderStepped: stepEpoch + 2 }
+    event('native_lanes_genesis_stepped', genesisStep)
+  }
   event('native_lanes_check_passed', { identity: holder.publicKey.toBase58(), lanesFromSlot, epochSlots, before, after,
     boundaryBefore: boundaryBefore.agreement, boundaryAfter: boundaryAfter.agreement,
     withdrawal, withdrawalCblock: cblock, withdrawalSequence: withdrawalSequence.toNumber(), releasedBaseUnits: withdrawAmount.toString(),
     unchangedSolanaProgram: program.toBase58(), silentWindow: silentWindow.number, silentRole,
     silentFinalizedUs: silent.cblock.finalizedUs, skipTimeoutUs: silent.consensusTimeoutUs,
-    rpcFollowerMatches: followerStates.size, observerMatches, nativeMint, feeBurned })
+    rpcFollowerMatches: followerStates.size, observerMatches, nativeMint, feeBurned, genesisStep })
 } catch (error) {
   console.error(`The local net's last output:\n${tail}\nOutside process:\n${observerTail}\nRPC follower:\n${followerTail}`)
   throw error

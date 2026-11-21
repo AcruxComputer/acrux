@@ -107,7 +107,8 @@ export const Hub = z.object({ chain: RegistryChain, code: HubCode, name: z.strin
 export type Hub = z.infer<typeof Hub>
 export const Hubs = page(Hub)
 /** The genesis validators' share of stake in each bridge epoch's fixed set; the next epoch appears once its set is fixed. */
-export const GenesisShare = z.object({ currentEpoch: Count, epochs: z.array(z.object({ epoch: Count, fixedAtSlot: Count.nullable(), genesisStake: U64, totalStake: U64, genesisShareBps: Count.max(10000), genesisMembers: Count, externalMembers: Count })) })
+/** From `genesisStepFromSlot`, each set's `genesisWeight` (per genesis identity, native lamports) falls by admitted outside stake, each outside identity counted up to one genesis identity's original weight, and never rises; null before the step. */
+export const GenesisShare = z.object({ currentEpoch: Count, genesisStepFromSlot: Count.nullable().optional(), epochs: z.array(z.object({ epoch: Count, fixedAtSlot: Count.nullable(), genesisStake: U64, totalStake: U64, genesisShareBps: Count.max(10000), genesisMembers: Count, externalMembers: Count, genesisWeight: U64.nullable().optional() })) })
 /** Earned fees only, in native lamports; amounts may exceed u64 after repeated circulation. */
 export const HubEarningsRow = z.object({ identity: Address, validatorKind: openEnum(['genesis', 'external']), base: BaseUnits, priority: BaseUnits, inclusion: BaseUnits })
 /** countedFromSlot is the first observed slot, so a partial first epoch is explicit. */
