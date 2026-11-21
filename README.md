@@ -8,7 +8,7 @@ Acrux is a Solana fork with New Constellation consensus (Kniep and Wattenhofer, 
 |---|---|
 | `node/` | `acrux-node` (Rust): Algorithms 1 to 4 on Alpenglow, Acrux Net, the Fault Lab runner and the `acrux` CLI. See [node/README.md](node/README.md). |
 | `chain/` | Anchor workspace: `hub_registry` (on Solana and in Acrux's genesis) and `demo_pool` (in Acrux's genesis). See [chain/README.md](chain/README.md). |
-| `api/` | The API: TypeScript, Hono, Prisma 7 on Postgres. Registry read model, schedule preview, faucet, transaction lookup, lab runs, facts. |
+| `api/` | The API: TypeScript, Hono, Prisma 7 on Postgres. Registry read model, schedule preview, transaction lookup, the bridge and burn read models, lab runs, facts; its keeper role runs the bridge relayer and the ACRUX buyback. |
 | `contract/` | `@acrux/contract`: zod schemas and types for the API, the gateway's JSON-RPC and every event, plus clients. |
 | `sdk/` | `@acrux/sdk`: `connect`, `send(tx, { n, t })`, `tx.follow`, `slots.subscribe`. See [sdk/README.md](sdk/README.md). |
 | `spec/map.json` | Every algorithm line and lemma of the paper, mapped to file, function and Fault Lab scenario. |
