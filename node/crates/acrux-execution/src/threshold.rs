@@ -612,4 +612,115 @@ mod tests {
             assert!(cache.accept(20, 2, sealed[1].verify().unwrap()).is_err());
         }
     }
+
+    /// Fragments sealed by the TypeScript SDK (`sdk/scripts/gen-sdk-vectors.mjs`), the mirror of
+    /// `sdk/test/vectors/rust-*.json`.
+    fn sdk_vector(n: u8, t: u8) -> (serde_json::Value, Vec<u8>) {
+        let path = format!(
+            "{}/../../../sdk/test/vectors/sdk-{t}-of-{n}.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let bytes = B64
+            .decode(value["plain"]["transaction"].as_str().unwrap())
+            .unwrap();
+        (value, bytes)
+    }
+
+    fn sdk_fragments(value: &serde_json::Value) -> Vec<serde_json::Value> {
+        value["fragments"].as_array().unwrap().clone()
+    }
+
+    /// Feeds the chosen fragments to a fresh cache the way a slot would, and returns the last result.
+    fn feed(chosen: &[serde_json::Value]) -> Result<AcceptOutcome> {
+        let mut cache = ThresholdCache::new(8)?;
+        let mut last = None;
+        for value in chosen {
+            let fragment = FragmentSubmission::parse(value.clone())?;
+            last = Some(cache.accept(100, fragment.receiver, fragment)?);
+        }
+        Ok(last.unwrap())
+    }
+
+    fn flip(value: &serde_json::Value, field: &str, at: usize) -> serde_json::Value {
+        let mut raw = B64.decode(value[field].as_str().unwrap()).unwrap();
+        raw[at] ^= 1;
+        let mut out = value.clone();
+        out[field] = serde_json::Value::String(B64.encode(raw));
+        out
+    }
+
+    #[test]
+    fn sdk_sealed_vectors_decode_from_every_t_subset() {
+        for (n, t) in [(2u8, 2u8), (3, 2), (3, 3)] {
+            let (vector, bytes) = sdk_vector(n, t);
+            let fragments = sdk_fragments(&vector);
+            assert_eq!(fragments.len(), n as usize);
+            for mask in 0u8..(1 << n) {
+                if mask.count_ones() as usize != t as usize {
+                    continue;
+                }
+                let chosen = fragments
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, f)| f.clone())
+                    .collect::<Vec<_>>();
+                match feed(&chosen).unwrap() {
+                    AcceptOutcome::Decoded { bytes: decoded, .. } => assert_eq!(decoded, bytes),
+                    other => panic!("{t} of {n} subset {mask:b} did not decode: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sdk_sealed_vectors_stay_closed_below_the_threshold() {
+        for (n, t) in [(2u8, 2u8), (3, 2), (3, 3)] {
+            let (vector, _) = sdk_vector(n, t);
+            let fragments = sdk_fragments(&vector);
+            // Any t - 1 fragments leave the transaction closed.
+            for fragment in &fragments {
+                assert!(matches!(
+                    feed(&[fragment.clone()]).unwrap(),
+                    AcceptOutcome::Pending { accepted: 1, .. }
+                ));
+            }
+            if t == 3 {
+                assert!(matches!(
+                    feed(&fragments[..2]).unwrap(),
+                    AcceptOutcome::Pending { accepted: 2, .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn tampered_sdk_vectors_fail_authentication() {
+        for (n, t) in [(2u8, 2u8), (3, 2), (3, 3)] {
+            let (vector, _) = sdk_vector(n, t);
+            let fragments = sdk_fragments(&vector);
+            let honest = fragments[..t as usize].to_vec();
+            // One flipped ciphertext shard byte: the envelope is well formed, the AEAD tag is not.
+            let mut shard = honest.clone();
+            shard[0] = flip(&shard[0], "fragment", 20);
+            assert!(feed(&shard).is_err(), "{t} of {n}: tampered shard decoded");
+            // One flipped key share byte reconstructs the wrong key.
+            let mut share = honest.clone();
+            share[0] = flip(&share[0], "keyShare", 10);
+            assert!(feed(&share).is_err(), "{t} of {n}: tampered key share decoded");
+            // A changed public header no longer matches the fee payer's signature.
+            let mut header = honest.clone();
+            header[0]["header"]["priorityFeePerCu"] = serde_json::json!("101");
+            assert!(
+                FragmentSubmission::parse(header[0].clone()).is_err(),
+                "{t} of {n}: tampered header verified"
+            );
+            // A nonce flip breaks decryption too.
+            let mut nonce = honest.clone();
+            nonce[0] = flip(&nonce[0], "fragment", 1);
+            assert!(feed(&nonce).is_err(), "{t} of {n}: nonce mismatch decoded");
+        }
+    }
 }

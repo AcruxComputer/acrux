@@ -18,7 +18,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test test/seal.test.mjs",
+    "test": "npm run build && node --test test/seal.test.mjs test/sdk-vectors.test.mjs",
     "e2e": "npm run build && node test/e2e.mjs"
   },
   "dependencies": {
